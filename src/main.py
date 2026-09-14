@@ -934,6 +934,21 @@ async def main():
                 raise RuntimeError("Unable to read follower wallet state")
             simulated_balance = follower_state.balance
 
+            if simulated_balance <= 0:
+                spot_balances = await client.get_spot_balances(settings.hyperliquid.wallet_address)
+                spot_usdc = next(
+                    (float(item.get("total", 0)) for item in spot_balances if item.get("coin") == "USDC"),
+                    0.0,
+                )
+                raise RuntimeError(
+                    f"Perp clearinghouse balance is ${simulated_balance:,.2f}. "
+                    f"Spot USDC balance is ${spot_usdc:,.2f}. "
+                    "Transfer USDC from Spot to Perp on Hyperliquid before live trading."
+                )
+
+        if target_balance <= 0:
+            raise RuntimeError("Target account balance is zero; cannot calculate copy ratio")
+
         # Auto-calculate ratio based on balances
         auto_ratio = simulated_balance / target_balance
         settings.sizing.portfolio_ratio = auto_ratio
@@ -942,8 +957,10 @@ async def main():
         logger.success(f"✨ AUTO-CALCULATED SIZING:")
         logger.success(f"   Target Balance: ${target_balance:,.2f}")
         logger.success(f"   Your Balance: ${simulated_balance:,.2f}")
-        logger.success(f"   📊 Ratio: 1:{int(1/auto_ratio)} ({auto_ratio*100:.4f}%)")
-        logger.success(f"   This means: For every ${int(1/auto_ratio)} target trades, you copy ${1}")
+        ratio_text = f"1:{int(1 / auto_ratio)}" if auto_ratio > 0 else "0 (no funds)"
+        logger.success(f"   📊 Ratio: {ratio_text} ({auto_ratio*100:.4f}%)")
+        if auto_ratio > 0:
+            logger.success(f"   This means: For every ${int(1/auto_ratio)} target trades, you copy ${1}")
         
         # Calculate minimum balance needed for $10 minimum order size
         if state.positions:

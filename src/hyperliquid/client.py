@@ -167,6 +167,18 @@ class HyperliquidClient:
         except Exception as e:
             logger.error(f"Failed to get assets: {e}")
             return []
+
+    async def get_spot_balances(self, address: str) -> List[Dict[str, Any]]:
+        """Return Spot balances for diagnostics and funding guidance."""
+        try:
+            response = await self._post(
+                self.info_url,
+                {"type": "spotClearinghouseState", "user": address},
+            )
+            return response.get("balances", []) if isinstance(response, dict) else []
+        except Exception as e:
+            logger.error(f"Failed to get Spot balances for {address}: {e}")
+            return []
     
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""
