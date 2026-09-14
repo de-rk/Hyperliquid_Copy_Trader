@@ -1,6 +1,9 @@
 services:
   copy-trader:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_TELEGRAM: ${INSTALL_TELEGRAM:-true}
     container_name: hyperliquid-copy-trader
     restart: unless-stopped
     volumes:
