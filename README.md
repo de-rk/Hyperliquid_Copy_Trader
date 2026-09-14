@@ -70,6 +70,7 @@ COPY_OPEN_POSITIONS=true
 COPY_EXISTING_ORDERS=true
 AUTO_ADJUST_SIZE=true
 USE_LIMIT_ORDERS=false
+MAX_SLIPPAGE_PCT=1.0
 LEVERAGE_ADJUSTMENT=1.0
 MAX_OPEN_TRADES=x
 MAX_OPEN_ORDERS=x
@@ -94,6 +95,8 @@ Notes:
 - `TARGET_WALLET_ADDRESS` accepts either a wallet address or a vault address.
 - `x` means unlimited; set an integer to cap `MAX_OPEN_TRADES`, `MAX_OPEN_ORDERS`, or `MAX_ACCOUNT_EQUITY`.
 - Hyperliquid enforces a $10 minimum notional per order. If your account is much smaller than the target, small fills will be skipped when the proportional size falls below $10. Increase balance or reduce the ratio gap to copy more trades.
+- Set `SIMULATED_TRADING=false` to enable live orders. In live mode the bot reads the configured wallet's real balance; `SIMULATED_ACCOUNT_BALANCE` is ignored.
+- Live market orders are IOC orders priced from the current mid with `MAX_SLIPPAGE_PCT` tolerance. Start with a small amount and verify the logs before increasing exposure.
 
 ## Leverage Adjustment
 

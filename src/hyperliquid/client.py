@@ -13,7 +13,9 @@ class HyperliquidClient:
         self.api_url = api_url
         self.info_url = f"{api_url}/info"
         self.exchange_url = f"{api_url}/exchange"
-        self.dexs = ["", 'xyz', 'flx', 'vntl', 'hyna', 'km', 'abcd', 'cash', 'para'] # empty string which represents the first perp dex
+        # The first null entry is the default perp DEX. Additional HIP-3 DEXs
+        # are discovered from the official perpDexs endpoint at runtime.
+        self.dexs = [""]
         self.session: Optional[aiohttp.ClientSession] = None
         
         
@@ -49,6 +51,12 @@ class HyperliquidClient:
             UserState object or None if failed
         """
         try:
+            # Keep the list current as HIP-3 DEXs are added or removed.
+            perp_dexes = await self._post(self.info_url, {"type": "perpDexs"})
+            self.dexs = [""] + [
+                dex["name"] for dex in (perp_dexes or [])[1:]
+                if dex and dex.get("name")
+            ]
             # merge all dex responses to get complete user state across all dexs
             all_responses = None
             for dex in self.dexs:
@@ -163,6 +171,12 @@ class HyperliquidClient:
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""
         try:
+            if ":" in symbol and self.dexs == [""]:
+                perp_dexes = await self._post(self.info_url, {"type": "perpDexs"})
+                self.dexs = [""] + [
+                    dex["name"] for dex in (perp_dexes or [])[1:]
+                    if dex and dex.get("name")
+                ]
             # The "allMids" endpoint returns the mid price for all symbols across all dexs, so we can just query it once and extract the price for the symbol we want
             find_symbol = False
             for dex in self.dexs:
@@ -174,9 +188,9 @@ class HyperliquidClient:
                 if not response:
                     continue
                 # Response is a dict with symbol: price
-                if isinstance(response, dict):
+                if isinstance(response, dict) and symbol in response:
                     find_symbol = True
-                    return float(response.get(symbol, 0))
+                    return float(response[symbol])
         
             if not find_symbol:
                 logger.error(f"Market price for {symbol} not found")

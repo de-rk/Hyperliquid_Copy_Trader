@@ -1,12 +1,13 @@
 """Trade execution engine for Hyperliquid"""
 import time
 from typing import Optional, Dict, Any
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from eth_account import Account
 import aiohttp
 
 from utils.logger import logger
 from hyperliquid.models import OrderType, OrderSide
+from copy_engine.hl_signing import float_to_wire, get_timestamp_ms, sign_l1_action
 
 
 class TradeExecutor:
@@ -18,14 +19,18 @@ class TradeExecutor:
         private_key: str,
         info_url: str = "https://api.hyperliquid.xyz/info",
         exchange_url: str = "https://api.hyperliquid.xyz/exchange",
-        dry_run: bool = True
+        dry_run: bool = True,
+        max_slippage_pct: float = 1.0,
     ):
         self.wallet_address = wallet_address.lower() if wallet_address else None
         self.private_key = private_key
         self.info_url = info_url
         self.exchange_url = exchange_url
         self.dry_run = dry_run
+        self.max_slippage_pct = max(0.01, float(max_slippage_pct))
         self._coin_index_cache: Dict[str, int] = {}
+        self._coin_size_decimals: Dict[str, int] = {}
+        self._metadata_loaded = False
 
         # Initialize signing account if we have credentials
         self.account = None
@@ -47,79 +52,127 @@ class TradeExecutor:
         else:
             logger.warning("⚠️ Running in DRY RUN mode - no real trades will be executed")
 
-    async def _get_asset_index(self, symbol: str) -> int:
-        """Resolve a coin symbol to its integer asset index.
+    async def _load_asset_metadata(self) -> None:
+        """Load the official default and HIP-3 asset universes.
 
-        Hyperliquid's exchange endpoint requires an integer for the 'asset' /
-        'a' fields, not a coin name string. The index is the coin's position in
-        the universe array returned by the meta endpoint.
+        Builder DEX assets use the SDK-defined offsets (110000, 120000, ...),
+        not the zero-based index from the default ``meta`` response.
         """
-        if not self._coin_index_cache:
-            async with aiohttp.ClientSession() as session:
+        if self._metadata_loaded:
+            return
+
+        async with aiohttp.ClientSession() as session:
+            async def info(payload: Dict[str, Any]) -> Any:
                 async with session.post(
                     self.info_url,
-                    json={"type": "meta"},
-                    headers={"Content-Type": "application/json"}
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
                 ) as response:
-                    data = await response.json()
-            universe = data.get("universe", [])
-            self._coin_index_cache = {coin["name"]: i for i, coin in enumerate(universe)}
+                    response.raise_for_status()
+                    return await response.json()
 
+            perp_dexes = await info({"type": "perpDexs"})
+            dex_names = [""]
+            dex_offsets = {"": 0}
+            for index, dex in enumerate((perp_dexes or [])[1:]):
+                if dex and dex.get("name"):
+                    name = dex["name"]
+                    dex_names.append(name)
+                    dex_offsets[name] = 110000 + index * 10000
+
+            for dex in dex_names:
+                metadata = await info({"type": "meta", "dex": dex})
+                offset = dex_offsets[dex]
+                for index, coin in enumerate(metadata.get("universe", [])):
+                    name = coin.get("name")
+                    if not name:
+                        continue
+                    self._coin_index_cache[name] = offset + index
+                    self._coin_size_decimals[name] = int(coin.get("szDecimals", 8))
+
+        self._metadata_loaded = True
+
+    async def _get_asset_info(self, symbol: str) -> tuple[int, int]:
+        await self._load_asset_metadata()
         if symbol not in self._coin_index_cache:
             raise ValueError(f"Unknown asset symbol: {symbol}")
-        return self._coin_index_cache[symbol]
+        return self._coin_index_cache[symbol], self._coin_size_decimals[symbol]
+
+    async def _get_asset_index(self, symbol: str) -> int:
+        return (await self._get_asset_info(symbol))[0]
+
+    async def _get_mid_price(self, symbol: str) -> float:
+        dex = symbol.split(":", 1)[0] if ":" in symbol else ""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.info_url,
+                json={"type": "allMids", "dex": dex},
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                response.raise_for_status()
+                mids = await response.json()
+        try:
+            return float(mids[symbol])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"No mid price returned for {symbol}") from exc
+
+    @staticmethod
+    def _wire_size(size: Decimal, size_decimals: int) -> str:
+        quantum = Decimal(1).scaleb(-size_decimals)
+        normalized = Decimal(str(size)).quantize(quantum, rounding=ROUND_DOWN)
+        if normalized <= 0:
+            raise ValueError("Order size rounds to zero")
+        return float_to_wire(normalized)
+
+    @staticmethod
+    def _wire_price(price: Decimal, size_decimals: int) -> str:
+        # Hyperliquid's SDK uses at most 6 - szDecimals decimal places for
+        # perp prices and at most five significant figures.
+        decimals = max(0, 6 - size_decimals)
+        rounded = round(float(price), decimals)
+        rounded = float(f"{rounded:.5g}")
+        return float_to_wire(rounded)
 
     def _sign_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Sign an action using EIP-712 structured data signing"""
+        """Sign an action using the official Hyperliquid L1 scheme."""
         if not self.account:
             raise ValueError("Cannot sign actions without account")
-
-        timestamp = int(time.time() * 1000)
-
-        structured_data = {
-            "domain": {
-                "name": "Exchange",
-                "version": "1",
-                "chainId": 1337,
-                "verifyingContract": "0x0000000000000000000000000000000000000000"
-            },
-            "primaryType": "Agent",
-            "types": {
-                "Agent": [
-                    {"name": "source", "type": "string"},
-                    {"name": "connectionId", "type": "bytes32"}
-                ],
-                "EIP712Domain": [
-                    {"name": "name", "type": "string"},
-                    {"name": "version", "type": "string"},
-                    {"name": "chainId", "type": "uint256"},
-                    {"name": "verifyingContract", "type": "address"}
-                ]
-            },
-            "message": {
-                "source": "a",
-                "connectionId": "0x" + "0" * 64
-            }
-        }
-
-        signed_message = self.account.sign_typed_data(
-            structured_data["domain"],
-            {"Agent": structured_data["types"]["Agent"]},
-            structured_data["message"]
+        nonce = get_timestamp_ms()
+        is_mainnet = self.info_url.startswith("https://api.hyperliquid.xyz/")
+        signature = sign_l1_action(
+            self.account,
+            action,
+            None,
+            nonce,
+            None,
+            is_mainnet,
         )
-
-        signature = {
-            "r": "0x" + signed_message.r.to_bytes(32, "big").hex(),
-            "s": "0x" + signed_message.s.to_bytes(32, "big").hex(),
-            "v": signed_message.v
-        }
-
         return {
             "action": action,
-            "nonce": timestamp,
+            "nonce": nonce,
             "signature": signature,
-            "vaultAddress": None
+            "vaultAddress": None,
+            "expiresAfter": None,
         }
+
+    @staticmethod
+    def _extract_order_id(result: Dict[str, Any]) -> Optional[str]:
+        if result.get("status") != "ok":
+            return None
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            return None
+        status = statuses[0]
+        for key in ("resting", "filled"):
+            value = status.get(key)
+            if isinstance(value, dict) and value.get("oid") is not None:
+                return str(value["oid"])
+        return None
+
+    @staticmethod
+    def _result_has_error(result: Dict[str, Any]) -> bool:
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        return any(isinstance(status, dict) and "error" in status for status in statuses)
 
     async def _update_leverage(
         self,
@@ -145,9 +198,12 @@ class TradeExecutor:
                     headers={"Content-Type": "application/json"}
                 ) as response:
                     if response.status == 200:
-                        await response.json()
-                        logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
-                        return True
+                        result = await response.json()
+                        if result.get("status") == "ok" and not self._result_has_error(result):
+                            logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
+                            return True
+                        logger.error(f"Hyperliquid rejected leverage update: {result}")
+                        return False
                     else:
                         error_text = await response.text()
                         logger.error(f"Failed to update leverage: {error_text}")
@@ -176,16 +232,21 @@ class TradeExecutor:
 
         try:
             if leverage > 1:
-                await self._update_leverage(symbol, leverage)
+                if not await self._update_leverage(symbol, leverage):
+                    logger.error(f"Cannot place {symbol} order because leverage update failed")
+                    return None
 
-            asset_index = await self._get_asset_index(symbol)
+            asset_index, size_decimals = await self._get_asset_info(symbol)
+            mid_price = await self._get_mid_price(symbol)
+            slippage = self.max_slippage_pct / 100.0
+            aggressive_price = mid_price * (1 + slippage if side == OrderSide.BUY else 1 - slippage)
             action = {
                 "type": "order",
                 "orders": [{
                     "a": asset_index,
                     "b": side == OrderSide.BUY,
-                    "p": "0",
-                    "s": str(float(size)),
+                    "p": self._wire_price(Decimal(str(aggressive_price)), size_decimals),
+                    "s": self._wire_size(size, size_decimals),
                     "r": reduce_only,
                     "t": {"limit": {"tif": "Ioc"}},
                     "c": None
@@ -201,16 +262,19 @@ class TradeExecutor:
                     json=signed_action,
                     headers={"Content-Type": "application/json"}
                 ) as response:
+                    # Hyperliquid can return HTTP 200 with a business-level
+                    # rejection. Always retain the response body for diagnosis.
                     if response.status == 200:
                         result = await response.json()
-                        logger.success(
-                            f"✅ Market {side.value} order executed: {symbol} "
-                            f"size={size} leverage={leverage}x"
-                        )
-                        if result.get("status") == "ok" and result.get("response", {}).get("data"):
-                            order_id = result["response"]["data"].get("statuses", [{}])[0].get("resting", {}).get("oid")
-                            return order_id
-                        return "executed"
+                        order_id = self._extract_order_id(result)
+                        if result.get("status") == "ok" and not self._result_has_error(result):
+                            logger.success(
+                                f"✅ Market {side.value} order accepted: {symbol} "
+                                f"size={size} leverage={leverage}x"
+                            )
+                            return order_id or "accepted"
+                        logger.error(f"Hyperliquid rejected market order: {result}")
+                        return None
                     else:
                         error_text = await response.text()
                         logger.error(f"Failed to execute market order: {error_text}")
@@ -242,9 +306,11 @@ class TradeExecutor:
 
         try:
             if leverage > 1:
-                await self._update_leverage(symbol, leverage)
+                if not await self._update_leverage(symbol, leverage):
+                    logger.error(f"Cannot place {symbol} order because leverage update failed")
+                    return None
 
-            asset_index = await self._get_asset_index(symbol)
+            asset_index, size_decimals = await self._get_asset_info(symbol)
             tif = "Alo" if post_only else "Gtc"
 
             action = {
@@ -252,8 +318,10 @@ class TradeExecutor:
                 "orders": [{
                     "a": asset_index,
                     "b": side == OrderSide.BUY,
-                    "p": str(float(price)),
-                    "s": str(float(size)),
+                    # Target limit prices are already exchange-valid; keep
+                    # their precision as the official SDK does.
+                    "p": float_to_wire(price),
+                    "s": self._wire_size(size, size_decimals),
                     "r": reduce_only,
                     "t": {"limit": {"tif": tif}},
                     "c": None
@@ -271,13 +339,14 @@ class TradeExecutor:
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        logger.success(
-                            f"✅ Limit {side.value} order placed: {symbol} "
-                            f"size={size} price={price} leverage={leverage}x"
-                        )
-                        if result.get("status") == "ok" and result.get("response", {}).get("data"):
-                            order_id = result["response"]["data"].get("statuses", [{}])[0].get("resting", {}).get("oid")
-                            return order_id
+                        order_id = self._extract_order_id(result)
+                        if result.get("status") == "ok" and not self._result_has_error(result):
+                            logger.success(
+                                f"✅ Limit {side.value} order accepted: {symbol} "
+                                f"size={size} price={price} leverage={leverage}x"
+                            )
+                            return order_id or "accepted"
+                        logger.error(f"Hyperliquid rejected limit order: {result}")
                         return None
                     else:
                         error_text = await response.text()

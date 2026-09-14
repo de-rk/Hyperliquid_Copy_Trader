@@ -106,6 +106,9 @@ class Settings(BaseModel):
         
         use_limit = os.getenv('USE_LIMIT_ORDERS', 'false').lower()
         settings.copy_rules.use_limit_orders = use_limit in ('true', '1', 'yes')
+
+        max_slippage = os.getenv('MAX_SLIPPAGE_PCT', '1.0')
+        settings.copy_rules.max_slippage_pct = float(max_slippage)
         
         # Leverage adjustment
         leverage_adj = os.getenv('LEVERAGE_ADJUSTMENT', '0.5')

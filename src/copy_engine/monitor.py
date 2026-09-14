@@ -138,11 +138,11 @@ class WalletMonitor:
         
         for pos_data in positions:
             # Parse position data
-            symbol = positions.get("coin", "").upper()
+            symbol = pos_data.get("coin", "")
             size = float(pos_data.get("szi", 0))
-            
+
             # Check if asset is blocked
-            if symbol in settings.copy_rules.blocked_assets:
+            if symbol.upper() in settings.copy_rules.blocked_assets:
                 logger.debug(f"⛔ Ignoring position update for blocked asset: {symbol}")
                 continue
             

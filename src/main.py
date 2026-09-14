@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from decimal import Decimal
 from loguru import logger
 from config.settings import settings
 from utils.logger import setup_logger
@@ -32,6 +33,20 @@ bot_start_time = None
 simulated_balance = 0.0
 simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'side': str}
 simulated_pnl = 0.0
+
+
+async def get_follower_balance() -> float | None:
+    """Return the balance used for live sizing, or the simulated balance."""
+    if settings.simulated_trading:
+        return simulated_balance
+    if not settings.hyperliquid.wallet_address:
+        logger.error("Live sizing requires HYPERLIQUID_WALLET_ADDRESS")
+        return None
+    follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
+    if follower_state is None:
+        logger.error("Unable to read follower wallet state")
+        return None
+    return follower_state.balance
 
 
 def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
@@ -141,7 +156,9 @@ async def on_new_position(position_data: dict):
         size = float(position_data.get("szi", 0))
         side = PositionSide.LONG if size > 0 else PositionSide.SHORT
         
-        position_info = position_data.get("position", {})
+        # REST snapshots wrap this under ``position`` while websocket
+        # position updates can provide the fields at the top level.
+        position_info = position_data.get("position", position_data)
         entry_price = float(position_info.get("entryPx", 0))
         target_leverage = float(position_info.get("leverage", {}).get("value", 1))
         
@@ -175,13 +192,16 @@ async def on_new_position(position_data: dict):
         target_state = monitor.current_state
         target_balance = target_state.balance if target_state else 100000  # Default if unknown
         
-        # Calculate your position size
-        your_balance = 1000  # TODO: Get actual balance from your account
+        # Calculate your position size from the follower's actual balance.
+        your_balance = await get_follower_balance()
+        if your_balance is None:
+            return
         your_exposure = 0  # TODO: Calculate current exposure
         
         # Simplified calculation for now
         if settings.sizing.mode == "proportional":
-            your_size = abs(size) * settings.sizing.portfolio_ratio
+            ratio = your_balance / target_balance if target_balance > 0 else settings.sizing.portfolio_ratio
+            your_size = abs(size) * ratio
         else:
             your_size = settings.sizing.fixed_size / entry_price if entry_price > 0 else 0
         
@@ -214,7 +234,7 @@ async def on_new_position(position_data: dict):
         logger.info(f"Executing trade...")
         result = await executor.execute_market_order(
             symbol=symbol,
-            side=side,
+            side=OrderSide.BUY if side == PositionSide.LONG else OrderSide.SELL,
             size=your_size,
             leverage=your_leverage
         )
@@ -288,9 +308,28 @@ async def on_position_close(position_data: dict):
             
             del simulated_positions[symbol]
     
-    # Close your corresponding position
+    # Close the corresponding follower position. A reduce-only order must use
+    # the follower's actual size and the opposite side; a placeholder size can
+    # leave the position open or create a new position.
     logger.info("   -> Closing your position...")
-    await executor.close_position(symbol)
+    if settings.simulated_trading:
+        await executor.close_position(symbol)
+    else:
+        follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
+        follower_position = next(
+            (position for position in (follower_state.positions if follower_state else [])
+             if position.symbol == symbol),
+            None,
+        )
+        if follower_position is None:
+            logger.info(f"No follower position found for {symbol}; nothing to close")
+            return
+        close_side = OrderSide.SELL if follower_position.side == PositionSide.LONG else OrderSide.BUY
+        await executor.close_position(
+            symbol,
+            size=Decimal(str(follower_position.size)),
+            side=close_side,
+        )
 
 
 async def on_position_update(position_data: dict):
@@ -342,13 +381,15 @@ async def on_new_order(order_data: dict):
         logger.info(f"Target Size: {target_size}")
         logger.info(f"Price: ${price:,.2f}")
         
-        # Calculate our order size
+        # Calculate our order size from the current follower/target balance
+        # ratio. This path previously called PositionSizer with an invalid
+        # signature and could not copy limit orders.
         if settings.copy_rules.auto_adjust_size:
-            our_size = position_sizer.calculate_size(
-                target_size=target_size,
-                symbol=symbol,
-                current_exposure=monitor.current_state.total_equity if monitor.current_state else 0
-            )
+            follower_balance = await get_follower_balance()
+            target_balance = monitor.current_state.balance if monitor.current_state else 0
+            if follower_balance is None or target_balance <= 0:
+                return
+            our_size = target_size * (follower_balance / target_balance)
         else:
             our_size = target_size
         
@@ -359,7 +400,7 @@ async def on_new_order(order_data: dict):
         # Execute the order
         result = await executor.execute_limit_order(
             symbol=symbol,
-            side=side,
+            side=OrderSide.BUY if side == 'B' else OrderSide.SELL,
             size=our_size,
             price=price
         )
@@ -380,9 +421,9 @@ async def on_new_order(order_data: dict):
             if notifier:
                 await notifier.send_trade_notification(
                     symbol=symbol,
-                    side=side,
+                    side=OrderSide.BUY.value if side == 'B' else OrderSide.SELL.value,
                     size=our_size,
-                    price=price,
+                    entry_price=price,
                     leverage=1.0,  # Orders don't have leverage until filled
                     target_size=target_size
                 )
@@ -499,10 +540,20 @@ async def on_order_fill(fill_data: dict):
                 return
         
         # Calculate our fill size
+        # In live mode, use the follower wallet balance rather than the
+        # simulated balance used by the dry-run account tracker.
+        follower_balance = simulated_balance
+        if not settings.simulated_trading:
+            follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
+            if follower_state is None:
+                logger.error("Unable to read follower wallet state; skipping fill")
+                return
+            follower_balance = follower_state.balance
+
         our_size = position_sizer.calculate_size(
             target_position=target_position,
             target_wallet_balance=monitor.current_state.balance if monitor.current_state else 1000000,
-            your_wallet_balance=simulated_balance if settings.simulated_trading else (monitor.current_state.balance if monitor.current_state else 10000)
+            your_wallet_balance=follower_balance
         )
         
         if not our_size:
@@ -548,7 +599,7 @@ async def on_order_fill(fill_data: dict):
             # Place limit order at the fill price
             result = await executor.execute_limit_order(
                 symbol=symbol,
-                side=position_side,
+                side=OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL,
                 size=our_size,
                 price=price,
                 leverage=our_leverage
@@ -557,7 +608,7 @@ async def on_order_fill(fill_data: dict):
             # Place market order (original behavior)
             result = await executor.execute_market_order(
                 symbol=symbol,
-                side=position_side,
+                side=OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL,
                 size=our_size,
                 leverage=our_leverage
             )
@@ -611,7 +662,7 @@ async def on_order_fill(fill_data: dict):
             if notifier:
                 await notifier.send_trade_notification(
                     symbol=symbol,
-                    side=position_side,
+                    side=OrderSide.BUY.value if position_side == PositionSide.LONG else OrderSide.SELL.value,
                     size=our_size,
                     entry_price=price,
                     leverage=our_leverage,
@@ -825,7 +876,8 @@ async def main():
     bot_start_time = datetime.now()
     trades_copied_count = 0
     
-    # Initialize simulated account
+    # Keep this variable as the account balance used by sizing and status
+    # reporting. In live mode it is populated from the follower wallet below.
     simulated_balance = settings.simulated_account_balance
     
     logger.info("=" * 60)
@@ -855,7 +907,8 @@ async def main():
         private_key=settings.hyperliquid.private_key,
         info_url=settings.hyperliquid.api_url + "/info",
         exchange_url=settings.hyperliquid.api_url + "/exchange",
-        dry_run=True  # Always start in dry run mode for safety!
+        dry_run=settings.simulated_trading,
+        max_slippage_pct=settings.copy_rules.max_slippage_pct,
     )
     
     # Fetch target wallet state to auto-calculate ratio
@@ -872,6 +925,15 @@ async def main():
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
         logger.info(f"   Open Positions: {len(state.positions)}")
         
+        # In live mode, size against the follower wallet's actual balance.
+        if not settings.simulated_trading:
+            if not settings.hyperliquid.wallet_address or not settings.hyperliquid.private_key:
+                raise RuntimeError("Live trading requires HYPERLIQUID_WALLET_ADDRESS and HYPERLIQUID_PRIVATE_KEY")
+            follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
+            if follower_state is None:
+                raise RuntimeError("Unable to read follower wallet state")
+            simulated_balance = follower_state.balance
+
         # Auto-calculate ratio based on balances
         auto_ratio = simulated_balance / target_balance
         settings.sizing.portfolio_ratio = auto_ratio
@@ -996,10 +1058,10 @@ async def main():
                 logger.success(f"   → Margin: ${margin_needed:,.2f}")
                 
                 # Execute the copy
-                side = PositionSide.LONG if pos.size > 0 else PositionSide.SHORT
+                position_side = PositionSide.LONG if pos.size > 0 else PositionSide.SHORT
                 result = await executor.execute_market_order(
                     symbol=pos.symbol,
-                    side=side,
+                    side=OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL,
                     size=your_size,
                     leverage=your_leverage
                 )
@@ -1008,9 +1070,9 @@ async def main():
                     # Update simulated account
                     if settings.simulated_trading:
                         simulated_positions[pos.symbol] = {
-                            'size': your_size if side == PositionSide.LONG else -your_size,
+                            'size': your_size if position_side == PositionSide.LONG else -your_size,
                             'entry_price': pos.entry_price,
-                            'side': side.value.upper(),
+                            'side': position_side.value.upper(),
                             'leverage': your_leverage,
                             'value': your_position_value,
                             'margin_used': margin_needed
@@ -1072,7 +1134,7 @@ async def main():
                 # Execute the order
                 result = await executor.execute_limit_order(
                     symbol=order.symbol,
-                    side=position_side,
+                    side=order.side,
                     size=your_size,
                     price=order.price,
                     leverage=your_leverage
