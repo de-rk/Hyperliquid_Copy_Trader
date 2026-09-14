@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from loguru import logger
 from config.settings import settings
 from utils.logger import setup_logger
@@ -8,7 +9,6 @@ from hyperliquid.client import HyperliquidClient
 from hyperliquid.websocket import HyperliquidWebSocket
 from hyperliquid.models import WebSocketUpdate, PositionSide, OrderSide
 from copy_engine import WalletMonitor, TradeExecutor, PositionSizer
-from telegram_bot import TelegramBot, NotificationService
 
 # Setup logging
 setup_logger(settings.log_file, settings.log_level)
@@ -21,8 +21,8 @@ monitor: WalletMonitor = None
 executor: TradeExecutor = None
 position_sizer: PositionSizer = None
 client: HyperliquidClient = None
-telegram_bot: TelegramBot = None
-notifier: NotificationService = None
+telegram_bot: Any = None
+notifier: Any = None
 
 # State tracking
 is_paused = False
@@ -1169,6 +1169,15 @@ async def main():
     
     # Initialize Telegram bot if configured
     if settings.telegram.bot_token and settings.telegram.chat_id:
+        try:
+            from telegram_bot import TelegramBot, NotificationService
+        except ImportError as exc:
+            raise RuntimeError(
+                "Telegram is configured but optional dependencies are missing. "
+                "Install requirements-telegram.txt or clear TELEGRAM_BOT_TOKEN "
+                "and TELEGRAM_CHAT_ID."
+            ) from exc
+
         logger.info("🤖 Initializing Telegram bot...")
         
         notifier = NotificationService(

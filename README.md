@@ -39,6 +39,13 @@ docker-compose up -d
 pip install -r requirements.txt
 ```
 
+Telegram control and notifications are optional. Install them only when you
+set both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`:
+
+```bash
+pip install -r requirements-telegram.txt
+```
+
 3. Configure .env file with your settings
 4. Run the bot:
 

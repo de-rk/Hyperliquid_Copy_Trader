@@ -1,0 +1,2 @@
+# Optional Telegram control and notifications
+python-telegram-bot==20.7
