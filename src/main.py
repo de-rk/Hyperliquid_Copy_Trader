@@ -353,9 +353,9 @@ async def on_new_order(order_data: dict):
         logger.warning("⏸️ Bot is paused - skipping order copy")
         return
     
-    # Check if we should copy orders
-    if not settings.copy_rules.copy_existing_orders:
-        return
+    # ``COPY_EXISTING_ORDERS`` only controls the startup snapshot below.
+    # This callback is fed by WebSocket events and must remain active so a
+    # newly-created target order can be copied even when startup copying is off.
     
     # Check max open orders limit
     if settings.copy_rules.max_open_orders is not None:
