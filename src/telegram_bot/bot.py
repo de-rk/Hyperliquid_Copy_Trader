@@ -40,6 +40,7 @@ class TelegramBot:
         self.get_positions_callback: Optional[Callable] = None
         self.get_orders_callback: Optional[Callable] = None
         self.get_pnl_callback: Optional[Callable] = None
+        self.get_leaderboard_callback: Optional[Callable] = None
         
         logger.info(f"Telegram bot initialized for chat {allowed_chat_id}")
     
@@ -66,6 +67,7 @@ class TelegramBot:
 /positions - 查看当前持仓
 /orders - 查看当前挂单
 /pnl - 查看收益摘要
+/leaderboard - 查看公开收益排行榜
 /pause - 暂停复制新成交，保留仓位
 /resume - 恢复复制
 /stop - 停止机器人，可选择是否平仓
@@ -128,7 +130,8 @@ class TelegramBot:
                     message += f"<b>{i}. {order['symbol']} {side}</b>\n"
                     message += f"   类型：{order_type}\n"
                     message += f"   数量：{abs(order['size']):.4f}\n"
-                    message += f"   价格：${order['price']:,.2f}\n"
+                    price = order.get('price')
+                    message += f"   价格：${price:,.2f}\n" if price is not None else "   价格：市价\n"
                     
                     if 'trigger_price' in order and order['trigger_price']:
                         message += f"   触发价：${order['trigger_price']:,.2f}\n"
@@ -204,6 +207,34 @@ class TelegramBot:
             reply_markup=reply_markup,
             parse_mode="HTML"
         )
+
+    @staticmethod
+    def _leaderboard_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("24H 收益", callback_data="leaderboard:day:pnl"),
+                InlineKeyboardButton("24H 收益率", callback_data="leaderboard:day:roi"),
+            ],
+            [
+                InlineKeyboardButton("7D 收益", callback_data="leaderboard:week:pnl"),
+                InlineKeyboardButton("7D 收益率", callback_data="leaderboard:week:roi"),
+            ],
+            [
+                InlineKeyboardButton("30D 收益", callback_data="leaderboard:month:pnl"),
+                InlineKeyboardButton("30D 收益率", callback_data="leaderboard:month:roi"),
+            ],
+        ])
+
+    async def _leaderboard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show period and sort selectors for the public leaderboard."""
+        if not self._check_authorized(update):
+            await update.message.reply_text("⛔ 未授权的聊天")
+            return
+        await update.message.reply_text(
+            "🏆 <b>Hyperliquid 收益排行榜</b>\n\n请选择周期和排序方式：",
+            reply_markup=self._leaderboard_keyboard(),
+            parse_mode="HTML",
+        )
     
     async def _button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button callbacks"""
@@ -212,6 +243,26 @@ class TelegramBot:
         
         if not self._check_authorized(update):
             await query.edit_message_text("⛔ 未授权的聊天")
+            return
+
+        if query.data and query.data.startswith("leaderboard:"):
+            parts = query.data.split(":")
+            if len(parts) != 3 or parts[1] not in {"day", "week", "month"} or parts[2] not in {"pnl", "roi"}:
+                await query.edit_message_text("❌ 无效的排行榜选项")
+                return
+            if not self.get_leaderboard_callback:
+                await query.edit_message_text("排行榜查询尚未配置")
+                return
+            try:
+                result = await self.get_leaderboard_callback(parts[1], parts[2])
+                await query.edit_message_text(
+                    result,
+                    reply_markup=self._leaderboard_keyboard(),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"Error getting leaderboard: {e}")
+                await query.edit_message_text(f"❌ 获取排行榜失败：{e}")
             return
         
         if query.data == "stop_close":
@@ -297,6 +348,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("resume", self._resume_command))
         self.app.add_handler(CommandHandler("stop", self._stop_command))
         self.app.add_handler(CommandHandler("pnl", self._pnl_command))
+        self.app.add_handler(CommandHandler("leaderboard", self._leaderboard_command))
         
         # Add callback query handler for buttons
         self.app.add_handler(CallbackQueryHandler(self._button_callback))

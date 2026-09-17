@@ -99,8 +99,8 @@ class UserState:
     
     @property
     def total_equity(self) -> float:
-        """Calculate total equity (balance + unrealized PnL)"""
-        return self.balance + self.unrealized_pnl
+        """Account value already includes unrealized PnL on Hyperliquid."""
+        return self.balance
     
     @property
     def margin_ratio(self) -> float:

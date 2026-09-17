@@ -9,10 +9,15 @@ class HyperliquidClient:
     Client for interacting with Hyperliquid REST API
     """
     
-    def __init__(self, api_url: str = "https://api.hyperliquid.xyz"):
+    def __init__(
+        self,
+        api_url: str = "https://api.hyperliquid.xyz",
+        leaderboard_url: str = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
+    ):
         self.api_url = api_url
         self.info_url = f"{api_url}/info"
         self.exchange_url = f"{api_url}/exchange"
+        self.leaderboard_url = leaderboard_url
         # The first null entry is the default perp DEX. Additional HIP-3 DEXs
         # are discovered from the official perpDexs endpoint at runtime.
         self.dexs = [""]
@@ -131,10 +136,14 @@ class HyperliquidClient:
                         trigger_price=float(order.get("triggerPx", 0)) if order.get("triggerPx") else None
                     ))
             
-            # Parse account balance
-            balance = float(all_responses.get("marginSummary", {}).get("accountValue", 0))
-            margin_used = float(all_responses.get("marginSummary", {}).get("totalMarginUsed", 0))
-            unrealized_pnl = float(all_responses.get("marginSummary", {}).get("totalNtlPos", 0))
+            # Parse account balance. A wallet with no perp state is still a
+            # valid account; return a zeroed state instead of raising here.
+            summary = (all_responses or {}).get("marginSummary", {})
+            balance = float(summary.get("accountValue", 0))
+            margin_used = float(summary.get("totalMarginUsed", 0))
+            # ``totalNtlPos`` is total position notional, not PnL. Sum the
+            # exchange-provided PnL from each open position instead.
+            unrealized_pnl = sum(position.unrealized_pnl for position in positions)
             
             from datetime import datetime
             return UserState(
@@ -150,6 +159,172 @@ class HyperliquidClient:
         except Exception as e:
             logger.error(f"Failed to get user state for {address}: {e}")
             return None
+
+    @staticmethod
+    def _as_float(value: Any) -> Optional[float]:
+        try:
+            if isinstance(value, str):
+                value = value.strip().replace(",", "").replace("%", "")
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _history_points(cls, payload: Any) -> List[tuple[int, float]]:
+        """Normalize portfolio history points from Hyperliquid API responses."""
+        if isinstance(payload, dict):
+            for key in ("accountValueHistory", "history", "values", "data"):
+                if key in payload:
+                    return cls._history_points(payload[key])
+            payload = [payload]
+
+        points: List[tuple[int, float]] = []
+        if not isinstance(payload, list):
+            return points
+
+        for item in payload:
+            timestamp = value = None
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                timestamp, value = item[0], item[1]
+            elif isinstance(item, dict):
+                timestamp = item.get("time", item.get("timestamp", item.get("t")))
+                value = item.get("value", item.get("accountValue", item.get("v")))
+            timestamp_number = cls._as_float(timestamp)
+            value_number = cls._as_float(value)
+            if timestamp_number is not None and value_number is not None:
+                points.append((int(timestamp_number), value_number))
+        return sorted(points, key=lambda point: point[0])
+
+    @classmethod
+    def _portfolio_windows(cls, response: Any) -> Dict[str, Any]:
+        """Extract day/week/month payloads across documented response shapes."""
+        windows: Dict[str, Any] = {}
+        aliases = {"day": "day", "24h": "day", "week": "week", "7d": "week", "month": "month", "30d": "month"}
+
+        if isinstance(response, dict):
+            source = response.get("data", response)
+            if isinstance(source, dict):
+                for key, payload in source.items():
+                    normalized = aliases.get(str(key).lower())
+                    if normalized:
+                        windows[normalized] = payload
+        elif isinstance(response, list):
+            for item in response:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    normalized = aliases.get(str(item[0]).lower())
+                    if normalized:
+                        windows[normalized] = item[1]
+                elif isinstance(item, dict):
+                    window = item.get("window", item.get("period", item.get("timeframe")))
+                    normalized = aliases.get(str(window).lower()) if window is not None else None
+                    if normalized:
+                        windows[normalized] = item
+        return windows
+
+    async def get_portfolio_performance(self, address: str) -> Dict[str, Optional[Dict[str, float]]]:
+        """Return account-value changes for Hyperliquid's day/week/month windows.
+
+        These are net-value changes, so deposits and withdrawals during a
+        window affect the result. That is preferable to presenting a made-up
+        realized PnL when the exchange does not provide complete cash-flow data.
+        """
+        empty = {"24H": None, "7D": None, "30D": None}
+        try:
+            response = await self._post(self.info_url, {"type": "portfolio", "user": address})
+            windows = self._portfolio_windows(response)
+            periods = {"24H": "day", "7D": "week", "30D": "month"}
+            result: Dict[str, Optional[Dict[str, float]]] = {}
+            for label, window in periods.items():
+                points = self._history_points(windows.get(window))
+                if len(points) < 2 or points[0][1] == 0:
+                    result[label] = None
+                    continue
+                start_value = points[0][1]
+                end_value = points[-1][1]
+                change = end_value - start_value
+                result[label] = {
+                    "change": change,
+                    "change_pct": change / start_value * 100,
+                    "start_value": start_value,
+                    "end_value": end_value,
+                }
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get portfolio performance for {address}: {e}")
+            return empty
+
+    @staticmethod
+    def _leaderboard_rows(response: Any) -> List[Dict[str, Any]]:
+        """Accept the known leaderboard response wrappers without inventing data."""
+        if isinstance(response, list):
+            return [row for row in response if isinstance(row, dict)]
+        if not isinstance(response, dict):
+            return []
+        for key in ("leaderboardRows", "rows", "data", "leaderboard"):
+            rows = response.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        return []
+
+    async def get_leaderboard(
+        self,
+        window: str,
+        sort_by: str = "pnl",
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Fetch and normalize the public Hyperliquid leaderboard."""
+        if window not in {"day", "week", "month"}:
+            raise ValueError(f"Unsupported leaderboard window: {window}")
+        if sort_by not in {"pnl", "roi"}:
+            raise ValueError(f"Unsupported leaderboard sort: {sort_by}")
+
+        params = {"timeWindow": window, "sortBy": sort_by}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.leaderboard_url, params=params) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+        except aiohttp.ClientError as e:
+            logger.error(f"Failed to get Hyperliquid leaderboard: {e}")
+            return []
+
+        def window_values(row: Dict[str, Any]) -> Dict[str, Any]:
+            """Extract values from APIs that return all windows per row."""
+            for key in ("windowPerformances", "performances", "windows"):
+                values = row.get(key)
+                if isinstance(values, dict):
+                    selected = values.get(window) or values.get({"day": "24H", "week": "7D", "month": "30D"}[window])
+                    if isinstance(selected, dict):
+                        return selected
+                elif isinstance(values, list):
+                    for item in values:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2 and str(item[0]).lower() in {window, {"day": "24h", "week": "7d", "month": "30d"}[window]}:
+                            if isinstance(item[1], dict):
+                                return item[1]
+                        elif isinstance(item, dict) and str(item.get("window", item.get("period", ""))).lower() in {window, {"day": "24h", "week": "7d", "month": "30d"}[window]}:
+                            return item
+            return row
+
+        normalized: List[Dict[str, Any]] = []
+        for index, row in enumerate(self._leaderboard_rows(payload), 1):
+            values = window_values(row)
+            pnl = self._as_float(values.get("pnl", values.get("pnlUsd", values.get("profit"))))
+            roi = self._as_float(values.get("roi", values.get("returnOnEquity", values.get("return"))))
+            address = row.get("ethAddress", row.get("address", row.get("user", "")))
+            display_name = row.get("displayName", row.get("name", ""))
+            if pnl is None and roi is None:
+                continue
+            normalized.append({
+                "rank": int(row.get("rank", index)),
+                "address": str(address),
+                "name": str(display_name),
+                "pnl": pnl,
+                "roi": roi,
+            })
+
+        key = "roi" if sort_by == "roi" else "pnl"
+        normalized.sort(key=lambda row: row[key] if row[key] is not None else float("-inf"), reverse=True)
+        return normalized[:max(1, min(limit, 20))]
     
     async def get_all_assets(self) -> List[Dict[str, Any]]:
         """Get list of all available trading assets"""

@@ -1,4 +1,5 @@
 import asyncio
+import html
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -895,14 +896,14 @@ async def get_status() -> str:
     """Get current bot status for Telegram"""
     uptime = (datetime.now() - bot_start_time).total_seconds() / 3600 if bot_start_time else 0
     
-    state = monitor.current_state if monitor else None
+    follower_state = None if settings.simulated_trading else await _get_follower_state()
     
     if settings.simulated_trading:
         balance = simulated_balance
         pnl = simulated_pnl
     else:
-        balance = state.balance if state else 0
-        pnl = state.unrealized_pnl if state else 0
+        balance = follower_state.balance if follower_state else 0
+        pnl = follower_state.unrealized_pnl if follower_state else 0
     
     status_emoji = "🟢" if not is_paused else "⏸️"
     status_text = "运行中" if not is_paused else "已暂停"
@@ -917,7 +918,7 @@ async def get_status() -> str:
 💼 <b>账户余额：</b>${balance:,.2f}
 📈 <b>未实现盈亏：</b>${pnl:,.2f}
 📊 <b>已复制成交：</b>{trades_copied_count}
-📍 <b>持仓数：</b>{len(simulated_positions) if settings.simulated_trading else (len(state.positions) if state else 0)}
+📍 <b>持仓数：</b>{len(simulated_positions) if settings.simulated_trading else (len(follower_state.positions) if follower_state else 0)}
 ⏰ <b>运行时长：</b>{uptime:.1f} 小时
 
 <b>仓位模式：</b>{settings.sizing.mode.title()}
@@ -925,13 +926,25 @@ async def get_status() -> str:
     """.strip()
 
 
-def get_positions() -> list:
-    """Get current positions for Telegram command"""
-    if not monitor or not monitor.current_state:
+async def get_positions() -> list:
+    """Get positions from the follower account for Telegram."""
+    state = await _get_follower_state() if not settings.simulated_trading else None
+    if settings.simulated_trading:
+        return [
+            {
+                "symbol": symbol,
+                "size": position.get("size", 0),
+                "entry_price": position.get("entry_price", 0),
+                "current_price": position.get("entry_price", 0),
+                "unrealized_pnl": 0,
+                "leverage": position.get("leverage", 1),
+            }
+            for symbol, position in simulated_positions.items()
+        ]
+    if not state:
         return []
-    
     positions = []
-    for pos in monitor.current_state.positions:
+    for pos in state.positions:
         positions.append({
             'symbol': pos.symbol,
             'size': pos.size,
@@ -944,13 +957,14 @@ def get_positions() -> list:
     return positions
 
 
-def get_orders() -> list:
-    """Get current open orders for Telegram command"""
-    if not monitor or not monitor.current_state:
+async def get_orders() -> list:
+    """Get open orders from the follower account for Telegram."""
+    state = await _get_follower_state() if not settings.simulated_trading else None
+    if not state:
         return []
     
     orders = []
-    for order in monitor.current_state.orders:
+    for order in state.orders:
         orders.append({
             'symbol': order.symbol,
             'side': order.side,
@@ -963,9 +977,36 @@ def get_orders() -> list:
     return orders
 
 
+async def _get_follower_state():
+    """Read the account that receives copied orders, never the target account."""
+    if settings.simulated_trading or not client or not settings.hyperliquid.wallet_address:
+        return None
+    return await client.get_user_state(settings.hyperliquid.wallet_address)
+
+
+def _format_performance(performance: dict) -> str:
+    lines = []
+    for label in ("24H", "7D", "30D"):
+        item = performance.get(label) if performance else None
+        if not item:
+            lines.append(f"• {label}：暂无数据")
+            continue
+        change = item["change"]
+        emoji = "📈" if change >= 0 else "📉"
+        lines.append(f"• {label}：{emoji} ${change:+,.2f} ({item['change_pct']:+.2f}%)")
+    return "\n".join(lines)
+
+
+def _wallet_label(address: str) -> str:
+    if not address:
+        return "未配置"
+    return f"{address[:10]}...{address[-6:]}"
+
+
 async def get_pnl() -> str:
     """Get PnL for Telegram"""
-    state = monitor.current_state if monitor else None
+    target_state = monitor.current_state if monitor else None
+    follower_state = None
     
     if settings.simulated_trading:
         balance = simulated_balance
@@ -973,30 +1014,58 @@ async def get_pnl() -> str:
         pnl = simulated_pnl
         mode = "模拟"
     else:
-        balance = state.balance if state else 0
-        equity = state.total_equity if state else 0
-        pnl = state.unrealized_pnl if state else 0
+        follower_state = await _get_follower_state()
+        balance = follower_state.balance if follower_state else 0
+        equity = follower_state.total_equity if follower_state else 0
+        pnl = follower_state.unrealized_pnl if follower_state else 0
         mode = "实盘"
-    
+
+    target_performance = await client.get_portfolio_performance(settings.target_wallet) if client else {}
+    follower_performance = (
+        await client.get_portfolio_performance(settings.hyperliquid.wallet_address)
+        if client and not settings.simulated_trading and settings.hyperliquid.wallet_address else {}
+    )
+    target_line = _wallet_label(settings.target_wallet)
+    follower_line = _wallet_label(settings.hyperliquid.wallet_address) if not settings.simulated_trading else "模拟账户"
+    target_summary = (
+        f"余额：${target_state.balance:,.2f}｜未实现盈亏：${target_state.unrealized_pnl:,.2f}"
+        if target_state else "当前状态暂无数据"
+    )
+    history_note = "模拟模式不提供跟随账户链上历史" if settings.simulated_trading else "按账户净值计算，充值/提现会影响结果"
     return f"""
 💰 <b>账户盈亏摘要</b>
 
 🎮 <b>模式：</b>{mode}
 
-<b>账户：</b>
+<b>跟随钱包：</b><code>{follower_line}</code>
 • 余额：${balance:,.2f}
 • 权益：${equity:,.2f}
 • 未实现盈亏：${pnl:,.2f}
 
+<b>跟随钱包周期净值变化</b>
+{_format_performance(follower_performance) if not settings.simulated_trading else '• 24H/7D/30D：模拟模式暂无链上历史'}
+
+<b>目标钱包：</b><code>{target_line}</code>
+• {target_summary}
+<b>目标钱包周期净值变化</b>
+{_format_performance(target_performance)}
+
 <b>本次运行：</b>
 • 已复制成交：{trades_copied_count}
-• 持仓数：{len(simulated_positions) if settings.simulated_trading else (len(state.positions) if state else 0)}
+• 跟随持仓数：{len(simulated_positions) if settings.simulated_trading else (len(follower_state.positions) if follower_state else 0)}
+
+<i>{history_note}</i>
     """.strip()
 
 
 async def get_positions_formatted() -> str:
     """Get current positions for Telegram"""
-    state = monitor.current_state if monitor else None
+    state = await _get_follower_state() if not settings.simulated_trading else None
+    if settings.simulated_trading:
+        return "📍 <b>当前持仓（模拟跟随账户）</b>\n\n" + ("暂无持仓。" if not simulated_positions else "\n".join(
+            f"• <b>{html.escape(symbol)}</b>：{position['size']:.4f}"
+            for symbol, position in simulated_positions.items()
+        ))
     
     if not state or not state.positions:
         return "📍 <b>当前持仓</b>\n\n暂无持仓。"
@@ -1006,7 +1075,7 @@ async def get_positions_formatted() -> str:
     for i, pos in enumerate(state.positions, 1):
         pnl_emoji = "📈" if pos.unrealized_pnl > 0 else "📉"
         message += f"""
-{i}️⃣ <b>{pos.symbol}</b> {pos.side.value.upper()}
+{i}️⃣ <b>{html.escape(pos.symbol)}</b> {pos.side.value.upper()}
    数量：{pos.size:.4f}
    开仓价：${pos.entry_price:,.2f}
    当前价：${pos.current_price:,.2f}
@@ -1016,6 +1085,28 @@ async def get_positions_formatted() -> str:
 """
     
     return message.strip()
+
+
+async def get_leaderboard(window: str, sort_by: str) -> str:
+    """Format the public Hyperliquid leaderboard for Telegram."""
+    labels = {"day": "24H", "week": "7D", "month": "30D"}
+    sort_labels = {"pnl": "收益额", "roi": "收益率"}
+    rows = await client.get_leaderboard(window, sort_by, limit=10) if client else []
+    title = f"🏆 <b>Hyperliquid 收益排行榜</b>\n周期：{labels[window]}｜排序：{sort_labels[sort_by]}"
+    if not rows:
+        return title + "\n\n暂无数据。公开排行榜接口暂不可用或未返回该周期数据。"
+
+    lines = [title, ""]
+    for index, row in enumerate(rows, 1):
+        name = row.get("name") or _wallet_label(row.get("address", ""))
+        pnl = row.get("pnl")
+        roi = row.get("roi")
+        pnl_text = f"${pnl:+,.2f}" if pnl is not None else "暂无"
+        roi_text = f"{roi:+.2f}%" if roi is not None else "暂无"
+        lines.append(f"<b>{index}. {html.escape(str(name))}</b>")
+        lines.append(f"   收益：{pnl_text}｜收益率：{roi_text}")
+    lines.append("\n<i>数据来自 Hyperliquid 公开排行榜，不代表跟随钱包收益。</i>")
+    return "\n".join(lines)
 
 
 async def handle_pause():
@@ -1066,14 +1157,26 @@ async def send_hourly_reports():
             await asyncio.sleep(3600)  # Wait 1 hour
             
             if notifier and monitor and monitor.current_state:
-                state = monitor.current_state
+                state = await _get_follower_state() if not settings.simulated_trading else None
+                if settings.simulated_trading:
+                    account_pnl = simulated_pnl
+                    account_balance = simulated_balance
+                    open_positions = len(simulated_positions)
+                    open_orders = 0
+                elif not state:
+                    continue
+                else:
+                    account_pnl = state.unrealized_pnl
+                    account_balance = state.balance
+                    open_positions = len(state.positions)
+                    open_orders = len(state.orders)
                 
                 await notifier.send_hourly_report(
                     trades_copied=trades_copied_count,
-                    account_pnl_usd=state.unrealized_pnl,
-                    account_pnl_pct=(state.unrealized_pnl / state.balance * 100) if state.balance > 0 else 0,
-                    open_positions=len(state.positions),
-                    open_orders=len(state.orders),
+                    account_pnl_usd=account_pnl,
+                    account_pnl_pct=(account_pnl / account_balance * 100) if account_balance > 0 else 0,
+                    open_positions=open_positions,
+                    open_orders=open_orders,
                     target_wallet=settings.target_wallet
                 )
         except Exception as e:
@@ -1107,7 +1210,10 @@ async def main():
     logger.info(f"📍 Target Address: {target_address}")
     
     # Initialize components
-    client = HyperliquidClient(settings.hyperliquid.api_url)
+    client = HyperliquidClient(
+        settings.hyperliquid.api_url,
+        settings.hyperliquid.leaderboard_url,
+    )
     
     monitor = WalletMonitor(
         target_address,
@@ -1409,6 +1515,7 @@ async def main():
         telegram_bot.get_positions_callback = get_positions_formatted
         telegram_bot.get_orders_callback = get_orders
         telegram_bot.get_pnl_callback = get_pnl
+        telegram_bot.get_leaderboard_callback = get_leaderboard
         telegram_bot.on_pause_requested = handle_pause
         telegram_bot.on_resume_requested = handle_resume
         telegram_bot.on_stop_requested = handle_stop

@@ -10,6 +10,7 @@ load_dotenv()
 class HyperliquidConfig(BaseModel):
     api_url: str = Field(default="https://api.hyperliquid.xyz")
     ws_url: str = Field(default="wss://api.hyperliquid.xyz/ws")
+    leaderboard_url: str = Field(default="https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
     wallet_address: Optional[str] = None
     private_key: Optional[str] = None
 
@@ -82,6 +83,9 @@ class Settings(BaseModel):
         
         # Load from environment
         settings.hyperliquid.api_url = os.getenv('HYPERLIQUID_API_URL', settings.hyperliquid.api_url)
+        settings.hyperliquid.leaderboard_url = os.getenv(
+            'HYPERLIQUID_LEADERBOARD_URL', settings.hyperliquid.leaderboard_url
+        )
         settings.hyperliquid.wallet_address = os.getenv('HYPERLIQUID_WALLET_ADDRESS')
         settings.hyperliquid.private_key = os.getenv('HYPERLIQUID_PRIVATE_KEY')
         

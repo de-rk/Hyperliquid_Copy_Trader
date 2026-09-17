@@ -83,6 +83,8 @@ docker compose up -d --build
 ```properties
 # Hyperliquid API
 HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
+# 公开排行榜接口（通常无需修改）
+HYPERLIQUID_LEADERBOARD_URL=https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
 
 # 跟随钱包。实盘时两个值必须填写且地址必须匹配。
 HYPERLIQUID_WALLET_ADDRESS=
@@ -144,11 +146,14 @@ INSTALL_TELEGRAM=true
 - `/positions` 查看当前仓位
 - `/orders` 查看挂单
 - `/pnl` 查看收益摘要
+- `/leaderboard` 查看 Hyperliquid 公开排行榜，可按 24H、7D、30D 的收益额或收益率筛选
 - `/pause` 暂停复制新成交，保留已有仓位
 - `/resume` 恢复复制
 - `/stop` 停止机器人，可选择是否平仓
 
 同一个 Telegram Token 只能由一个实例轮询。出现 `terminated by other getUpdates request` 时，关闭使用同一 Token 的其他机器人实例。
+
+`/pnl` 会分别显示目标钱包和跟随钱包。实盘模式下，24H、7D、30D 使用账户净值历史计算；充值或提现也会影响净值变化。模拟模式没有跟随钱包的链上历史，因此这些周期显示为暂无数据。
 
 ## 常见问题
 
