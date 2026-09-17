@@ -905,23 +905,23 @@ async def get_status() -> str:
         pnl = state.unrealized_pnl if state else 0
     
     status_emoji = "🟢" if not is_paused else "⏸️"
-    status_text = "ACTIVE" if not is_paused else "PAUSED"
-    mode = "SIMULATED" if settings.simulated_trading else "LIVE"
+    status_text = "运行中" if not is_paused else "已暂停"
+    mode = "模拟" if settings.simulated_trading else "实盘"
     
     return f"""
-📊 <b>Copy Trading Status</b>
+📊 <b>跟单运行状态</b>
 
-{status_emoji} <b>Status:</b> {status_text}
-🎮 <b>Mode:</b> {mode}
-👤 <b>Target:</b> <code>{settings.target_wallet[:10]}...{settings.target_wallet[-6:]}</code>
-💼 <b>Your Balance:</b> ${balance:,.2f}
-📈 <b>Session PnL:</b> ${pnl:,.2f}
-📊 <b>Trades Copied:</b> {trades_copied_count}
-📍 <b>Open Positions:</b> {len(simulated_positions) if settings.simulated_trading else (len(state.positions) if state else 0)}
-⏰ <b>Uptime:</b> {uptime:.1f}h
+{status_emoji} <b>状态：</b>{status_text}
+🎮 <b>模式：</b>{mode}
+👤 <b>目标：</b><code>{settings.target_wallet[:10]}...{settings.target_wallet[-6:]}</code>
+💼 <b>账户余额：</b>${balance:,.2f}
+📈 <b>未实现盈亏：</b>${pnl:,.2f}
+📊 <b>已复制成交：</b>{trades_copied_count}
+📍 <b>持仓数：</b>{len(simulated_positions) if settings.simulated_trading else (len(state.positions) if state else 0)}
+⏰ <b>运行时长：</b>{uptime:.1f} 小时
 
-<b>Sizing Mode:</b> {settings.sizing.mode.title()}
-<b>Leverage:</b> {settings.leverage.adjustment_ratio}x of target
+<b>仓位模式：</b>{settings.sizing.mode.title()}
+<b>杠杆：</b>目标杠杆的 {settings.leverage.adjustment_ratio} 倍
     """.strip()
 
 
@@ -971,26 +971,26 @@ async def get_pnl() -> str:
         balance = simulated_balance
         equity = simulated_balance
         pnl = simulated_pnl
-        mode = "SIMULATED"
+        mode = "模拟"
     else:
         balance = state.balance if state else 0
         equity = state.total_equity if state else 0
         pnl = state.unrealized_pnl if state else 0
-        mode = "LIVE"
+        mode = "实盘"
     
     return f"""
-💰 <b>Account PnL Summary</b>
+💰 <b>账户盈亏摘要</b>
 
-🎮 <b>Mode:</b> {mode}
+🎮 <b>模式：</b>{mode}
 
-<b>Account:</b>
-• Balance: ${balance:,.2f}
-• Equity: ${equity:,.2f}
-• Unrealized PnL: ${pnl:,.2f}
+<b>账户：</b>
+• 余额：${balance:,.2f}
+• 权益：${equity:,.2f}
+• 未实现盈亏：${pnl:,.2f}
 
-<b>Session:</b>
-• Trades Copied: {trades_copied_count}
-• Open Positions: {len(simulated_positions) if settings.simulated_trading else (len(state.positions) if state else 0)}
+<b>本次运行：</b>
+• 已复制成交：{trades_copied_count}
+• 持仓数：{len(simulated_positions) if settings.simulated_trading else (len(state.positions) if state else 0)}
     """.strip()
 
 
@@ -999,19 +999,19 @@ async def get_positions_formatted() -> str:
     state = monitor.current_state if monitor else None
     
     if not state or not state.positions:
-        return "📍 <b>Open Positions</b>\n\nNo open positions."
+        return "📍 <b>当前持仓</b>\n\n暂无持仓。"
     
-    message = f"📍 <b>Open Positions ({len(state.positions)})</b>\n\n"
+    message = f"📍 <b>当前持仓（{len(state.positions)}）</b>\n\n"
     
     for i, pos in enumerate(state.positions, 1):
         pnl_emoji = "📈" if pos.unrealized_pnl > 0 else "📉"
         message += f"""
 {i}️⃣ <b>{pos.symbol}</b> {pos.side.value.upper()}
-   Size: {pos.size:.4f}
-   Entry: ${pos.entry_price:,.2f}
-   Current: ${pos.current_price:,.2f}
-   Leverage: {pos.leverage}x
-   PnL: {pnl_emoji} ${pos.unrealized_pnl:,.2f} ({pos.pnl_percentage:+.2f}%)
+   数量：{pos.size:.4f}
+   开仓价：${pos.entry_price:,.2f}
+   当前价：${pos.current_price:,.2f}
+   杠杆：{pos.leverage}x
+   未实现盈亏：{pnl_emoji} ${pos.unrealized_pnl:,.2f} ({pos.pnl_percentage:+.2f}%)
 
 """
     

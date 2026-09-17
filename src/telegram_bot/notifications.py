@@ -54,21 +54,21 @@ class NotificationService:
         """Send notification about a copied trade"""
         
         mode_emoji = "🧪" if is_simulated else "✅"
-        mode_text = "[SIMULATED]" if is_simulated else ""
+        mode_text = "[模拟]" if is_simulated else "[实盘]"
         
         message = f"""
-{mode_emoji} <b>New Trade Copied!</b> {mode_text}
+{mode_emoji} <b>已复制新成交</b> {mode_text}
 
-<b>Symbol:</b> {symbol}
-<b>Side:</b> {side.upper()}
-<b>Your Size:</b> {size:.4f}
-<b>Entry:</b> ${entry_price:,.2f}
-<b>Leverage:</b> {leverage}x
-<b>Notional:</b> ${size * entry_price:,.2f}
+<b>币种：</b>{symbol}
+<b>方向：</b>{side.upper()}
+<b>跟随数量：</b>{size:.4f}
+<b>成交价：</b>${entry_price:,.2f}
+<b>杠杆：</b>{leverage}x
+<b>名义价值：</b>${size * entry_price:,.2f}
 
 ━━━━━━━━━━━━━━━━━━
-<b>Target Size:</b> {target_size:.4f}
-<b>Time:</b> {datetime.now().strftime('%H:%M:%S UTC')}
+<b>目标成交数量：</b>{target_size:.4f}
+<b>时间：</b>{datetime.now().strftime('%H:%M:%S UTC')}
 """
         await self.send_message(message.strip())
     
@@ -81,18 +81,18 @@ class NotificationService:
         """Send notification about a closed position"""
         
         mode_emoji = "🧪" if is_simulated else "🔴"
-        mode_text = "[SIMULATED]" if is_simulated else ""
+        mode_text = "[模拟]" if is_simulated else "[实盘]"
         
         pnl_text = ""
         if pnl is not None:
             pnl_emoji = "📈" if pnl > 0 else "📉"
-            pnl_text = f"\n<b>PnL:</b> {pnl_emoji} ${pnl:,.2f}"
+            pnl_text = f"\n<b>盈亏：</b>{pnl_emoji} ${pnl:,.2f}"
         
         message = f"""
-{mode_emoji} <b>Position Closed</b> {mode_text}
+{mode_emoji} <b>仓位已平</b> {mode_text}
 
-<b>Symbol:</b> {symbol}{pnl_text}
-<b>Time:</b> {datetime.now().strftime('%H:%M:%S UTC')}
+<b>币种：</b>{symbol}{pnl_text}
+<b>时间：</b>{datetime.now().strftime('%H:%M:%S UTC')}
 """
         await self.send_message(message.strip())
     
@@ -110,29 +110,29 @@ class NotificationService:
         pnl_emoji = "📈" if account_pnl_usd > 0 else "📉"
         
         message = f"""
-📊 <b>Hourly Copy Trading Report</b>
+📊 <b>每小时跟单报告</b>
 
-<b>Target:</b> <code>{target_wallet[:10]}...{target_wallet[-6:]}</code>
+<b>目标：</b><code>{target_wallet[:10]}...{target_wallet[-6:]}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 <b>Trades Copied:</b> {trades_copied}
-💰 <b>Account PnL:</b> {pnl_emoji} ${account_pnl_usd:,.2f} ({account_pnl_pct:+.2f}%)
-📍 <b>Open Positions:</b> {open_positions}
-📝 <b>Open Orders:</b> {open_orders}
+📈 <b>已复制成交：</b>{trades_copied}
+💰 <b>账户未实现盈亏：</b>{pnl_emoji} ${account_pnl_usd:,.2f} ({account_pnl_pct:+.2f}%)
+📍 <b>持仓数：</b>{open_positions}
+📝 <b>挂单数：</b>{open_orders}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🕐 <b>Report Time:</b> {datetime.now().strftime('%H:%M UTC')}
+🕐 <b>报告时间：</b>{datetime.now().strftime('%H:%M UTC')}
 """
         await self.send_message(message.strip())
     
     async def send_error_notification(self, error_message: str):
         """Send error notification"""
         message = f"""
-⚠️ <b>Error Detected</b>
+⚠️ <b>检测到错误</b>
 
 <code>{error_message}</code>
 
-<b>Time:</b> {datetime.now().strftime('%H:%M:%S UTC')}
+<b>时间：</b>{datetime.now().strftime('%H:%M:%S UTC')}
 """
         await self.send_message(message.strip())
     
@@ -145,28 +145,28 @@ class NotificationService:
     ):
         """Send bot startup notification"""
         message = f"""
-🚀 <b>Copy Trading Bot Started</b>
+🚀 <b>跟单机器人已启动</b>
 
-<b>Target Wallet:</b>
+<b>目标钱包：</b>
 <code>{target_wallet}</code>
 
-<b>Configuration:</b>
-• Sizing: {sizing_mode.title()}
-• Ratio: {ratio}
-• Leverage: {leverage_adjustment}x of target
-• Status: <b>ACTIVE</b> 🟢
+<b>当前配置：</b>
+• 仓位模式：{sizing_mode.title()}
+• 资金比例：{ratio}
+• 杠杆：目标杠杆的 {leverage_adjustment} 倍
+• 状态：<b>运行中</b> 🟢
 
-Bot is now monitoring for trades!
+正在监听目标钱包的新成交。
 """
         await self.send_message(message.strip())
     
     async def send_shutdown_notification(self):
         """Send bot shutdown notification"""
         message = """
-🛑 <b>Copy Trading Bot Stopped</b>
+🛑 <b>跟单机器人已停止</b>
 
-Bot has been shut down gracefully.
-Status: <b>INACTIVE</b> 🔴
+机器人已安全退出。
+状态：<b>已停止</b> 🔴
 """
         await self.send_message(message.strip())
     

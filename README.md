@@ -1,237 +1,190 @@
-# Hyperliquid Copy Trader
+# Hyperliquid 跟单机器人
 
-<p align="center">
-  <a href="https://hyperfoundation.org/" target="_blank">
-    <img src="https://www.cryptoninjas.net/wp-content/uploads/hyperliquid-logo-330x330.webp" alt="Hyperliquid Logo" width="200"/>
-  </a>
-</p>
+基于 Hyperliquid WebSocket 的跟单程序。它监听指定目标钱包的**新成交**，按跟随钱包与目标钱包的资金比例计算数量，并在 Hyperliquid 永续合约账户中提交对应订单。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://www.docker.com/)
+> 风险提示：这是交易执行程序，不保证盈利。先使用模拟模式验证，再用少量资金开启实盘。私钥只应保存在本机或服务器的 `.env`，不要提交、截图或发送给任何人。
 
-Automated copy trading bot for Hyperliquid DEX. Copies trades from any wallet in real-time with automatic position sizing.
+## 当前行为
 
-## Features
+- 只复制机器人启动后的目标**成交**，避免复制尚未成交的挂单。
+- `COPY_OPEN_POSITIONS=false` 时，不会在启动时追入目标已有仓位。
+- 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
+- 平仓仅在跟随钱包存在同方向仓位时执行，并使用 `reduce-only`，不会反手开仓。
+- 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
+- 新开仓会限制在可用保证金的 95% 以内，并遵守 `MAX_OPEN_TRADES`。
 
-- Real-time trade copying via WebSocket
-- Automatic position sizing based on account balance ratio
-- Integer leverage with asset-specific limits
-- Market and limit order support
-- Copy existing positions on startup
-- Simulated trading mode for testing
-- Telegram notifications (optional)
+## 快速开始
 
-## Quick Start
-
-### Docker (Recommended)
+### 1. 配置环境变量
 
 ```bash
-docker-compose up -d
+cp .env.example .env
 ```
 
-### Manual Installation
+编辑 `.env`。首次使用请保留：
 
-1. Install Python 3.12+
-2. Install dependencies:
+```properties
+SIMULATED_TRADING=true
+COPY_OPEN_POSITIONS=false
+COPY_EXISTING_ORDERS=false
+AUTO_ADJUST_SIZE=true
+LEVERAGE_ADJUSTMENT=0.5
+MAX_OPEN_TRADES=1
+```
+
+必须填写：
+
+```properties
+HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址
+HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
+TARGET_WALLET_ADDRESS=0x要跟随的目标地址
+```
+
+`HYPERLIQUID_WALLET_ADDRESS` 必须与私钥推导出的地址一致。用于实盘的 USDC 必须位于 Hyperliquid 的 **Perp** 账户，不是 Spot 账户。
+
+### 2. 启动 Docker 服务
 
 ```bash
-pip install -r requirements.txt
+docker compose up -d --build
+docker compose logs -f --tail=100 copy-trader
 ```
 
-Telegram control and notifications are optional. Install them only when you
-set both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`:
+停止服务：
 
 ```bash
-pip install -r requirements-telegram.txt
+docker compose down
 ```
 
-3. Configure .env file with your settings
-4. Run the bot:
+代码更新后必须使用 `up -d --build` 重新构建；仅执行 `restart` 不会更新镜像内的代码。
+
+### 3. 切换到实盘前的检查
+
+先在模拟模式观察新成交。看到以下日志，说明监听与尺寸计算正常：
+
+```text
+Fill copied: xyz:SKHX buy size=... target_size=... reduce_only=False
+```
+
+确认后将 `.env` 改为：
+
+```properties
+SIMULATED_TRADING=false
+```
+
+再重新创建容器：
 
 ```bash
-python src/main.py
+docker compose down
+docker compose up -d --build
 ```
 
-## Configuration
-
-Edit the `.env` file:
+## 配置说明
 
 ```properties
 # Hyperliquid API
 HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
 
-# Your Hyperliquid credentials (leave empty for simulation)
+# 跟随钱包。实盘时两个值必须填写且地址必须匹配。
 HYPERLIQUID_WALLET_ADDRESS=
 HYPERLIQUID_PRIVATE_KEY=
 
-# Target to copy (wallet or vault)
-TARGET_WALLET_ADDRESS=0x...
+# 目标钱包或 Vault 地址
+TARGET_WALLET_ADDRESS=
 
-# Trading mode
+# true 为模拟模式；实盘必须明确改为 false
 SIMULATED_TRADING=true
-SIMULATED_ACCOUNT_BALANCE=10000.0
+SIMULATED_ACCOUNT_BALANCE=1000.0
 
-# Copy settings
-COPY_OPEN_POSITIONS=true
-COPY_EXISTING_ORDERS=true
+# 启动时是否复制目标已有仓位。建议保持 false。
+COPY_OPEN_POSITIONS=false
+
+# 启动时是否复制目标已有挂单。建议保持 false。
+COPY_EXISTING_ORDERS=false
+
+# true 时，单笔跟随数量 = 目标本次成交量 × 跟随资金 / 目标资金
 AUTO_ADJUST_SIZE=true
+
+# false 为带滑点保护的 IOC 市价单；true 为限价单。
 USE_LIMIT_ORDERS=false
 MAX_SLIPPAGE_PCT=1.0
-LEVERAGE_ADJUSTMENT=1.0
-MAX_OPEN_TRADES=x
+
+# 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
+LEVERAGE_ADJUSTMENT=0.5
+
+# x 表示不限制。建议实盘先用 1。
+MAX_OPEN_TRADES=1
 MAX_OPEN_ORDERS=x
 MAX_ACCOUNT_EQUITY=x
 
-# Asset Filters
-BLOCKED_ASSETS=BTC,ETH  # Comma-separated list (e.g., BTC,ETH,SOL)
+# 不跟随的币种，使用英文逗号分隔
+BLOCKED_ASSETS=
 
-# Telegram (optional)
+# Telegram 为可选功能
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
-
-# Database
-DATABASE_URL=sqlite:///./data/trading.db
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FILE=./logs/trading.log
+INSTALL_TELEGRAM=true
 ```
 
-Notes:
-- `TARGET_WALLET_ADDRESS` accepts either a wallet address or a vault address.
-- `x` means unlimited; set an integer to cap `MAX_OPEN_TRADES`, `MAX_OPEN_ORDERS`, or `MAX_ACCOUNT_EQUITY`.
-- Hyperliquid enforces a $10 minimum notional per order. If your account is much smaller than the target, small fills will be skipped when the proportional size falls below $10. Increase balance or reduce the ratio gap to copy more trades.
-- Set `SIMULATED_TRADING=false` to enable live orders. In live mode the bot reads the configured wallet's real balance; `SIMULATED_ACCOUNT_BALANCE` is ignored.
-- Live market orders are IOC orders priced from the current mid with `MAX_SLIPPAGE_PCT` tolerance. Start with a small amount and verify the logs before increasing exposure.
+### 资金与仓位示例
 
-## Leverage Adjustment
+假设目标账户 `$100,000`，跟随账户 `$1,000`，目标本次成交 `10` 个币：
 
-The `LEVERAGE_ADJUSTMENT` setting controls risk:
+- 资金比例为 `1%`
+- 跟随数量为 `0.1` 个币
+- 程序检查该数量的名义价值是否至少 `$10`
+- 程序再检查该订单所需保证金是否不超过跟随账户可用保证金的 95%
 
-- 0.5 = Use 50% of target's leverage (safer)
-- 1.0 = Match target's leverage exactly
-- 2.0 = Use 200% of target's leverage (more aggressive)
+启动日志中的 `Your Copy` 是“若复制目标当前全部旧仓位”的预估，不代表已下单。只有 `COPY_OPEN_POSITIONS=true` 才会在启动时执行该操作。
 
-Leverage is automatically rounded to integers and capped at asset-specific maximums.
+## Telegram
 
-## Blocked Assets
+填写 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID` 后，机器人会发送中文通知，并支持：
 
-The `BLOCKED_ASSETS` setting lets you exclude specific assets from copying:
+- `/status` 查看运行状态和跟随账户信息
+- `/positions` 查看当前仓位
+- `/orders` 查看挂单
+- `/pnl` 查看收益摘要
+- `/pause` 暂停复制新成交，保留已有仓位
+- `/resume` 恢复复制
+- `/stop` 停止机器人，可选择是否平仓
 
-```properties
-BLOCKED_ASSETS=BTC,ETH,SOL
-```
+同一个 Telegram Token 只能由一个实例轮询。出现 `terminated by other getUpdates request` 时，关闭使用同一 Token 的其他机器人实例。
 
-When the target wallet trades these assets, the bot will:
+## 常见问题
 
-- Log a warning message
-- Skip copying the trade
-- Continue monitoring other assets normally
+### `User or API Wallet ... does not exist`
 
-This is useful for:
-
-- Avoiding high-volatility assets
-- Excluding assets you're manually trading
-- Managing risk by limiting exposure to certain markets
-
-Note: Asset symbols are case-insensitive (BTC, btc, Btc all work).
-
-## Position Sizing
-
-Position sizes are automatically calculated based on the ratio of your account balance to the target wallet balance.
-
-Example:
-
-- Target wallet: $100,000
-- Your account: $10,000
-- Ratio: 1:10
-- Target opens 1 BTC position = You open 0.1 BTC position
-
-## Docker Commands
-
-### Windows
-
-Use the batch files in the `windows/` folder:
-
-```cmd
-cd windows
-start.bat    # Start the bot
-logs.bat     # View logs
-stop.bat     # Stop the bot
-```
-
-### Linux/Mac
-
-Use the shell scripts in the `linux/` folder:
+这通常是旧版本订单签名格式与交易所不一致造成的。拉取本仓库最新代码后执行：
 
 ```bash
-cd linux
-chmod +x *.sh       # Make executable (first time only)
-./start.sh          # Start the bot
-./logs.sh           # View logs
-./stop.sh           # Stop the bot
+docker compose down
+docker compose up -d --build
 ```
 
-### Manual Docker Commands
+如果仍出现该错误，检查 `HYPERLIQUID_WALLET_ADDRESS` 是否确实由 `HYPERLIQUID_PRIVATE_KEY` 推导而来。
 
-Start bot:
+### 只收到小时报告，没有跟单
+
+检查目标是否真的有新的 `Open` 或 `Add` 成交；`Close` 或 `Reduce` 成交只有在跟随账户已有相同仓位时才会发送平仓单。用以下命令查看相关日志：
 
 ```bash
-docker-compose up -d
+docker compose logs --since 24h copy-trader | grep -E 'FILL DETECTED|Fill copied|Failed to copy fill|Hyperliquid rejected'
 ```
 
-View logs:
+### 余额显示为 0
+
+请将 USDC 从 Hyperliquid 的 Spot 账户转入 Perp 账户。实盘下单和仓位保证金只使用 Perp 余额。
+
+## 本地运行
+
+需要 Python 3.12：
 
 ```bash
-docker-compose logs -f
+pip install -r requirements.txt
+pip install -r requirements-telegram.txt  # 仅在使用 Telegram 时需要
+python src/main.py
 ```
 
-Stop bot:
+## 免责声明
 
-```bash
-docker-compose down
-```
-
-Rebuild after code changes:
-
-```bash
-docker-compose up -d --build
-```
-
-## Telegram Bot
-
-To enable Telegram notifications:
-
-1. Create bot with @BotFather on Telegram
-2. Get your bot token
-3. Send a message to your bot
-4. Get your chat ID from: https://api.telegram.org/bot `<TOKEN>`/getUpdates
-5. Add both values to .env file
-
-Available commands:
-
-- /status - Bot status and balance
-- /positions - Current positions
-- /pnl - Profit and loss report
-- /pause - Pause copying
-- /resume - Resume copying
-
-## Disclaimer
-
-Trading cryptocurrencies involves substantial risk of loss. This software is provided as-is without any warranties. Use at your own risk. The author is not responsible for any financial losses.
-
-## Support
-
-Discord: maskiplays
-
-## Donations
-
-If you find this bot useful, donations are appreciated:
-
-Arbitrum USDC: 0x2987F53372c02D1a4C67241aA1840C1E83c480fF
-Dont look at PNL :(
-
-## Final Thoughts
-10/10 Crash fucking sucked
-Hyperliquid.
+数字资产交易可能导致全部本金损失。软件按“现状”提供，不提供任何收益、可用性或适用性保证。使用者自行承担所有交易、配置和密钥管理风险。
