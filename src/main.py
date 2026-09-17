@@ -33,6 +33,8 @@ bot_start_time = None
 simulated_balance = 0.0
 simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'side': str}
 simulated_pnl = 0.0
+processed_fill_ids: set[str] = set()
+MAX_PROCESSED_FILL_IDS = 10_000
 
 
 async def get_follower_balance() -> float | None:
@@ -434,7 +436,7 @@ async def on_new_order(order_data: dict):
         logger.error(f"Error copying order: {e}")
 
 
-async def on_order_fill(fill_data: dict):
+async def _legacy_on_order_fill(fill_data: dict):
     """
     Called when an order is filled
     Copy the filled order
@@ -675,6 +677,217 @@ async def on_order_fill(fill_data: dict):
         logger.error(f"Error copying fill: {e}")
         import traceback
         logger.error(traceback.format_exc())
+
+
+def _fill_id(fill_data: dict) -> str:
+    """Return the exchange trade id, with a stable fallback for malformed events."""
+    trade_id = fill_data.get("tid")
+    if trade_id is not None:
+        return str(trade_id)
+    return ":".join(str(fill_data.get(key, "")) for key in ("coin", "time", "oid", "sz", "px"))
+
+
+def _remember_fill(fill_id: str) -> None:
+    processed_fill_ids.add(fill_id)
+    if len(processed_fill_ids) > MAX_PROCESSED_FILL_IDS:
+        processed_fill_ids.clear()
+
+
+def _target_position(symbol: str):
+    if not monitor or not monitor.current_state:
+        return None
+    return next((position for position in monitor.current_state.positions if position.symbol == symbol), None)
+
+
+async def on_order_fill(fill_data: dict):
+    """Copy one target fill using its actual filled quantity.
+
+    Target orders can be split into many fills. Copying the target's current
+    position on each event compounds exposure, so all sizing starts from
+    ``fill_data['sz']`` and each exchange trade id is handled at most once.
+    """
+    global trades_copied_count
+
+    if is_paused:
+        logger.warning("Bot is paused - skipping fill copy")
+        return
+
+    try:
+        symbol = fill_data.get("coin", "")
+        direction = fill_data.get("dir", "")
+        target_size = abs(float(fill_data.get("sz", 0)))
+        price = float(fill_data.get("px", 0))
+        fill_id = _fill_id(fill_data)
+
+        if fill_id in processed_fill_ids:
+            logger.info(f"Skipping already copied fill {fill_id}")
+            return
+        if not symbol or target_size <= 0 or price <= 0:
+            logger.warning(f"Skipping malformed fill: {fill_data}")
+            return
+        if ">" in direction:
+            logger.warning(f"Skipping position flip until it can be reconciled safely: {direction}")
+            return
+
+        is_closing = "Close" in direction or "Reduce" in direction
+        is_opening = "Open" in direction or "Add" in direction
+        if not (is_opening or is_closing):
+            logger.warning(f"Skipping unknown fill direction: {direction}")
+            return
+
+        if "Long" in direction:
+            position_side = PositionSide.LONG
+        elif "Short" in direction:
+            position_side = PositionSide.SHORT
+        else:
+            position_side = PositionSide.LONG if fill_data.get("side") == "B" else PositionSide.SHORT
+
+        follower_state = None
+        follower_balance = simulated_balance
+        if not settings.simulated_trading:
+            follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
+            if follower_state is None:
+                logger.error("Unable to read follower wallet state; skipping fill")
+                return
+            follower_balance = follower_state.balance
+
+        target_balance = monitor.current_state.balance if monitor and monitor.current_state else 0
+        if settings.copy_rules.auto_adjust_size:
+            if target_balance <= 0:
+                logger.error("Target balance is unavailable; skipping fill")
+                return
+            our_size = target_size * (follower_balance / target_balance)
+        else:
+            our_size = target_size
+
+        if our_size <= 0:
+            logger.warning("Skipping fill because calculated size is zero")
+            return
+
+        target_position = _target_position(symbol)
+        if is_closing:
+            if settings.simulated_trading:
+                simulated_position = simulated_positions.get(symbol)
+                follower_size = abs(simulated_position["size"]) if simulated_position else 0
+                follower_side = simulated_position.get("side") if simulated_position else None
+            else:
+                follower_position = next(
+                    (position for position in follower_state.positions if position.symbol == symbol), None
+                )
+                follower_size = follower_position.size if follower_position else 0
+                follower_side = follower_position.side.value if follower_position else None
+
+            if follower_size <= 0 or follower_side != position_side.value:
+                logger.info(f"No matching follower {position_side.value} position for {symbol}; skipping reduce-only fill")
+                return
+
+            our_size = min(our_size, follower_size)
+            if our_size * price < MIN_POSITION_SIZE_USD:
+                logger.info(f"Reduce-only residual for {symbol} is below ${MIN_POSITION_SIZE_USD:.2f}; leaving it open")
+                return
+
+            order_side = OrderSide.SELL if position_side == PositionSide.LONG else OrderSide.BUY
+            leverage = 1
+            result = await executor.execute_market_order(
+                symbol=symbol,
+                side=order_side,
+                size=Decimal(str(our_size)),
+                reduce_only=True,
+            )
+        else:
+            if target_position is None:
+                logger.warning(f"Target position unavailable for opening fill {symbol}; skipping safely")
+                return
+
+            leverage = calculate_adjusted_leverage(
+                target_leverage=target_position.leverage,
+                adjustment_ratio=settings.leverage.adjustment_ratio,
+                symbol=symbol,
+            )
+            if settings.simulated_trading:
+                follower_position = simulated_positions.get(symbol)
+                available_margin = simulated_balance
+                open_positions = len(simulated_positions)
+            else:
+                follower_position = next(
+                    (position for position in follower_state.positions if position.symbol == symbol), None
+                )
+                available_margin = max(0.0, follower_state.available_balance)
+                open_positions = len(follower_state.positions)
+
+            if (
+                settings.copy_rules.max_open_trades is not None
+                and follower_position is None
+                and open_positions >= settings.copy_rules.max_open_trades
+            ):
+                logger.warning(f"Max open trades limit reached ({open_positions}/{settings.copy_rules.max_open_trades}); skipping {symbol}")
+                return
+
+            max_size_from_margin = (available_margin * leverage * 0.95) / price
+            our_size = min(our_size, max_size_from_margin)
+            if our_size * price < MIN_POSITION_SIZE_USD:
+                logger.warning(f"Skipping {symbol}: copied fill value ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}")
+                return
+
+            order_side = OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL
+            if settings.copy_rules.use_limit_orders:
+                result = await executor.execute_limit_order(
+                    symbol=symbol,
+                    side=order_side,
+                    size=Decimal(str(our_size)),
+                    price=Decimal(str(price)),
+                    leverage=leverage,
+                )
+            else:
+                result = await executor.execute_market_order(
+                    symbol=symbol,
+                    side=order_side,
+                    size=Decimal(str(our_size)),
+                    leverage=leverage,
+                )
+
+        if not result:
+            logger.error(f"Failed to copy fill {fill_id}")
+            return
+
+        _remember_fill(fill_id)
+        trades_copied_count += 1
+        logger.success(
+            f"Fill copied: {symbol} {order_side.value} size={our_size:.8f} "
+            f"target_size={target_size:.8f} reduce_only={is_closing}"
+        )
+
+        if settings.simulated_trading:
+            position = simulated_positions.get(symbol)
+            if is_opening:
+                if position is None:
+                    position = {"size": 0.0, "entry_price": 0.0, "side": position_side.value}
+                    simulated_positions[symbol] = position
+                previous_size = abs(position["size"])
+                total_size = previous_size + our_size
+                position["entry_price"] = (
+                    ((previous_size * position["entry_price"]) + (our_size * price)) / total_size
+                )
+                position["size"] = total_size if position_side == PositionSide.LONG else -total_size
+                position["side"] = position_side.value
+            elif position is not None:
+                remaining = max(0.0, abs(position["size"]) - our_size)
+                if remaining == 0:
+                    del simulated_positions[symbol]
+                else:
+                    position["size"] = remaining if position_side == PositionSide.LONG else -remaining
+
+        if notifier:
+            await notifier.send_trade_notification(
+                symbol=symbol,
+                side=order_side.value,
+                size=our_size,
+                entry_price=price,
+                leverage=leverage,
+                target_size=target_size,
+            )
+    except Exception as exc:
+        logger.exception(f"Error copying fill: {exc}")
 
 
 # Telegram bot callback functions
@@ -1032,11 +1245,12 @@ async def main():
         max_total_exposure=settings.sizing.max_total_exposure
     )
     
-    # Set up callbacks
-    monitor.on_new_position = on_new_position
-    monitor.on_position_close = on_position_close
-    monitor.on_position_update = on_position_update
-    monitor.on_new_order = on_new_order
+    # Fills are the real-time source of truth. Position and order callbacks
+    # describe the same target action and would otherwise duplicate an order.
+    monitor.on_new_position = None
+    monitor.on_position_close = None
+    monitor.on_position_update = None
+    monitor.on_new_order = None
     monitor.on_order_fill = on_order_fill
     
     # Copy existing positions if enabled

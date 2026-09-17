@@ -248,8 +248,7 @@ class TradeExecutor:
                     "p": self._wire_price(Decimal(str(aggressive_price)), size_decimals),
                     "s": self._wire_size(size, size_decimals),
                     "r": reduce_only,
-                    "t": {"limit": {"tif": "Ioc"}},
-                    "c": None
+                    "t": {"limit": {"tif": "Ioc"}}
                 }],
                 "grouping": "na"
             }
@@ -323,8 +322,7 @@ class TradeExecutor:
                     "p": float_to_wire(price),
                     "s": self._wire_size(size, size_decimals),
                     "r": reduce_only,
-                    "t": {"limit": {"tif": tif}},
-                    "c": None
+                    "t": {"limit": {"tif": tif}}
                 }],
                 "grouping": "na"
             }
