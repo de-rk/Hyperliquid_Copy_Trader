@@ -1087,17 +1087,23 @@ async def get_positions_formatted() -> str:
     return message.strip()
 
 
-async def get_leaderboard(window: str, sort_by: str) -> str:
-    """Format the public Hyperliquid leaderboard for Telegram."""
+async def get_leaderboard(window: str, sort_by: str, page: int = 0) -> tuple[str, int]:
+    """Format up to 200 public leaderboard rows in Telegram-sized pages."""
     labels = {"day": "24H", "week": "7D", "month": "30D"}
     sort_labels = {"pnl": "收益额", "roi": "收益率"}
-    rows = await client.get_leaderboard(window, sort_by, limit=10) if client else []
+    page_size = 10
+    rows = await client.get_leaderboard(window, sort_by, limit=200) if client else []
     title = f"🏆 <b>Hyperliquid 收益排行榜</b>\n周期：{labels[window]}｜排序：{sort_labels[sort_by]}"
     if not rows:
-        return title + "\n\n暂无数据。公开排行榜接口暂不可用或未返回该周期数据。"
+        return title + "\n\n暂无数据。公开排行榜接口暂不可用或未返回该周期数据。", 0
 
-    lines = [title, ""]
-    for index, row in enumerate(rows, 1):
+    total_pages = (len(rows) + page_size - 1) // page_size
+    page = min(max(page, 0), total_pages - 1)
+    start = page * page_size
+    page_rows = rows[start:start + page_size]
+
+    lines = [f"{title}\n第 {page + 1}/{total_pages} 页｜前 {len(rows)} 名", ""]
+    for index, row in enumerate(page_rows, start + 1):
         address = str(row.get("address", ""))
         name = row.get("name") or address or "未知地址"
         pnl = row.get("pnl")
@@ -1109,7 +1115,7 @@ async def get_leaderboard(window: str, sort_by: str) -> str:
             lines.append(f"   地址：<code>{html.escape(address)}</code>")
         lines.append(f"   收益：{pnl_text}｜收益率：{roi_text}")
     lines.append("\n<i>数据来自 Hyperliquid 公开排行榜，不代表跟随钱包收益。</i>")
-    return "\n".join(lines)
+    return "\n".join(lines), total_pages
 
 
 async def handle_pause():

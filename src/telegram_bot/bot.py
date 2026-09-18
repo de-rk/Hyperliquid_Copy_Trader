@@ -209,21 +209,35 @@ class TelegramBot:
         )
 
     @staticmethod
-    def _leaderboard_keyboard() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
+    def _leaderboard_keyboard(
+        window: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        page: int = 0,
+        total_pages: int = 0,
+    ) -> InlineKeyboardMarkup:
+        keyboard = [
             [
-                InlineKeyboardButton("24H 收益", callback_data="leaderboard:day:pnl"),
-                InlineKeyboardButton("24H 收益率", callback_data="leaderboard:day:roi"),
+                InlineKeyboardButton("24H 收益", callback_data="leaderboard:day:pnl:0"),
+                InlineKeyboardButton("24H 收益率", callback_data="leaderboard:day:roi:0"),
             ],
             [
-                InlineKeyboardButton("7D 收益", callback_data="leaderboard:week:pnl"),
-                InlineKeyboardButton("7D 收益率", callback_data="leaderboard:week:roi"),
+                InlineKeyboardButton("7D 收益", callback_data="leaderboard:week:pnl:0"),
+                InlineKeyboardButton("7D 收益率", callback_data="leaderboard:week:roi:0"),
             ],
             [
-                InlineKeyboardButton("30D 收益", callback_data="leaderboard:month:pnl"),
-                InlineKeyboardButton("30D 收益率", callback_data="leaderboard:month:roi"),
+                InlineKeyboardButton("30D 收益", callback_data="leaderboard:month:pnl:0"),
+                InlineKeyboardButton("30D 收益率", callback_data="leaderboard:month:roi:0"),
             ],
-        ])
+        ]
+        if window and sort_by and total_pages > 1:
+            navigation = []
+            if page > 0:
+                navigation.append(InlineKeyboardButton("上一页", callback_data=f"leaderboard:{window}:{sort_by}:{page - 1}"))
+            navigation.append(InlineKeyboardButton(f"第 {page + 1}/{total_pages} 页", callback_data="leaderboard:noop"))
+            if page + 1 < total_pages:
+                navigation.append(InlineKeyboardButton("下一页", callback_data=f"leaderboard:{window}:{sort_by}:{page + 1}"))
+            keyboard.append(navigation)
+        return InlineKeyboardMarkup(keyboard)
 
     async def _leaderboard_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show period and sort selectors for the public leaderboard."""
@@ -245,10 +259,21 @@ class TelegramBot:
             await query.edit_message_text("⛔ 未授权的聊天")
             return
 
+        if query.data == "leaderboard:noop":
+            return
+
         if query.data and query.data.startswith("leaderboard:"):
             parts = query.data.split(":")
-            if len(parts) != 3 or parts[1] not in {"day", "week", "month"} or parts[2] not in {"pnl", "roi"}:
+            if len(parts) != 4 or parts[1] not in {"day", "week", "month"} or parts[2] not in {"pnl", "roi"}:
                 await query.edit_message_text("❌ 无效的排行榜选项")
+                return
+            try:
+                page = int(parts[3])
+            except ValueError:
+                await query.edit_message_text("❌ 无效的排行榜页码")
+                return
+            if not 0 <= page < 20:
+                await query.edit_message_text("❌ 无效的排行榜页码")
                 return
             if not self.get_leaderboard_callback:
                 await query.edit_message_text("排行榜查询尚未配置")
@@ -258,10 +283,10 @@ class TelegramBot:
                     "🏆 <b>Hyperliquid 收益排行榜</b>\n\n正在读取公开数据...",
                     parse_mode="HTML",
                 )
-                result = await self.get_leaderboard_callback(parts[1], parts[2])
+                result, total_pages = await self.get_leaderboard_callback(parts[1], parts[2], page)
                 await query.edit_message_text(
                     result,
-                    reply_markup=self._leaderboard_keyboard(),
+                    reply_markup=self._leaderboard_keyboard(parts[1], parts[2], page, total_pages),
                     parse_mode="HTML",
                 )
             except Exception as e:

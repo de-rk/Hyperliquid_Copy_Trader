@@ -326,7 +326,7 @@ class HyperliquidClient:
 
         key = "roi" if sort_by == "roi" else "pnl"
         normalized.sort(key=lambda row: row[key] if row[key] is not None else float("-inf"), reverse=True)
-        return normalized[:max(1, min(limit, 20))]
+        return normalized[:max(1, min(limit, 200))]
     
     async def get_all_assets(self) -> List[Dict[str, Any]]:
         """Get list of all available trading assets"""

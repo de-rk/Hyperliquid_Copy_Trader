@@ -146,7 +146,7 @@ INSTALL_TELEGRAM=true
 - `/positions` 查看当前仓位
 - `/orders` 查看挂单
 - `/pnl` 查看收益摘要
-- `/leaderboard` 查看 Hyperliquid 公开排行榜，可按 24H、7D、30D 的收益额或收益率筛选
+- `/leaderboard` 查看 Hyperliquid 公开排行榜，可按 24H、7D、30D 的收益额或收益率筛选；最多读取 200 名，每页 10 名
 - `/pause` 暂停复制新成交，保留已有仓位
 - `/resume` 恢复复制
 - `/stop` 停止机器人，可选择是否平仓
