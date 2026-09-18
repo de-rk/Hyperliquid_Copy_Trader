@@ -113,6 +113,8 @@ AUTO_ADJUST_SIZE=true
 # false 为带滑点保护的 IOC 市价单；true 为限价单。
 USE_LIMIT_ORDERS=false
 MAX_SLIPPAGE_PCT=1.0
+# 每笔开仓最多使用可用保证金的比例。HIP-3 标的实际保证金可能高于显示杠杆的简单估算。
+MAX_MARGIN_USAGE_RATIO=0.40
 
 # 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
 LEVERAGE_ADJUSTMENT=0.5

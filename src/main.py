@@ -826,7 +826,11 @@ async def on_order_fill(fill_data: dict):
                 logger.warning(f"Max open trades limit reached ({open_positions}/{settings.copy_rules.max_open_trades}); skipping {symbol}")
                 return
 
-            max_size_from_margin = (available_margin * leverage * 0.95) / price
+            max_size_from_margin = (
+                available_margin
+                * leverage
+                * settings.copy_rules.max_margin_usage_ratio
+            ) / price
             existing_position_value = follower_position.notional_value if follower_position else 0.0
             remaining_position_value = max(
                 0.0, settings.sizing.max_position_size - existing_position_value
@@ -1408,7 +1412,11 @@ async def main():
                         continue
                     available_margin = max(0.0, current_follower_state.available_balance)
 
-                margin_limited_value = available_margin * your_leverage * 0.95
+                margin_limited_value = (
+                    available_margin
+                    * your_leverage
+                    * settings.copy_rules.max_margin_usage_ratio
+                )
                 max_position_value = settings.sizing.max_position_size
                 capped_position_value = min(
                     target_position_value * auto_ratio,
@@ -1453,6 +1461,9 @@ async def main():
     logger.info(f"   Sizing Mode: {settings.sizing.mode}")
     logger.info(f"   Leverage Adjustment: {settings.leverage.adjustment_ratio}x")
     logger.info(f"   Max Position Size: ${settings.sizing.max_position_size:,.2f}")
+    logger.info(
+        f"   Max Margin Usage: {settings.copy_rules.max_margin_usage_ratio:.0%}"
+    )
     
     position_sizer = PositionSizer(
         mode=settings.sizing.mode,
@@ -1502,7 +1513,9 @@ async def main():
                 requested_position_value = target_position_value * auto_ratio
                 capped_position_value = min(
                     requested_position_value,
-                    available_margin * your_leverage * 0.95,
+                    available_margin
+                    * your_leverage
+                    * settings.copy_rules.max_margin_usage_ratio,
                     settings.sizing.max_position_size,
                 )
                 if capped_position_value < MIN_POSITION_SIZE_USD:
