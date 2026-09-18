@@ -312,8 +312,8 @@ class HyperliquidClient:
             values = window_values(row)
             pnl = self._as_float(values.get("pnl", values.get("pnlUsd", values.get("profit"))))
             roi = self._as_float(values.get("roi", values.get("returnOnEquity", values.get("return"))))
-            address = row.get("ethAddress", row.get("address", row.get("user", "")))
-            display_name = row.get("displayName", row.get("name", ""))
+            address = row.get("ethAddress") or row.get("address") or row.get("user") or ""
+            display_name = row.get("displayName") or row.get("name") or ""
             if pnl is None and roi is None:
                 continue
             normalized.append({

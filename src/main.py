@@ -1098,12 +1098,14 @@ async def get_leaderboard(window: str, sort_by: str) -> str:
 
     lines = [title, ""]
     for index, row in enumerate(rows, 1):
-        name = row.get("name") or _wallet_label(row.get("address", ""))
+        address = str(row.get("address", ""))
+        name = row.get("name") or _wallet_label(address)
         pnl = row.get("pnl")
         roi = row.get("roi")
         pnl_text = f"${pnl:+,.2f}" if pnl is not None else "暂无"
         roi_text = f"{roi:+.2f}%" if roi is not None else "暂无"
         lines.append(f"<b>{index}. {html.escape(str(name))}</b>")
+        lines.append(f"   地址：<code>{html.escape(_wallet_label(address))}</code>")
         lines.append(f"   收益：{pnl_text}｜收益率：{roi_text}")
     lines.append("\n<i>数据来自 Hyperliquid 公开排行榜，不代表跟随钱包收益。</i>")
     return "\n".join(lines)
