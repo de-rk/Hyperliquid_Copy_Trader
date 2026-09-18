@@ -254,6 +254,38 @@ class HyperliquidClient:
             logger.error(f"Failed to get portfolio performance for {address}: {e}")
             return empty
 
+    async def get_user_fills(self, address: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return the newest public fills for an address, newest first."""
+        try:
+            response = await self._post(self.info_url, {"type": "userFills", "user": address})
+        except Exception as e:
+            logger.error(f"Failed to get user fills for {address}: {e}")
+            return []
+
+        fills: List[Dict[str, Any]] = []
+        for fill in response if isinstance(response, list) else []:
+            if not isinstance(fill, dict):
+                continue
+            timestamp = self._as_float(fill.get("time", fill.get("timestamp", 0))) or 0
+            price = self._as_float(fill.get("px", fill.get("price")))
+            size = self._as_float(fill.get("sz", fill.get("size")))
+            if price is None or size is None:
+                continue
+            raw_side = str(fill.get("side", "")).upper()
+            side = "买入" if raw_side in {"B", "BUY"} else "卖出" if raw_side in {"A", "S", "SELL"} else raw_side
+            fills.append({
+                "symbol": str(fill.get("coin", fill.get("symbol", "未知币种"))),
+                "direction": str(fill.get("dir", "")),
+                "side": side,
+                "price": price,
+                "size": size,
+                "closed_pnl": self._as_float(fill.get("closedPnl")),
+                "fee": self._as_float(fill.get("fee")),
+                "timestamp": int(timestamp),
+            })
+        fills.sort(key=lambda fill: fill["timestamp"], reverse=True)
+        return fills[:max(1, min(limit, 20))]
+
     @staticmethod
     def _leaderboard_rows(response: Any) -> List[Dict[str, Any]]:
         """Accept the known leaderboard response wrappers without inventing data."""

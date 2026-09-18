@@ -1118,6 +1118,61 @@ async def get_leaderboard(window: str, sort_by: str, page: int = 0) -> tuple[str
     return "\n".join(lines), total_pages
 
 
+async def get_wallet_report(address: str, fill_limit: int = 10) -> str:
+    """Format public account performance and recent fills for Telegram."""
+    if not client:
+        return "❌ Hyperliquid 客户端尚未初始化。"
+
+    state = await client.get_user_state(address)
+    performance = await client.get_portfolio_performance(address)
+    fills = await client.get_user_fills(address, fill_limit)
+    if state:
+        account_summary = (
+            f"• 账户价值：${state.balance:,.2f}\n"
+            f"• 未实现盈亏：${state.unrealized_pnl:,.2f}\n"
+            f"• 当前持仓：{len(state.positions)}｜挂单：{len(state.orders)}"
+        )
+    else:
+        account_summary = "• 当前账户状态暂不可用"
+
+    lines = [
+        "🔎 <b>Hyperliquid 公开账户查询</b>",
+        f"<code>{html.escape(address)}</code>",
+        "",
+        "<b>账户状态</b>",
+        account_summary,
+        "",
+        "<b>周期净值变化</b>",
+        _format_performance(performance),
+        "",
+        f"<b>最近成交（{len(fills)} 笔）</b>",
+    ]
+    if not fills:
+        lines.append("暂无可用成交记录。")
+    else:
+        for index, fill in enumerate(fills, 1):
+            timestamp = (
+                datetime.utcfromtimestamp(fill["timestamp"] / 1000).strftime("%m-%d %H:%M UTC")
+                if fill["timestamp"] else "时间未知"
+            )
+            direction = fill["direction"] or fill["side"] or "未知方向"
+            lines.append(
+                f"<b>{index}. {html.escape(fill['symbol'])}</b> {html.escape(direction)}\n"
+                f"   数量：{fill['size']:,.6f}｜价格：${fill['price']:,.4f}\n"
+                f"   时间：{timestamp}"
+            )
+            details = []
+            if fill["closed_pnl"] is not None:
+                details.append(f"已实现盈亏：${fill['closed_pnl']:+,.2f}")
+            if fill["fee"] is not None:
+                details.append(f"手续费：${fill['fee']:,.4f}")
+            if details:
+                lines.append("   " + "｜".join(details))
+
+    lines.append("\n<i>净值变化包含充值/提现影响；最近成交按交易所 fills 返回，非按开平仓配对后的完整交易。</i>")
+    return "\n".join(lines)
+
+
 async def handle_pause():
     """Handle pause request from Telegram"""
     global is_paused
@@ -1525,6 +1580,7 @@ async def main():
         telegram_bot.get_orders_callback = get_orders
         telegram_bot.get_pnl_callback = get_pnl
         telegram_bot.get_leaderboard_callback = get_leaderboard
+        telegram_bot.get_wallet_callback = get_wallet_report
         telegram_bot.on_pause_requested = handle_pause
         telegram_bot.on_resume_requested = handle_resume
         telegram_bot.on_stop_requested = handle_stop

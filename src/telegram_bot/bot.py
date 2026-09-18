@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Optional, Callable
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -41,6 +42,7 @@ class TelegramBot:
         self.get_orders_callback: Optional[Callable] = None
         self.get_pnl_callback: Optional[Callable] = None
         self.get_leaderboard_callback: Optional[Callable] = None
+        self.get_wallet_callback: Optional[Callable] = None
         
         logger.info(f"Telegram bot initialized for chat {allowed_chat_id}")
     
@@ -68,6 +70,7 @@ class TelegramBot:
 /orders - 查看当前挂单
 /pnl - 查看收益摘要
 /leaderboard - 查看公开收益排行榜
+/wallet 地址 [数量] - 查询公开账户收益和最近成交
 /pause - 暂停复制新成交，保留仓位
 /resume - 恢复复制
 /stop - 停止机器人，可选择是否平仓
@@ -360,6 +363,39 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Error getting PnL: {e}")
             await update.message.reply_text(f"❌ 获取收益失败：{e}")
+
+    async def _wallet_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show public account performance and newest fills for an address."""
+        if not self._check_authorized(update):
+            await update.message.reply_text("⛔ 未授权的聊天")
+            return
+        if not context.args:
+            await update.message.reply_text("用法：<code>/wallet 0x钱包地址 [1-20]</code>", parse_mode="HTML")
+            return
+        address = context.args[0].strip().lower()
+        if not re.fullmatch(r"0x[a-f0-9]{40}", address):
+            await update.message.reply_text("❌ 地址格式无效，请输入 0x 开头的 40 位十六进制钱包地址。")
+            return
+        limit = 10
+        if len(context.args) > 1:
+            try:
+                limit = int(context.args[1])
+            except ValueError:
+                await update.message.reply_text("❌ 成交数量必须是 1 到 20 的整数。")
+                return
+        if not 1 <= limit <= 20:
+            await update.message.reply_text("❌ 成交数量必须是 1 到 20。")
+            return
+        if not self.get_wallet_callback:
+            await update.message.reply_text("账户查询尚未配置")
+            return
+        try:
+            await update.message.reply_text("🔎 正在读取公开账户数据...", parse_mode="HTML")
+            result = await self.get_wallet_callback(address, limit)
+            await update.message.reply_text(result, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error getting public wallet data: {e}")
+            await update.message.reply_text(f"❌ 获取账户数据失败：{e}")
     
     async def start(self):
         """Start the Telegram bot"""
@@ -378,6 +414,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("stop", self._stop_command))
         self.app.add_handler(CommandHandler("pnl", self._pnl_command))
         self.app.add_handler(CommandHandler("leaderboard", self._leaderboard_command))
+        self.app.add_handler(CommandHandler("wallet", self._wallet_command))
         
         # Add callback query handler for buttons
         self.app.add_handler(CallbackQueryHandler(self._button_callback))
