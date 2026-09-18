@@ -40,6 +40,11 @@ MAX_PROCESSED_FILL_IDS = 10_000
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
+def perp_dex_for_symbol(symbol: str) -> str:
+    """Return the DEX that owns a perp symbol's collateral and positions."""
+    return symbol.split(":", 1)[0] if ":" in symbol else ""
+
+
 async def get_follower_balance() -> float | None:
     """Return the balance used for live sizing, or the simulated balance."""
     if settings.simulated_trading:
@@ -746,6 +751,7 @@ async def on_order_fill(fill_data: dict):
             position_side = PositionSide.LONG if fill_data.get("side") == "B" else PositionSide.SHORT
 
         follower_state = None
+        follower_dex_state = None
         follower_balance = simulated_balance
         if not settings.simulated_trading:
             follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
@@ -753,6 +759,13 @@ async def on_order_fill(fill_data: dict):
                 logger.error("Unable to read follower wallet state; skipping fill")
                 return
             follower_balance = follower_state.balance
+            follower_dex_state = await client.get_user_state(
+                settings.hyperliquid.wallet_address,
+                dex=perp_dex_for_symbol(symbol),
+            )
+            if follower_dex_state is None:
+                logger.error(f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state; skipping fill")
+                return
 
         target_balance = monitor.current_state.balance if monitor and monitor.current_state else 0
         if settings.copy_rules.auto_adjust_size:
@@ -775,7 +788,7 @@ async def on_order_fill(fill_data: dict):
                 follower_side = simulated_position.get("side") if simulated_position else None
             else:
                 follower_position = next(
-                    (position for position in follower_state.positions if position.symbol == symbol), None
+                    (position for position in follower_dex_state.positions if position.symbol == symbol), None
                 )
                 follower_size = follower_position.size if follower_position else 0
                 follower_side = follower_position.side.value if follower_position else None
@@ -813,10 +826,18 @@ async def on_order_fill(fill_data: dict):
                 open_positions = len(simulated_positions)
             else:
                 follower_position = next(
-                    (position for position in follower_state.positions if position.symbol == symbol), None
+                    (position for position in follower_dex_state.positions if position.symbol == symbol), None
                 )
-                available_margin = max(0.0, follower_state.available_balance)
+                available_margin = max(0.0, follower_dex_state.available_balance)
                 open_positions = len(follower_state.positions)
+
+                if available_margin <= 0:
+                    dex_name = perp_dex_for_symbol(symbol) or "default"
+                    logger.warning(
+                        f"Skipping {symbol}: {dex_name} Perp DEX available margin is $0.00. "
+                        f"Fund the {dex_name} DEX before copying this asset."
+                    )
+                    return
 
             if (
                 settings.copy_rules.max_open_trades is not None
@@ -1405,12 +1426,19 @@ async def main():
                     available_margin = simulated_balance
                 else:
                     current_follower_state = await client.get_user_state(
-                        settings.hyperliquid.wallet_address
+                        settings.hyperliquid.wallet_address,
+                        dex=perp_dex_for_symbol(pos.symbol),
                     )
                     if current_follower_state is None:
                         logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
                         continue
                     available_margin = max(0.0, current_follower_state.available_balance)
+                    if available_margin <= 0:
+                        dex_name = perp_dex_for_symbol(pos.symbol) or "default"
+                        logger.warning(
+                            f"   ⚠️ {pos.symbol} belongs to the {dex_name} Perp DEX, "
+                            "which has $0.00 available margin. No order will be sent."
+                        )
 
                 margin_limited_value = (
                     available_margin
@@ -1503,12 +1531,19 @@ async def main():
                     available_margin = simulated_balance
                 else:
                     current_follower_state = await client.get_user_state(
-                        settings.hyperliquid.wallet_address
+                        settings.hyperliquid.wallet_address,
+                        dex=perp_dex_for_symbol(pos.symbol),
                     )
                     if current_follower_state is None:
                         logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
                         continue
                     available_margin = max(0.0, current_follower_state.available_balance)
+                    if available_margin <= 0:
+                        dex_name = perp_dex_for_symbol(pos.symbol) or "default"
+                        logger.warning(
+                            f"   ⚠️ {pos.symbol} belongs to the {dex_name} Perp DEX, "
+                            "which has $0.00 available margin. No order will be sent."
+                        )
 
                 requested_position_value = target_position_value * auto_ratio
                 capped_position_value = min(

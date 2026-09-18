@@ -11,7 +11,7 @@
 - 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
 - 平仓仅在跟随钱包存在同方向仓位时执行，并使用 `reduce-only`，不会反手开仓。
 - 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
-- 新开仓会限制在可用保证金的 95% 以内，并遵守 `MAX_OPEN_TRADES`。
+- 新开仓会限制在订单所属 Perp DEX 可用保证金的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内，并遵守 `MAX_OPEN_TRADES`。
 - WebSocket 之外每 15 秒检查一次新 fills，用于补回连接重连期间漏掉的事件；启动前的历史 fills 仅作为基线，不会自动补单。
 - 容器日志和 Telegram 通知使用中国标准时间（UTC+8）。
 
@@ -44,7 +44,7 @@ HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
 TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```
 
-`HYPERLIQUID_WALLET_ADDRESS` 必须与私钥推导出的地址一致。用于实盘的 USDC 必须位于 Hyperliquid 的 **Perp** 账户，不是 Spot 账户。
+`HYPERLIQUID_WALLET_ADDRESS` 必须与私钥推导出的地址一致。用于实盘的 USDC 必须位于 Hyperliquid 的 **Perp** 账户，不是 Spot 账户。HIP-3 标的（例如 `xyz:SKHX`）还要求保证金位于其所属的 `xyz` Perp DEX；默认 Perp 账户的余额不能用于 `xyz:*` 下单。
 
 ### 2. 启动 Docker 服务
 
@@ -81,6 +81,19 @@ SIMULATED_TRADING=false
 docker compose down
 docker compose up -d --build
 ```
+
+### 4. 验证真实下单线路
+
+若要验证签名、下单、成交查询和 `reduce-only` 平仓，可运行一次 ETH 验证脚本。它只能在实盘模式、默认 Perp DEX 没有 ETH 仓位、且传入确认词时执行；开仓请求固定在 `$10-$12`，随后立即按交易所报告的实际仓位平仓。
+
+```bash
+docker compose stop copy-trader
+docker compose run --rm -e LIVE_ORDER_TEST_CONFIRM=ETH_12_USD copy-trader \
+  python src/verify_eth_live_order.py
+docker compose up -d copy-trader
+```
+
+此命令产生两笔真实 ETH 市价单的手续费和极小滑点。若脚本在开仓后报错，先在 Hyperliquid 界面检查 ETH 仓位，确认平仓后再启动机器人。
 
 ## 配置说明
 
@@ -143,7 +156,7 @@ INSTALL_TELEGRAM=true
 - 资金比例为 `1%`
 - 跟随数量为 `0.1` 个币
 - 程序检查该数量的名义价值是否至少 `$10`
-- 程序再检查该订单所需保证金是否不超过跟随账户可用保证金的 95%
+- 程序再检查该订单所需保证金是否不超过该标的所属 Perp DEX 可用保证金的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）
 
 启动日志中的 `Your Copy` 是“若复制目标当前全部旧仓位”的预估，不代表已下单。只有 `COPY_OPEN_POSITIONS=true` 才会在启动时执行该操作。
 

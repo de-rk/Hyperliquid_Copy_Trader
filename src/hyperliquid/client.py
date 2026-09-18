@@ -51,30 +51,37 @@ class HyperliquidClient:
             logger.error(f"API request failed: {e}")
             raise
     
-    async def get_user_state(self, address: str) -> Optional[UserState]:
+    async def get_user_state(
+        self, address: str, dex: Optional[str] = None
+    ) -> Optional[UserState]:
         """
         Get complete user state including positions and orders
         
         Args:
             address: Wallet address to query
+            dex: A specific perp DEX. ``None`` returns the aggregate state.
             
         Returns:
             UserState object or None if failed
         """
         try:
-            # Keep the list current as HIP-3 DEXs are added or removed.
-            perp_dexes = await self._post(self.info_url, {"type": "perpDexs"})
-            self.dexs = [""] + [
-                dex["name"] for dex in (perp_dexes or [])[1:]
-                if dex and dex.get("name")
-            ]
+            if dex is None:
+                # Keep the list current as HIP-3 DEXs are added or removed.
+                perp_dexes = await self._post(self.info_url, {"type": "perpDexs"})
+                dexes = [""] + [
+                    item["name"] for item in (perp_dexes or [])[1:]
+                    if item and item.get("name")
+                ]
+                self.dexs = dexes
+            else:
+                dexes = [dex]
             # merge all dex responses to get complete user state across all dexs
             all_responses = None
-            for dex in self.dexs:
+            for current_dex in dexes:
                 data = {
                     "type": "clearinghouseState",
                     "user": address,
-                    "dex": dex
+                    "dex": current_dex
                 }
                 
                 response = await self._post(self.info_url, data)
