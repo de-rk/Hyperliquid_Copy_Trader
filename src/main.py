@@ -45,6 +45,28 @@ def perp_dex_for_symbol(symbol: str) -> str:
     return symbol.split(":", 1)[0] if ":" in symbol else ""
 
 
+def calculate_proportional_close_size(
+    target_fill_size: float,
+    target_remaining_size: float,
+    follower_size: float,
+) -> tuple[float, float]:
+    """Return a follower close size from the target's pre-close position ratio.
+
+    ``target_remaining_size`` is the target position after this fill. A full
+    close therefore has a remaining size of zero and closes the whole follower
+    position. The returned size is always capped to the actual follower size.
+    """
+    if target_fill_size <= 0 or follower_size <= 0:
+        return 0.0, 0.0
+
+    target_pre_close_size = max(0.0, target_remaining_size) + target_fill_size
+    if target_pre_close_size <= 0:
+        return 0.0, 0.0
+
+    close_ratio = min(1.0, target_fill_size / target_pre_close_size)
+    return min(follower_size, follower_size * close_ratio), close_ratio
+
+
 async def get_follower_balance() -> float | None:
     """Return the balance used for live sizing, or the simulated balance."""
     if settings.simulated_trading:
@@ -767,19 +789,6 @@ async def on_order_fill(fill_data: dict):
                 logger.error(f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state; skipping fill")
                 return
 
-        target_balance = monitor.current_state.balance if monitor and monitor.current_state else 0
-        if settings.copy_rules.auto_adjust_size:
-            if target_balance <= 0:
-                logger.error("Target balance is unavailable; skipping fill")
-                return
-            our_size = target_size * (follower_balance / target_balance)
-        else:
-            our_size = target_size
-
-        if our_size <= 0:
-            logger.warning("Skipping fill because calculated size is zero")
-            return
-
         target_position = _target_position(symbol)
         if is_closing:
             if settings.simulated_trading:
@@ -797,7 +806,28 @@ async def on_order_fill(fill_data: dict):
                 logger.info(f"No matching follower {position_side.value} position for {symbol}; skipping reduce-only fill")
                 return
 
-            our_size = min(our_size, follower_size)
+            target_remaining_size = float(
+                fill_data.get("_target_remaining_size_after_fill", 0.0)
+            )
+            if (
+                "_target_remaining_size_after_fill" not in fill_data
+                and target_position is not None
+                and target_position.side == position_side
+            ):
+                target_remaining_size = target_position.size
+
+            our_size, close_ratio = calculate_proportional_close_size(
+                target_fill_size=target_size,
+                target_remaining_size=target_remaining_size,
+                follower_size=follower_size,
+            )
+            if our_size <= 0:
+                logger.warning(f"Cannot calculate proportional close size for {symbol}; skipping safely")
+                return
+            logger.info(
+                f"Proportional close for {symbol}: target closed {close_ratio:.2%}; "
+                f"follower closes {our_size:.8f} of {follower_size:.8f}"
+            )
             if our_size * price < MIN_POSITION_SIZE_USD:
                 logger.info(f"Reduce-only residual for {symbol} is below ${MIN_POSITION_SIZE_USD:.2f}; leaving it open")
                 return
@@ -813,6 +843,19 @@ async def on_order_fill(fill_data: dict):
         else:
             if target_position is None:
                 logger.warning(f"Target position unavailable for opening fill {symbol}; skipping safely")
+                return
+
+            target_balance = monitor.current_state.balance if monitor and monitor.current_state else 0
+            if settings.copy_rules.auto_adjust_size:
+                if target_balance <= 0:
+                    logger.error("Target balance is unavailable; skipping fill")
+                    return
+                our_size = target_size * (follower_balance / target_balance)
+            else:
+                our_size = target_size
+
+            if our_size <= 0:
+                logger.warning("Skipping fill because calculated size is zero")
                 return
 
             leverage = calculate_adjusted_leverage(

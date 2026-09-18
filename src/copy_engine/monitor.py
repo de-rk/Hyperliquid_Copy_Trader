@@ -153,13 +153,42 @@ class WalletMonitor:
         logger.debug("🔄 Refreshing position state before processing fills...")
         await self.get_current_state()
         
+        new_fills = []
         for fill in fills:
             fill_id = self._fill_id(fill)
             if fill_id in self.observed_fill_ids:
                 continue
             self.observed_fill_ids.add(fill_id)
+            new_fills.append(fill)
+
+        # Polling can return several fills from one reduce order. Process them
+        # chronologically and annotate each with its own post-fill target size,
+        # rather than using the final position size for every partial fill.
+        new_fills.sort(key=lambda fill: int(fill.get("time", 0)))
+        pending_close_sizes = {}
+        for fill in new_fills:
+            direction = str(fill.get("dir", ""))
+            if "Close" in direction or "Reduce" in direction:
+                symbol = str(fill.get("coin", "")).upper()
+                pending_close_sizes[symbol] = pending_close_sizes.get(symbol, 0.0) + abs(
+                    float(fill.get("sz", 0))
+                )
+
+        final_position_sizes = {
+            position.symbol.upper(): position.size for position in self.current_state.positions
+        } if self.current_state else {}
+
+        for fill in new_fills:
             # Extract symbol from fill data
             symbol = fill.get("coin", "").upper()
+            direction = str(fill.get("dir", ""))
+            if "Close" in direction or "Reduce" in direction:
+                fill_size = abs(float(fill.get("sz", 0)))
+                pending_size = pending_close_sizes.get(symbol, 0.0)
+                fill["_target_remaining_size_after_fill"] = (
+                    final_position_sizes.get(symbol, 0.0) + max(0.0, pending_size - fill_size)
+                )
+                pending_close_sizes[symbol] = max(0.0, pending_size - fill_size)
             
             # Check if asset is blocked
             from config.settings import settings
