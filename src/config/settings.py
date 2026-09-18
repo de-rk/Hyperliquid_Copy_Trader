@@ -117,6 +117,10 @@ class Settings(BaseModel):
         # Leverage adjustment
         leverage_adj = os.getenv('LEVERAGE_ADJUSTMENT', '0.5')
         settings.leverage.adjustment_ratio = float(leverage_adj)
+
+        max_position_size = os.getenv('MAX_POSITION_SIZE')
+        if max_position_size:
+            settings.sizing.max_position_size = float(max_position_size)
         
         max_trades = os.getenv('MAX_OPEN_TRADES', 'x')
         settings.copy_rules.max_open_trades = None if max_trades.lower() == 'x' else int(max_trades)

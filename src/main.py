@@ -827,9 +827,17 @@ async def on_order_fill(fill_data: dict):
                 return
 
             max_size_from_margin = (available_margin * leverage * 0.95) / price
-            our_size = min(our_size, max_size_from_margin)
+            existing_position_value = follower_position.notional_value if follower_position else 0.0
+            remaining_position_value = max(
+                0.0, settings.sizing.max_position_size - existing_position_value
+            )
+            max_size_from_position_limit = remaining_position_value / price
+            our_size = min(our_size, max_size_from_margin, max_size_from_position_limit)
             if our_size * price < MIN_POSITION_SIZE_USD:
-                logger.warning(f"Skipping {symbol}: copied fill value ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}")
+                logger.warning(
+                    f"Skipping {symbol}: copied fill value ${our_size * price:.2f} is below "
+                    f"${MIN_POSITION_SIZE_USD:.2f} after margin/MAX_POSITION_SIZE limits"
+                )
                 return
 
             order_side = OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL
@@ -1386,6 +1394,41 @@ async def main():
                     adjustment_ratio=settings.leverage.adjustment_ratio,
                     symbol=pos.symbol
                 )
+                # Startup copying must use the same risk caps as live fills.
+                # The exchange reserves margin and fees, so using the entire
+                # displayed balance can be rejected as insufficient margin.
+                if settings.simulated_trading:
+                    available_margin = simulated_balance
+                else:
+                    current_follower_state = await client.get_user_state(
+                        settings.hyperliquid.wallet_address
+                    )
+                    if current_follower_state is None:
+                        logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
+                        continue
+                    available_margin = max(0.0, current_follower_state.available_balance)
+
+                margin_limited_value = available_margin * your_leverage * 0.95
+                max_position_value = settings.sizing.max_position_size
+                capped_position_value = min(
+                    target_position_value * auto_ratio,
+                    margin_limited_value,
+                    max_position_value,
+                )
+                if capped_position_value < MIN_POSITION_SIZE_USD:
+                    logger.warning(
+                        f"⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}; "
+                        f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
+                    )
+                    continue
+                if capped_position_value < target_position_value * auto_ratio:
+                    logger.warning(
+                        f"⚠️  Capping {pos.symbol} startup copy from "
+                        f"${target_position_value * auto_ratio:,.2f} to ${capped_position_value:,.2f} "
+                        f"(available-margin or MAX_POSITION_SIZE limit)"
+                    )
+                your_position_value = capped_position_value
+                your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
                 margin_needed = your_position_value / your_leverage
                 total_simulated_margin += margin_needed
                 
@@ -1445,6 +1488,37 @@ async def main():
                     adjustment_ratio=settings.leverage.adjustment_ratio,
                     symbol=pos.symbol
                 )
+                if settings.simulated_trading:
+                    available_margin = simulated_balance
+                else:
+                    current_follower_state = await client.get_user_state(
+                        settings.hyperliquid.wallet_address
+                    )
+                    if current_follower_state is None:
+                        logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
+                        continue
+                    available_margin = max(0.0, current_follower_state.available_balance)
+
+                requested_position_value = target_position_value * auto_ratio
+                capped_position_value = min(
+                    requested_position_value,
+                    available_margin * your_leverage * 0.95,
+                    settings.sizing.max_position_size,
+                )
+                if capped_position_value < MIN_POSITION_SIZE_USD:
+                    logger.warning(
+                        f"⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}; "
+                        f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
+                    )
+                    continue
+                if capped_position_value < requested_position_value:
+                    logger.warning(
+                        f"⚠️  Capping {pos.symbol} startup copy from "
+                        f"${requested_position_value:,.2f} to ${capped_position_value:,.2f} "
+                        f"(available-margin or MAX_POSITION_SIZE limit)"
+                    )
+                your_position_value = capped_position_value
+                your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
                 margin_needed = your_position_value / your_leverage
                 
                 # Check minimum position size

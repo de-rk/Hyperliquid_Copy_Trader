@@ -117,6 +117,9 @@ MAX_SLIPPAGE_PCT=1.0
 # 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
 LEVERAGE_ADJUSTMENT=0.5
 
+# 单个跟随仓位最大名义价值（美元）。启动补仓和新成交都受此限制。
+MAX_POSITION_SIZE=1000.0
+
 # x 表示不限制。建议实盘先用 1。
 MAX_OPEN_TRADES=1
 MAX_OPEN_ORDERS=x
