@@ -254,6 +254,10 @@ class TelegramBot:
                 await query.edit_message_text("排行榜查询尚未配置")
                 return
             try:
+                await query.edit_message_text(
+                    "🏆 <b>Hyperliquid 收益排行榜</b>\n\n正在读取公开数据...",
+                    parse_mode="HTML",
+                )
                 result = await self.get_leaderboard_callback(parts[1], parts[2])
                 await query.edit_message_text(
                     result,

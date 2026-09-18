@@ -1,3 +1,4 @@
+import asyncio
 import aiohttp
 import json
 from typing import Optional, List, Dict, Any
@@ -280,11 +281,12 @@ class HyperliquidClient:
 
         params = {"timeWindow": window, "sortBy": sort_by}
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(self.leaderboard_url, params=params) as response:
                     response.raise_for_status()
                     payload = await response.json()
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"Failed to get Hyperliquid leaderboard: {e}")
             return []
 
