@@ -11,4 +11,4 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     environment:
-      - TZ=UTC
+      - TZ=Asia/Shanghai

@@ -25,6 +25,10 @@ class WalletMonitor:
         self.current_state: Optional[UserState] = None
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
+        self.is_monitoring = False
+        self.observed_fill_ids: set[str] = set()
+        self.fill_poll_task: Optional[asyncio.Task] = None
+        self.fill_poll_interval = 15
         
         # Callbacks
         self.on_new_position: Optional[Callable] = None
@@ -38,21 +42,25 @@ class WalletMonitor:
     
     async def get_current_state(self) -> Optional[UserState]:
         """Fetch current state of target wallet"""
-        async with self.client:
-            self.current_state = await self.client.get_user_state(self.target_address)
-            
-            if self.current_state:
-                self.last_positions = self.current_state.positions.copy()
-                self.last_orders = self.current_state.orders.copy()
-            
-            return self.current_state
+        self.current_state = await self.client.get_user_state(self.target_address)
+
+        if self.current_state:
+            self.last_positions = self.current_state.positions.copy()
+            self.last_orders = self.current_state.orders.copy()
+
+        return self.current_state
     
     async def start_monitoring(self):
         """Start monitoring the target wallet"""
         logger.info(f"Starting monitoring for {self.target_address}")
+        self.is_monitoring = True
         
-        # Get initial state
+        # Establish the historical fill baseline before taking the initial
+        # state snapshot. New fills after this point are handled by polling
+        # even if the WebSocket subscription is still connecting.
+        await self._seed_fill_baseline()
         await self.get_current_state()
+        self.fill_poll_task = asyncio.create_task(self._poll_fills())
         
         # Connect WebSocket
         await self.ws.connect()
@@ -69,7 +77,43 @@ class WalletMonitor:
     async def stop_monitoring(self):
         """Stop monitoring"""
         logger.info("Stopping wallet monitoring")
+        self.is_monitoring = False
+        if self.fill_poll_task and not self.fill_poll_task.done():
+            self.fill_poll_task.cancel()
+            try:
+                await self.fill_poll_task
+            except asyncio.CancelledError:
+                pass
         await self.ws.stop()
+        await self.client.close()
+
+    @staticmethod
+    def _fill_id(fill: dict) -> str:
+        trade_id = fill.get("tid")
+        if trade_id is not None:
+            return str(trade_id)
+        return ":".join(str(fill.get(key, "")) for key in ("coin", "time", "oid", "sz", "px"))
+
+    async def _seed_fill_baseline(self) -> None:
+        """Remember old fills so startup never creates surprise catch-up orders."""
+        fills = await self.client.get_raw_user_fills(self.target_address)
+        self.observed_fill_ids.update(self._fill_id(fill) for fill in fills)
+        logger.info(
+            f"Fill baseline seeded with {len(self.observed_fill_ids)} historical fills; "
+            "only fills after monitoring starts are eligible for copying"
+        )
+
+    async def _poll_fills(self) -> None:
+        """Recover new fills that may be missed while the WebSocket reconnects."""
+        while self.is_monitoring:
+            try:
+                await asyncio.sleep(self.fill_poll_interval)
+                fills = await self.client.get_raw_user_fills(self.target_address)
+                await self._handle_fills(fills, source="poll")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error polling target fills: {e}")
     
     async def _handle_user_event(self, update: WebSocketUpdate):
         """Handle WebSocket updates from target wallet"""
@@ -86,7 +130,7 @@ class WalletMonitor:
             # Handle fills (completed trades)
             if "fills" in data:
                 logger.success(f"💥 FILLS DETECTED: {len(data['fills'])} fills")
-                await self._handle_fills(data["fills"])
+                await self._handle_fills(data["fills"], source="websocket")
             
             # Handle position updates
             if "positions" in data:
@@ -103,13 +147,17 @@ class WalletMonitor:
             import traceback
             logger.error(traceback.format_exc())
     
-    async def _handle_fills(self, fills: List[dict]):
+    async def _handle_fills(self, fills: List[dict], source: str = "websocket"):
         """Handle trade fills"""
         # Refresh positions before processing fills to ensure we have up-to-date state
         logger.debug("🔄 Refreshing position state before processing fills...")
         await self.get_current_state()
         
         for fill in fills:
+            fill_id = self._fill_id(fill)
+            if fill_id in self.observed_fill_ids:
+                continue
+            self.observed_fill_ids.add(fill_id)
             # Extract symbol from fill data
             symbol = fill.get("coin", "").upper()
             
@@ -119,7 +167,7 @@ class WalletMonitor:
                 logger.warning(f"⛔ BLOCKED ASSET - Ignoring fill for {symbol} (in blocked list)")
                 continue
             
-            logger.success(f"🎯 FILL DETECTED: {fill}")
+            logger.success(f"🎯 FILL DETECTED ({source}): {fill}")
             
             if self.on_order_fill:
                 try:

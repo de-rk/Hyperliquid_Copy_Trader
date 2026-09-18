@@ -1,8 +1,16 @@
 import asyncio
 from typing import Optional
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from telegram import Bot
 from loguru import logger
+
+
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _now_shanghai() -> datetime:
+    return datetime.now(SHANGHAI_TZ)
 
 
 class NotificationService:
@@ -68,7 +76,7 @@ class NotificationService:
 
 ━━━━━━━━━━━━━━━━━━
 <b>目标成交数量：</b>{target_size:.4f}
-<b>时间：</b>{datetime.now().strftime('%H:%M:%S UTC')}
+<b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
 """
         await self.send_message(message.strip())
     
@@ -92,7 +100,7 @@ class NotificationService:
 {mode_emoji} <b>仓位已平</b> {mode_text}
 
 <b>币种：</b>{symbol}{pnl_text}
-<b>时间：</b>{datetime.now().strftime('%H:%M:%S UTC')}
+<b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
 """
         await self.send_message(message.strip())
     
@@ -121,7 +129,7 @@ class NotificationService:
 📝 <b>挂单数：</b>{open_orders}
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🕐 <b>报告时间：</b>{datetime.now().strftime('%H:%M UTC')}
+🕐 <b>报告时间：</b>{_now_shanghai().strftime('%H:%M UTC+8')}
 """
         await self.send_message(message.strip())
     
@@ -132,7 +140,7 @@ class NotificationService:
 
 <code>{error_message}</code>
 
-<b>时间：</b>{datetime.now().strftime('%H:%M:%S UTC')}
+<b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
 """
         await self.send_message(message.strip())
     

@@ -30,12 +30,17 @@ class HyperliquidClient:
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the reusable HTTP session owned by this client."""
+        if self.session and not self.session.closed:
             await self.session.close()
+        self.session = None
     
     async def _post(self, url: str, data: dict) -> dict:
         """Make POST request to API"""
-        if not self.session:
+        if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
             
         try:
@@ -254,18 +259,19 @@ class HyperliquidClient:
             logger.error(f"Failed to get portfolio performance for {address}: {e}")
             return empty
 
-    async def get_user_fills(self, address: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Return the newest public fills for an address, newest first."""
+    async def get_raw_user_fills(self, address: str) -> List[Dict[str, Any]]:
+        """Return raw public fills for internal monitoring and formatting."""
         try:
             response = await self._post(self.info_url, {"type": "userFills", "user": address})
         except Exception as e:
             logger.error(f"Failed to get user fills for {address}: {e}")
             return []
+        return [fill for fill in response if isinstance(fill, dict)] if isinstance(response, list) else []
 
+    async def get_user_fills(self, address: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return the newest public fills for an address, newest first."""
         fills: List[Dict[str, Any]] = []
-        for fill in response if isinstance(response, list) else []:
-            if not isinstance(fill, dict):
-                continue
+        for fill in await self.get_raw_user_fills(address):
             timestamp = self._as_float(fill.get("time", fill.get("timestamp", 0))) or 0
             price = self._as_float(fill.get("px", fill.get("price")))
             size = self._as_float(fill.get("sz", fill.get("size")))

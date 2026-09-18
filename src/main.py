@@ -1,8 +1,9 @@
 import asyncio
 import html
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 from loguru import logger
 from config.settings import settings
 from utils.logger import setup_logger
@@ -36,6 +37,7 @@ simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'sid
 simulated_pnl = 0.0
 processed_fill_ids: set[str] = set()
 MAX_PROCESSED_FILL_IDS = 10_000
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 async def get_follower_balance() -> float | None:
@@ -894,7 +896,7 @@ async def on_order_fill(fill_data: dict):
 # Telegram bot callback functions
 async def get_status() -> str:
     """Get current bot status for Telegram"""
-    uptime = (datetime.now() - bot_start_time).total_seconds() / 3600 if bot_start_time else 0
+    uptime = (datetime.now(SHANGHAI_TZ) - bot_start_time).total_seconds() / 3600 if bot_start_time else 0
     
     follower_state = None if settings.simulated_trading else await _get_follower_state()
     
@@ -1152,7 +1154,9 @@ async def get_wallet_report(address: str, fill_limit: int = 10) -> str:
     else:
         for index, fill in enumerate(fills, 1):
             timestamp = (
-                datetime.utcfromtimestamp(fill["timestamp"] / 1000).strftime("%m-%d %H:%M UTC")
+                datetime.fromtimestamp(fill["timestamp"] / 1000, timezone.utc)
+                .astimezone(SHANGHAI_TZ)
+                .strftime("%m-%d %H:%M UTC+8")
                 if fill["timestamp"] else "时间未知"
             )
             direction = fill["direction"] or fill["side"] or "未知方向"
@@ -1253,7 +1257,7 @@ async def main():
     global monitor, executor, position_sizer, client, telegram_bot, notifier, bot_start_time
     global simulated_balance, trades_copied_count
     
-    bot_start_time = datetime.now()
+    bot_start_time = datetime.now(SHANGHAI_TZ)
     trades_copied_count = 0
     
     # Keep this variable as the account balance used by sizing and status
@@ -1459,7 +1463,7 @@ async def main():
                 logger.success(f"   → Margin: ${margin_needed:,.2f}")
                 
                 # Execute the copy
-                position_side = PositionSide.LONG if pos.size > 0 else PositionSide.SHORT
+                position_side = pos.side
                 result = await executor.execute_market_order(
                     symbol=pos.symbol,
                     side=OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL,
