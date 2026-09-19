@@ -15,7 +15,9 @@ class WalletMonitor:
         self,
         target_address: str,
         api_url: str = "https://api.hyperliquid.xyz",
-        ws_url: str = "wss://api.hyperliquid.xyz/ws"
+        ws_url: str = "wss://api.hyperliquid.xyz/ws",
+        fill_polling_enabled: bool = False,
+        fill_poll_interval_seconds: int = 15,
     ):
         self.target_address = target_address
         self.client = HyperliquidClient(api_url)
@@ -28,7 +30,8 @@ class WalletMonitor:
         self.is_monitoring = False
         self.observed_fill_ids: set[str] = set()
         self.fill_poll_task: Optional[asyncio.Task] = None
-        self.fill_poll_interval = 15
+        self.fill_polling_enabled = fill_polling_enabled
+        self.fill_poll_interval = max(15, fill_poll_interval_seconds)
         
         # Callbacks
         self.on_new_position: Optional[Callable] = None
@@ -60,7 +63,13 @@ class WalletMonitor:
         # even if the WebSocket subscription is still connecting.
         await self._seed_fill_baseline()
         await self.get_current_state()
-        self.fill_poll_task = asyncio.create_task(self._poll_fills())
+        if self.fill_polling_enabled:
+            self.fill_poll_task = asyncio.create_task(self._poll_fills())
+            logger.info(
+                f"Fill polling fallback enabled ({self.fill_poll_interval}s interval)"
+            )
+        else:
+            logger.info("Fill polling fallback disabled; using WebSocket fills only")
         
         # Connect WebSocket
         await self.ws.connect()

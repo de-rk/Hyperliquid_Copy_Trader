@@ -1362,7 +1362,9 @@ async def main():
     monitor = WalletMonitor(
         target_address,
         settings.hyperliquid.api_url,
-        settings.hyperliquid.ws_url
+        settings.hyperliquid.ws_url,
+        fill_polling_enabled=settings.copy_rules.fill_polling_enabled,
+        fill_poll_interval_seconds=settings.copy_rules.fill_poll_interval_seconds,
     )
     
     executor = TradeExecutor(
@@ -1534,6 +1536,10 @@ async def main():
     logger.info(f"   Max Position Size: ${settings.sizing.max_position_size:,.2f}")
     logger.info(
         f"   Max Margin Usage: {settings.copy_rules.max_margin_usage_ratio:.0%}"
+    )
+    logger.info(
+        f"   Fill Polling Fallback: "
+        f"{'enabled (' + str(settings.copy_rules.fill_poll_interval_seconds) + 's)' if settings.copy_rules.fill_polling_enabled else 'disabled'}"
     )
     
     position_sizer = PositionSizer(

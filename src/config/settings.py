@@ -44,6 +44,8 @@ class CopyRulesConfig(BaseModel):
     max_slippage_pct: float = 1.0
     # Reserve headroom for asset-specific initial-margin requirements and fees.
     max_margin_usage_ratio: float = 0.40
+    fill_polling_enabled: bool = False
+    fill_poll_interval_seconds: int = 15
     min_position_size_usd: float = 10.0
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 
@@ -118,6 +120,12 @@ class Settings(BaseModel):
 
         max_margin_usage = float(os.getenv('MAX_MARGIN_USAGE_RATIO', '0.40'))
         settings.copy_rules.max_margin_usage_ratio = min(0.95, max(0.05, max_margin_usage))
+
+        fill_polling = os.getenv('FILL_POLLING_ENABLED', 'false').lower()
+        settings.copy_rules.fill_polling_enabled = fill_polling in ('true', '1', 'yes')
+        settings.copy_rules.fill_poll_interval_seconds = max(
+            15, int(os.getenv('FILL_POLL_INTERVAL_SECONDS', '15'))
+        )
         
         # Leverage adjustment
         leverage_adj = os.getenv('LEVERAGE_ADJUSTMENT', '0.5')

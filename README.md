@@ -12,7 +12,7 @@
 - 平仓按目标本次减仓占其平仓前仓位的比例执行；仅在跟随钱包存在同方向仓位时使用 `reduce-only`，不会反手开仓。
 - 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
 - 新开仓会限制在订单所属 Perp DEX 可用保证金的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内，并遵守 `MAX_OPEN_TRADES`。
-- WebSocket 之外每 15 秒检查一次新 fills，用于补回连接重连期间漏掉的事件；启动前的历史 fills 仅作为基线，不会自动补单。
+- 默认只使用 WebSocket 监听成交；`FILL_POLLING_ENABLED=true` 时才会按 `FILL_POLL_INTERVAL_SECONDS`（默认 15 秒）查询 REST 接口补回断线期间漏掉的成交。启动前的历史 fills 仅作为基线，不会自动补单。
 - 容器日志和 Telegram 通知使用中国标准时间（UTC+8）。
 
 如果机器人启动前目标已经开仓，且需要主动复制该已有仓位，必须由使用者明确设置 `COPY_OPEN_POSITIONS=true` 并重启服务。该设置会产生真实订单；默认 `false` 不会追入已有仓位。
@@ -128,6 +128,9 @@ USE_LIMIT_ORDERS=false
 MAX_SLIPPAGE_PCT=1.0
 # 每笔开仓最多使用可用保证金的比例。HIP-3 标的实际保证金可能高于显示杠杆的简单估算。
 MAX_MARGIN_USAGE_RATIO=0.40
+# 默认关闭 REST 成交补漏；需要时改为 true
+FILL_POLLING_ENABLED=false
+FILL_POLL_INTERVAL_SECONDS=15
 
 # 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
 LEVERAGE_ADJUSTMENT=0.5
