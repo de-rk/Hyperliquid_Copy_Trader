@@ -790,6 +790,16 @@ async def on_order_fill(fill_data: dict):
                 return
 
         target_position = _target_position(symbol)
+        if target_position is None and is_opening and monitor:
+            # The fill is the source of truth, while the REST position
+            # snapshot can lag the WebSocket event by a few hundred ms.
+            # Refresh once before deciding that an opening fill is invalid.
+            logger.info(
+                f"Target position snapshot missing for opening fill {symbol}; "
+                "refreshing before copy"
+            )
+            await monitor.get_current_state()
+            target_position = _target_position(symbol)
         if is_closing:
             if settings.simulated_trading:
                 simulated_position = simulated_positions.get(symbol)
@@ -808,6 +818,10 @@ async def on_order_fill(fill_data: dict):
 
             target_remaining_size = float(
                 fill_data.get("_target_remaining_size_after_fill", 0.0)
+            )
+            target_fully_closed = (
+                "_target_remaining_size_after_fill" in fill_data
+                and target_remaining_size <= 1e-12
             )
             if (
                 "_target_remaining_size_after_fill" not in fill_data
@@ -828,7 +842,11 @@ async def on_order_fill(fill_data: dict):
                 f"Proportional close for {symbol}: target closed {close_ratio:.2%}; "
                 f"follower closes {our_size:.8f} of {follower_size:.8f}"
             )
-            if our_size * price < MIN_POSITION_SIZE_USD:
+            # A partial close below the exchange minimum must wait for more
+            # fills from the same target order. Once the target is fully flat,
+            # force the final reduce-only order so the follower cannot retain
+            # a residual position indefinitely.
+            if our_size * price < MIN_POSITION_SIZE_USD and not target_fully_closed:
                 logger.info(f"Reduce-only residual for {symbol} is below ${MIN_POSITION_SIZE_USD:.2f}; leaving it open")
                 return
 
@@ -841,10 +859,6 @@ async def on_order_fill(fill_data: dict):
                 reduce_only=True,
             )
         else:
-            if target_position is None:
-                logger.warning(f"Target position unavailable for opening fill {symbol}; skipping safely")
-                return
-
             target_balance = monitor.current_state.balance if monitor and monitor.current_state else 0
             if settings.copy_rules.auto_adjust_size:
                 if target_balance <= 0:
@@ -858,8 +872,14 @@ async def on_order_fill(fill_data: dict):
                 logger.warning("Skipping fill because calculated size is zero")
                 return
 
+            target_leverage = target_position.leverage if target_position else 1.0
+            if target_position is None:
+                logger.warning(
+                    f"Target position still unavailable for opening fill {symbol}; "
+                    "copying with conservative 1x leverage"
+                )
             leverage = calculate_adjusted_leverage(
-                target_leverage=target_position.leverage,
+                target_leverage=target_leverage,
                 adjustment_ratio=settings.leverage.adjustment_ratio,
                 symbol=symbol,
             )
@@ -926,7 +946,11 @@ async def on_order_fill(fill_data: dict):
                 )
 
         if not result:
-            logger.error(f"Failed to copy fill {fill_id}")
+            logger.error(
+                f"Failed to copy fill {fill_id}: executor returned no order id; "
+                f"symbol={symbol} direction={direction} size={our_size:.8f} "
+                f"notional=${our_size * price:.2f} simulated={settings.simulated_trading}"
+            )
             return
 
         _remember_fill(fill_id)
@@ -957,14 +981,19 @@ async def on_order_fill(fill_data: dict):
                     position["size"] = remaining if position_side == PositionSide.LONG else -remaining
 
         if notifier:
-            await notifier.send_trade_notification(
+            notification_sent = await notifier.send_trade_notification(
                 symbol=symbol,
                 side=order_side.value,
                 size=our_size,
                 entry_price=price,
                 leverage=leverage,
                 target_size=target_size,
+                is_simulated=settings.simulated_trading,
             )
+            if not notification_sent:
+                logger.error(
+                    f"Copy succeeded but Telegram notification failed for {fill_id}"
+                )
     except Exception as exc:
         logger.exception(f"Error copying fill: {exc}")
 

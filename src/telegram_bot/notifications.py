@@ -78,7 +78,13 @@ class NotificationService:
 <b>目标成交数量：</b>{target_size:.4f}
 <b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
 """
-        await self.send_message(message.strip())
+        sent = await self.send_message(message.strip())
+        if not sent:
+            logger.error(
+                f"Trade notification was not delivered: {symbol} "
+                f"{side.upper()} size={size:.8f}"
+            )
+        return sent
     
     async def send_position_close_notification(
         self,
