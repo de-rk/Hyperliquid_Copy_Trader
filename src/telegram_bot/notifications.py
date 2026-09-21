@@ -226,7 +226,7 @@ class NotificationService:
 • 杠杆：目标杠杆的 {leverage_adjustment} 倍
 • 状态：<b>运行中</b> 🟢
 
-正在监听目标钱包的新成交。
+正在监听目标钱包的新挂单、撤单和成交。
 """
         await self.send_message(message.strip())
     

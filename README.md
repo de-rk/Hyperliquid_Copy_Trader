@@ -1,12 +1,13 @@
 # Hyperliquid 跟单机器人
 
-基于 Hyperliquid WebSocket 的跟单程序。它监听指定目标钱包的**新成交**，按跟随钱包与目标钱包的资金比例计算数量，并在 Hyperliquid 永续合约账户中提交对应订单。
+基于 Hyperliquid WebSocket 的跟单程序。它监听指定目标钱包的**新挂单和成交**，按跟随钱包与目标钱包的资金比例计算数量，并在 Hyperliquid 永续合约账户中提交对应订单。
 
 > 风险提示：这是交易执行程序，不保证盈利。先使用模拟模式验证，再用少量资金开启实盘。私钥只应保存在本机或服务器的 `.env`，不要提交、截图或发送给任何人。
 
 ## 当前行为
 
-- 只复制机器人启动后的目标**成交**，避免复制尚未成交的挂单。
+- 默认镜像机器人启动后的目标**限价挂单**：目标挂单后立即按同一价格创建跟随挂单；目标取消、过期或被拒时，撤销仍未成交的跟随挂单。
+- 目标挂单成交时不会再次创建跟随订单；跟随挂单自身的成交负责改变跟随仓位。若目标订单部分成交，跟随挂单保留剩余数量。
 - `COPY_OPEN_POSITIONS=false` 时，不会在启动时追入目标已有仓位。
 - 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
 - 平仓按目标本次减仓占其平仓前仓位的比例执行；仅在跟随钱包存在同方向仓位时使用 `reduce-only`，不会反手开仓。
@@ -31,6 +32,9 @@ cp .env.example .env
 SIMULATED_TRADING=true
 COPY_OPEN_POSITIONS=false
 COPY_EXISTING_ORDERS=false
+COPY_PENDING_ORDERS=true
+CANCEL_MIRRORED_ORDERS=true
+MIRROR_ORDER_PRICE=true
 AUTO_ADJUST_SIZE=true
 LEVERAGE_ADJUSTMENT=0.5
 MAX_OPEN_TRADES=1
@@ -119,6 +123,12 @@ COPY_OPEN_POSITIONS=false
 
 # 启动时是否复制目标已有挂单。建议保持 false。
 COPY_EXISTING_ORDERS=false
+
+# 是否在目标挂单出现时立即镜像，以及目标取消时联动撤销。
+COPY_PENDING_ORDERS=true
+CANCEL_MIRRORED_ORDERS=true
+# true 使用目标限价；false 使用跟随账户读取的当前中间价。
+MIRROR_ORDER_PRICE=true
 
 # true 时，单笔跟随数量 = 目标本次成交量 × 跟随资金 / 目标资金
 AUTO_ADJUST_SIZE=true

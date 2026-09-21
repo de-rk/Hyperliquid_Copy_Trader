@@ -37,6 +37,10 @@ simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'sid
 simulated_pnl = 0.0
 processed_fill_ids: set[str] = set()
 MAX_PROCESSED_FILL_IDS = 10_000
+# target oid -> follower order metadata. Keeping this mapping in memory is
+# sufficient because the target websocket is the source of truth for this run;
+# a restart takes a fresh baseline and never cancels unrelated follower orders.
+mirrored_orders: dict[str, dict] = {}
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -388,20 +392,55 @@ async def on_position_update(position_data: dict):
 
 
 async def on_new_order(order_data: dict):
-    """Notify immediately when a target order is created.
-
-    This callback intentionally never places an order. The fill callback is
-    the single execution path, preventing a pending target order plus its
-    eventual fill from creating duplicate follower exposure.
-    """
+    """Mirror a target resting order immediately and remember its oid mapping."""
+    global mirrored_orders
     try:
+        if not settings.copy_rules.mirror_pending_orders:
+            return
+        if is_paused:
+            logger.warning("Bot is paused - skipping pending order mirror")
+            return
+
         symbol = order_data.get('coin', '')
         side = order_data.get('side', '')
         target_size = abs(float(order_data.get('sz', order_data.get('origSz', 0))))
         price = float(order_data.get('limitPx', order_data.get('px', 0)) or 0)
+        target_oid = str(order_data.get('_target_oid', order_data.get('oid', '')) or '')
         side_code = side.value if isinstance(side, OrderSide) else str(side).lower()
         is_buy = side_code in ('b', 'buy')
         position_side = PositionSide.LONG if is_buy else PositionSide.SHORT
+        reduce_only = bool(order_data.get("reduceOnly", order_data.get("reduce_only", False)))
+
+        if target_oid and target_oid in mirrored_orders:
+            return
+        if not symbol or not target_oid or target_size <= 0 or price <= 0:
+            await _notify_copy_failure(
+                symbol=symbol or "unknown", direction=position_side.value,
+                target_size=target_size, follower_size=0, price=price,
+                category="挂单数据无效", reason=f"Missing oid/symbol/size/price: {order_data}",
+                fill_id=target_oid,
+            )
+            return
+        if not settings.copy_rules.mirror_order_price:
+            try:
+                price = await executor._get_mid_price(symbol)
+            except Exception as exc:
+                await _notify_copy_failure(
+                    symbol=symbol, direction=position_side.value, target_size=target_size,
+                    follower_size=0, price=price, category="镜像价格查询失败",
+                    reason=str(exc), fill_id=target_oid,
+                )
+                return
+        if settings.copy_rules.max_open_orders is not None:
+            active_mirrors = sum(1 for item in mirrored_orders.values() if item.get("active", True))
+            if active_mirrors >= settings.copy_rules.max_open_orders:
+                await _notify_copy_failure(
+                    symbol=symbol, direction=position_side.value, target_size=target_size,
+                    follower_size=0, price=price, category="达到最大挂单数",
+                    reason=f"Mirrored open orders {active_mirrors} >= limit {settings.copy_rules.max_open_orders}",
+                    fill_id=target_oid,
+                )
+                return
 
         target_position = _target_position(symbol)
         target_leverage = target_position.leverage if target_position else 1.0
@@ -417,26 +456,176 @@ async def on_new_order(order_data: dict):
         else:
             our_size = target_size
 
-        # This notification is deliberately sent before any pause, risk-limit,
-        # or exchange validation. It reports detection, not execution.
+        leverage = calculate_adjusted_leverage(
+            target_leverage, settings.leverage.adjustment_ratio, symbol
+        )
+        # Apply the same hard exposure and margin ceilings used by fill copies
+        # before sending a live resting order.
+        max_size = settings.sizing.max_position_size / price
+        if not reduce_only:
+            if settings.simulated_trading:
+                available_margin = simulated_balance
+            else:
+                follower_dex_state = await client.get_user_state(
+                    settings.hyperliquid.wallet_address,
+                    dex=perp_dex_for_symbol(symbol),
+                )
+                if follower_dex_state is None:
+                    await _notify_copy_failure(
+                        symbol=symbol, direction=position_side.value, target_size=target_size,
+                        follower_size=our_size, price=price, category="DEX账户查询失败",
+                        reason=f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state",
+                        fill_id=target_oid,
+                    )
+                    return
+                available_margin = max(0.0, follower_dex_state.available_balance)
+            max_size = min(
+                max_size,
+                available_margin * leverage * settings.copy_rules.max_margin_usage_ratio / price,
+            )
+        our_size = min(our_size, max_size)
+        if our_size * price < MIN_POSITION_SIZE_USD:
+            await _notify_copy_failure(
+                symbol=symbol, direction=position_side.value, target_size=target_size,
+                follower_size=our_size, price=price, category="低于最小订单金额",
+                reason=f"Mirrored order notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}",
+                fill_id=target_oid,
+            )
+            return
+
+        result = await executor.execute_limit_order(
+            symbol=symbol,
+            side=OrderSide.BUY if is_buy else OrderSide.SELL,
+            size=Decimal(str(our_size)),
+            price=Decimal(str(price)),
+            leverage=leverage,
+            reduce_only=reduce_only,
+        )
+        if not result:
+            await _notify_copy_failure(
+                symbol=symbol, direction=position_side.value, target_size=target_size,
+                follower_size=our_size, price=price, category="镜像挂单失败",
+                reason=getattr(executor, "last_error", None) or "Executor returned no order id",
+                fill_id=target_oid,
+            )
+            return
+
+        mirrored_orders[target_oid] = {
+            "follower_oid": str(result), "symbol": symbol, "size": our_size,
+            "price": price, "target_price": price, "target_size": target_size,
+            "side": position_side.value, "leverage": leverage,
+            "reduce_only": reduce_only,
+            "active": True, "target_filled_size": 0.0,
+        }
+        logger.success(
+            f"Mirrored target order: {symbol} {position_side.value} "
+            f"target_oid={target_oid} follower_oid={result} size={our_size:.8f} price=${price:,.4f}"
+        )
         if notifier and not order_data.get('_startup_snapshot'):
             await notifier.send_order_detected_notification(
-                symbol=symbol,
-                side=position_side.value,
-                size=our_size,
-                entry_price=price,
-                leverage=target_leverage,
-                target_size=target_size,
-                status=str(order_data.get('_order_status') or 'PENDING').upper(),
+                symbol=symbol, side=position_side.value, size=our_size,
+                entry_price=price, leverage=leverage, target_size=target_size,
+                status="MIRRORED",
             )
-
-        logger.info(
-            f"New target order notified (no order placed): {symbol} "
-            f"{position_side.value} target_size={target_size:.8f} "
-            f"estimated_size={our_size:.8f} price=${price:,.4f}"
-        )
     except Exception as e:
         logger.error(f"Error notifying new target order: {e}")
+        try:
+            await _notify_copy_failure(
+                symbol=str(order_data.get("coin", "unknown")),
+                direction=str(order_data.get("side", "unknown")),
+                target_size=abs(float(order_data.get("sz", order_data.get("origSz", 0)) or 0)),
+                follower_size=0,
+                price=float(order_data.get("limitPx", order_data.get("px", 0)) or 0),
+                category="镜像挂单异常",
+                reason=str(e),
+                fill_id=str(order_data.get("_target_oid", order_data.get("oid", "")) or ""),
+            )
+        except Exception as notify_exc:
+            logger.error(f"Unable to send mirror failure notification: {notify_exc}")
+
+
+async def on_order_cancel(order_data: dict):
+    """Cancel the still-resting follower order for a target terminal cancel."""
+    target_oid = str(order_data.get("_target_oid", order_data.get("oid", "")) or "")
+    mirror = mirrored_orders.get(target_oid)
+    if not mirror or not mirror.get("active"):
+        return
+    if not settings.copy_rules.cancel_mirrored_orders:
+        return
+    try:
+        cancelled = await executor.cancel_order(mirror["symbol"], mirror["follower_oid"])
+        if cancelled:
+            mirror["active"] = False
+            logger.info(
+                f"Cancelled mirrored order after target cancellation: "
+                f"target_oid={target_oid} follower_oid={mirror['follower_oid']}"
+            )
+        elif any(token in str(getattr(executor, "last_error", "")).lower() for token in ("not found", "already filled", "does not exist", "order was filled")):
+            # The follower order may have filled before the target cancellation
+            # arrived. There is no resting order left to cancel, and the filled
+            # position must remain untouched.
+            mirror["active"] = False
+            logger.info(f"Follower mirror already filled/absent for target oid={target_oid}; no position reversal")
+        else:
+            await _notify_copy_failure(
+                symbol=mirror["symbol"], direction="cancel", target_size=0,
+                follower_size=mirror.get("size", 0), price=mirror.get("price", 0),
+                category="联动撤单失败",
+                reason=getattr(executor, "last_error", None) or "Follower cancel rejected",
+                fill_id=target_oid,
+            )
+    except Exception as exc:
+        await _notify_copy_failure(
+            symbol=mirror["symbol"], direction="cancel", target_size=0,
+            follower_size=mirror.get("size", 0), price=mirror.get("price", 0),
+            category="联动撤单异常", reason=str(exc), fill_id=target_oid,
+        )
+
+
+async def on_order_update(order_data: dict):
+    """Track target updates and replace a mirrored order when its price changes."""
+    target_oid = str(order_data.get("_target_oid", order_data.get("oid", "")) or "")
+    mirror = mirrored_orders.get(target_oid)
+    if mirror:
+        status = str(order_data.get("_order_status", "") or "").lower()
+        if status:
+            mirror["target_status"] = status
+        target_price = float(order_data.get("limitPx", order_data.get("px", 0)) or 0)
+        if (
+            settings.copy_rules.mirror_order_price
+            and
+            status in {"open", "resting"}
+            and target_price > 0
+            and abs(target_price - float(mirror.get("target_price", mirror.get("price", 0)))) > 1e-12
+            and not mirror.get("replacing")
+        ):
+            mirror["replacing"] = True
+            try:
+                if not settings.copy_rules.cancel_mirrored_orders:
+                    logger.warning(
+                        f"Target order {target_oid} changed price, but mirrored cancellation is disabled; "
+                        "keeping the original follower order"
+                    )
+                    return
+                cancelled = await executor.cancel_order(mirror["symbol"], mirror["follower_oid"])
+                if not cancelled:
+                    await _notify_copy_failure(
+                        symbol=mirror["symbol"], direction="replace", target_size=mirror.get("target_size", 0),
+                        follower_size=mirror.get("size", 0), price=target_price,
+                        category="改单撤旧失败",
+                        reason=getattr(executor, "last_error", None) or "Follower cancel rejected",
+                        fill_id=target_oid,
+                    )
+                    return
+                mirrored_orders.pop(target_oid, None)
+                await on_new_order(order_data)
+            finally:
+                replacement = mirrored_orders.get(target_oid)
+                if replacement:
+                    replacement["target_price"] = target_price
+                else:
+                    mirror["replacing"] = False
+            return
 
 
 async def _legacy_on_order_fill(fill_data: dict):
@@ -742,6 +931,57 @@ async def on_order_fill(fill_data: dict):
     ``fill_data['sz']`` and each exchange trade id is handled at most once.
     """
     global trades_copied_count
+
+    target_oid = str(fill_data.get("oid", "") or "")
+    mirror = mirrored_orders.get(target_oid)
+    if mirror:
+        # The follower already has a resting limit order for this target oid.
+        # Its own fill event changes the follower position; submitting a new
+        # market/limit order here would double the exposure.
+        target_fill_size = abs(float(fill_data.get("sz", 0) or 0))
+        mirror["target_filled_size"] = mirror.get("target_filled_size", 0.0) + target_fill_size
+        if settings.simulated_trading and target_fill_size > 0:
+            # A dry-run has no follower exchange stream, so project the
+            # proportional filled quantity into the local simulated account.
+            target_order_size = max(float(mirror.get("target_size", 0)), target_fill_size)
+            follower_fill_size = target_fill_size * float(mirror.get("size", 0)) / target_order_size
+            symbol = mirror["symbol"]
+            side = mirror.get("side", "long")
+            direction = str(fill_data.get("dir", ""))
+            position = simulated_positions.get(symbol)
+            is_close = mirror.get("reduce_only") or "Close" in direction or "Reduce" in direction
+            if is_close:
+                if position:
+                    remaining = max(0.0, abs(position["size"]) - follower_fill_size)
+                    if remaining <= 1e-12:
+                        simulated_positions.pop(symbol, None)
+                    else:
+                        position["size"] = remaining if position["size"] > 0 else -remaining
+            else:
+                price = float(fill_data.get("px", mirror.get("price", 0)) or mirror.get("price", 0))
+                if position is None:
+                    simulated_positions[symbol] = {
+                        "size": follower_fill_size if side == "long" else -follower_fill_size,
+                        "entry_price": price,
+                        "side": side,
+                        "leverage": mirror.get("leverage", 1),
+                        "value": follower_fill_size * price,
+                        "margin_used": follower_fill_size * price / max(float(mirror.get("leverage", 1)), 1),
+                    }
+                else:
+                    prior_size = abs(position["size"])
+                    total_size = prior_size + follower_fill_size
+                    position["entry_price"] = (
+                        prior_size * position["entry_price"] + follower_fill_size * price
+                    ) / total_size
+                    position["size"] = total_size if position["size"] > 0 else -total_size
+        trades_copied_count += 1
+        logger.info(
+            f"Target fill acknowledged for mirrored order {target_oid}; "
+            "no duplicate follower order will be submitted"
+        )
+        _remember_fill(_fill_id(fill_data))
+        return
 
     if is_paused:
         logger.warning("Bot is paused - skipping fill copy")
@@ -1627,6 +1867,8 @@ async def main():
         f"   Fill Polling Fallback: "
         f"{'enabled (' + str(settings.copy_rules.fill_poll_interval_seconds) + 's)' if settings.copy_rules.fill_polling_enabled else 'disabled'}"
     )
+    logger.info(f"   Pending Order Mirror: {settings.copy_rules.mirror_pending_orders}")
+    logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
     
     position_sizer = PositionSizer(
         mode=settings.sizing.mode,
@@ -1642,6 +1884,8 @@ async def main():
     monitor.on_position_close = None
     monitor.on_position_update = None
     monitor.on_new_order = on_new_order
+    monitor.on_order_update = on_order_update
+    monitor.on_order_cancel = on_order_cancel
     monitor.on_order_fill = on_order_fill
     
     # Copy existing positions if enabled
@@ -1765,53 +2009,6 @@ async def main():
         # Update global counter
         trades_copied_count += copied_count
     
-    # Copy existing orders if enabled
-    if settings.copy_rules.copy_existing_orders and state and state.orders:
-        logger.info("")
-        logger.info("=" * 60)
-        logger.success("📋 COPYING EXISTING ORDERS ON STARTUP")
-        logger.info("=" * 60)
-        
-        for i, order in enumerate(state.orders, 1):
-            try:
-                # Skip if price is None
-                if order.price is None or order.price <= 0:
-                    logger.warning(f"   ⚠️ Skipping order {order.symbol} - invalid price")
-                    continue
-                
-                # Calculate your order size
-                target_order_value = order.size * order.price
-                your_order_value = target_order_value * auto_ratio
-                your_size = your_order_value / order.price
-                your_leverage = 1.0  # Default leverage for orders
-                
-                logger.info("")
-                logger.info(f"📝 Copying Order {i}/{len(state.orders)}: {order.symbol}")
-                logger.info(f"   Target: {order.size:.4f} @ ${order.price:,.2f}")
-                logger.success(f"   → Your Size: {your_size:.4f} @ ${order.price:,.2f}")
-                
-                # Convert OrderSide to PositionSide
-                position_side = PositionSide.LONG if order.side == OrderSide.BUY else PositionSide.SHORT
-                
-                # Execute the order
-                result = await executor.execute_limit_order(
-                    symbol=order.symbol,
-                    side=order.side,
-                    size=your_size,
-                    price=order.price,
-                    leverage=your_leverage
-                )
-                
-                if result:
-                    logger.success(f"   ✅ Order copied successfully!")
-                else:
-                    logger.error(f"   ❌ Failed to copy order")
-                    
-            except Exception as e:
-                logger.error(f"   ❌ Error copying order {order.symbol}: {e}")
-        
-        logger.info("=" * 60)
-    
     # Initialize Telegram bot if configured
     if settings.telegram.bot_token and settings.telegram.chat_id:
         try:
@@ -1884,6 +2081,8 @@ async def main():
                 try:
                     order_dict = {
                         'coin': order.symbol,
+                        'oid': order.order_id,
+                        '_target_oid': order.order_id,
                         'side': order.side,
                         'orderType': order.order_type,
                         'sz': str(order.size),
@@ -1899,6 +2098,8 @@ async def main():
         logger.info("✅ Bot is now LIVE and monitoring for trades!")
         logger.info(f"   Copy Open Positions: {settings.copy_rules.copy_open_positions}")
         logger.info(f"   Copy Existing Orders: {settings.copy_rules.copy_existing_orders}")
+        logger.info(f"   Mirror Pending Orders: {settings.copy_rules.mirror_pending_orders}")
+        logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
         logger.info(f"   Auto Adjust Size: {settings.copy_rules.auto_adjust_size}")
         logger.info(f"   Max Open Trades: {'Unlimited' if settings.copy_rules.max_open_trades is None else settings.copy_rules.max_open_trades}")
         logger.info(f"   Max Open Orders: {'Unlimited' if settings.copy_rules.max_open_orders is None else settings.copy_rules.max_open_orders}")

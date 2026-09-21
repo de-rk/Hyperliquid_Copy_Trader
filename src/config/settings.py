@@ -35,6 +35,11 @@ class CopyRulesConfig(BaseModel):
     copy_existing_positions: bool = True
     copy_existing_orders: bool = True
     copy_open_positions: bool = True
+    # Mirror target resting orders immediately and cancel the follower order
+    # when the target order is cancelled/expired/rejected.
+    mirror_pending_orders: bool = True
+    cancel_mirrored_orders: bool = True
+    mirror_order_price: bool = True
     auto_adjust_size: bool = True
     use_limit_orders: bool = False  # Convert market orders to limit orders at fill price
     max_open_trades: Optional[int] = None  # None = unlimited
@@ -108,6 +113,13 @@ class Settings(BaseModel):
         
         copy_orders = os.getenv('COPY_EXISTING_ORDERS', 'true').lower()
         settings.copy_rules.copy_existing_orders = copy_orders in ('true', '1', 'yes')
+
+        mirror_pending = os.getenv('COPY_PENDING_ORDERS', 'true').lower()
+        settings.copy_rules.mirror_pending_orders = mirror_pending in ('true', '1', 'yes')
+        cancel_mirrored = os.getenv('CANCEL_MIRRORED_ORDERS', 'true').lower()
+        settings.copy_rules.cancel_mirrored_orders = cancel_mirrored in ('true', '1', 'yes')
+        mirror_price = os.getenv('MIRROR_ORDER_PRICE', 'true').lower()
+        settings.copy_rules.mirror_order_price = mirror_price in ('true', '1', 'yes')
         
         auto_adjust = os.getenv('AUTO_ADJUST_SIZE', 'true').lower()
         settings.copy_rules.auto_adjust_size = auto_adjust in ('true', '1', 'yes')

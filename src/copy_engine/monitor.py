@@ -30,6 +30,7 @@ class WalletMonitor:
         self.is_monitoring = False
         self.observed_fill_ids: set[str] = set()
         self.observed_order_ids: set[str] = set()
+        self.order_baseline_seeded = False
         self.fill_poll_task: Optional[asyncio.Task] = None
         # Hyperliquid can split one order into many fills. Keep fills for the
         # same order together briefly so the copier submits one meaningful
@@ -45,6 +46,7 @@ class WalletMonitor:
         self.on_position_update: Optional[Callable] = None
         self.on_position_close: Optional[Callable] = None
         self.on_new_order: Optional[Callable] = None
+        self.on_order_update: Optional[Callable] = None
         self.on_order_fill: Optional[Callable] = None
         self.on_order_cancel: Optional[Callable] = None
         
@@ -57,7 +59,12 @@ class WalletMonitor:
         if self.current_state:
             self.last_positions = self.current_state.positions.copy()
             self.last_orders = self.current_state.orders.copy()
-            self.observed_order_ids.update(order.order_id for order in self.last_orders)
+            # Seed the initial snapshot once. Subsequent refreshes must not add
+            # a newly-created target oid to the baseline before its websocket
+            # order event is delivered.
+            if not self.order_baseline_seeded:
+                self.observed_order_ids.update(order.order_id for order in self.last_orders)
+                self.order_baseline_seeded = True
 
         return self.current_state
     
@@ -159,9 +166,14 @@ class WalletMonitor:
                 await self._handle_positions(data["positions"])
             
             # Handle order updates
-            if "orders" in data:
-                logger.success(f"📋 ORDERS UPDATE: {len(data['orders'])} orders")
-                await self._handle_orders(data["orders"])
+            orders = data.get("orders", data.get("orderUpdates"))
+            if orders is None and isinstance(data, list):
+                orders = data
+            if isinstance(orders, dict):
+                orders = [orders]
+            if orders:
+                logger.success(f"📋 ORDERS UPDATE: {len(orders)} orders")
+                await self._handle_orders(orders)
                 
         except Exception as e:
             logger.error(f"Error handling update: {e}")
@@ -346,11 +358,30 @@ class WalletMonitor:
     async def _handle_orders(self, orders: List[dict]):
         """Handle order updates"""
         logger.info(f"📝 Order update received: {len(orders)} orders")
+
+        cancelled_statuses = {
+            "canceled", "cancelled", "expired", "rejected", "margincanceled",
+            "reduceonlycanceled", "liquidated",
+        }
         
         for order_data in orders:
             order = order_data.get("order", order_data)
             order_id = str(order.get("oid", order_data.get("oid", "")))
             symbol = order.get("coin", order_data.get("coin", ""))
+            if not order_id:
+                logger.warning(f"Ignoring target order update without oid: {order_data}")
+                continue
+
+            raw_status = order_data.get("status", order.get("status", ""))
+            status = (
+                str(raw_status or "").strip().lower()
+                .replace(" ", "").replace("-", "").replace("_", "")
+            )
+            callback_data = {
+                **order,
+                "_target_oid": order_id,
+                "_order_status": raw_status or None,
+            }
             
             # Check if new order
             existing = order_id and (
@@ -362,14 +393,35 @@ class WalletMonitor:
                 self.observed_order_ids.add(order_id)
                 logger.success(f"📋 NEW ORDER: {symbol} - ID: {order_id}")
                 
-                if self.on_new_order:
+                if self.on_new_order and status not in cancelled_statuses and status not in {"filled", "triggered"}:
                     try:
                         if asyncio.iscoroutinefunction(self.on_new_order):
-                            await self.on_new_order({**order, "_order_status": order_data.get("status")})
+                            await self.on_new_order({**callback_data, "_is_new_order": True})
                         else:
-                            self.on_new_order({**order, "_order_status": order_data.get("status")})
+                            self.on_new_order({**callback_data, "_is_new_order": True})
                     except Exception as e:
                         logger.error(f"Error in new order callback: {e}")
+
+            # Order updates carry partial fills and final statuses on the same
+            # oid. Keep them available to the mirror layer without treating a
+            # later update as a second new order.
+            if self.on_order_update and existing:
+                try:
+                    if asyncio.iscoroutinefunction(self.on_order_update):
+                        await self.on_order_update(callback_data)
+                    else:
+                        self.on_order_update(callback_data)
+                except Exception as e:
+                    logger.error(f"Error in order update callback: {e}")
+
+            if status in cancelled_statuses and self.on_order_cancel:
+                try:
+                    if asyncio.iscoroutinefunction(self.on_order_cancel):
+                        await self.on_order_cancel(callback_data)
+                    else:
+                        self.on_order_cancel(callback_data)
+                except Exception as e:
+                    logger.error(f"Error in order cancel callback: {e}")
         
         # Update state
         await self.get_current_state()
@@ -384,11 +436,15 @@ class WalletMonitor:
                 return
             
             data = update.data["data"]
-            logger.info(f"📦 Order update data keys: {list(data.keys())}")
-            
-            if "orders" in data:
-                logger.success(f"📋 ORDERS UPDATE: {len(data['orders'])} orders")
-                await self._handle_orders(data["orders"])
+            logger.info(
+                f"📦 Order update data keys: {list(data.keys()) if isinstance(data, dict) else 'list'}"
+            )
+            orders = data.get("orders", data.get("orderUpdates")) if isinstance(data, dict) else data
+            if isinstance(orders, dict):
+                orders = [orders]
+            if orders:
+                logger.success(f"📋 ORDERS UPDATE: {len(orders)} orders")
+                await self._handle_orders(orders)
                 
         except Exception as e:
             logger.error(f"Error handling order update: {e}")

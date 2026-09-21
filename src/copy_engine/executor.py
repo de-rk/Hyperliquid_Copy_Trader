@@ -408,7 +408,7 @@ class TradeExecutor:
                 "type": "cancel",
                 "cancels": [{
                     "a": asset_index,
-                    "o": order_id
+                    "o": int(order_id) if str(order_id).isdigit() else order_id,
                 }]
             }
 
@@ -421,14 +421,27 @@ class TradeExecutor:
                     headers={"Content-Type": "application/json"}
                 ) as response:
                     if response.status == 200:
-                        logger.success(f"✅ Cancelled order {order_id} for {symbol}")
-                        return True
+                        result = await response.json()
+                        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                        rejected = any(
+                            isinstance(status, dict) and "error" in status
+                            for status in statuses
+                        )
+                        if result.get("status") == "ok" and not rejected:
+                            self.last_error = None
+                            logger.success(f"✅ Cancelled order {order_id} for {symbol}")
+                            return True
+                        self.last_error = f"Hyperliquid rejected cancel: {result}"
+                        logger.error(self.last_error)
+                        return False
                     else:
                         error_text = await response.text()
+                        self.last_error = f"HTTP {response.status} cancelling order: {error_text}"
                         logger.error(f"Failed to cancel order: {error_text}")
                         return False
 
         except Exception as e:
+            self.last_error = f"Error cancelling order: {e}"
             logger.error(f"Error cancelling order: {e}")
             return False
 
