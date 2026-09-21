@@ -123,11 +123,12 @@ class NotificationService:
         category: str,
         reason: str,
         fill_id: str = "",
+        stage: str = "成交跟单",
     ) -> bool:
-        """Report a copy skip/rejection with enough context to diagnose it."""
+        """Report a mirror or fill-copy skip/rejection with diagnostic context."""
         notional = follower_size * price
         message = f"""
-⚠️ <b>跟单失败 / 已跳过</b>
+⚠️ <b>{stage}失败 / 已跳过</b>
 
 <b>币种：</b>{symbol}
 <b>方向：</b>{side.upper()}

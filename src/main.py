@@ -419,6 +419,7 @@ async def on_new_order(order_data: dict):
                 target_size=target_size, follower_size=0, price=price,
                 category="挂单数据无效", reason=f"Missing oid/symbol/size/price: {order_data}",
                 fill_id=target_oid,
+                stage="镜像交易",
             )
             return
         if not settings.copy_rules.mirror_order_price:
@@ -429,6 +430,7 @@ async def on_new_order(order_data: dict):
                     symbol=symbol, direction=position_side.value, target_size=target_size,
                     follower_size=0, price=price, category="镜像价格查询失败",
                     reason=str(exc), fill_id=target_oid,
+                    stage="镜像交易",
                 )
                 return
         if settings.copy_rules.max_open_orders is not None:
@@ -439,6 +441,7 @@ async def on_new_order(order_data: dict):
                     follower_size=0, price=price, category="达到最大挂单数",
                     reason=f"Mirrored open orders {active_mirrors} >= limit {settings.copy_rules.max_open_orders}",
                     fill_id=target_oid,
+                    stage="镜像交易",
                 )
                 return
 
@@ -476,6 +479,7 @@ async def on_new_order(order_data: dict):
                         follower_size=our_size, price=price, category="DEX账户查询失败",
                         reason=f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state",
                         fill_id=target_oid,
+                        stage="镜像交易",
                     )
                     return
                 available_margin = max(0.0, follower_dex_state.available_balance)
@@ -490,6 +494,7 @@ async def on_new_order(order_data: dict):
                 follower_size=our_size, price=price, category="低于最小订单金额",
                 reason=f"Mirrored order notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}",
                 fill_id=target_oid,
+                stage="镜像交易",
             )
             return
 
@@ -507,6 +512,7 @@ async def on_new_order(order_data: dict):
                 follower_size=our_size, price=price, category="镜像挂单失败",
                 reason=getattr(executor, "last_error", None) or "Executor returned no order id",
                 fill_id=target_oid,
+                stage="镜像交易",
             )
             return
 
@@ -539,6 +545,7 @@ async def on_new_order(order_data: dict):
                 category="镜像挂单异常",
                 reason=str(e),
                 fill_id=str(order_data.get("_target_oid", order_data.get("oid", "")) or ""),
+                stage="镜像交易",
             )
         except Exception as notify_exc:
             logger.error(f"Unable to send mirror failure notification: {notify_exc}")
@@ -573,12 +580,14 @@ async def on_order_cancel(order_data: dict):
                 category="联动撤单失败",
                 reason=getattr(executor, "last_error", None) or "Follower cancel rejected",
                 fill_id=target_oid,
+                stage="镜像交易",
             )
     except Exception as exc:
         await _notify_copy_failure(
             symbol=mirror["symbol"], direction="cancel", target_size=0,
             follower_size=mirror.get("size", 0), price=mirror.get("price", 0),
             category="联动撤单异常", reason=str(exc), fill_id=target_oid,
+            stage="镜像交易",
         )
 
 
@@ -615,6 +624,7 @@ async def on_order_update(order_data: dict):
                         category="改单撤旧失败",
                         reason=getattr(executor, "last_error", None) or "Follower cancel rejected",
                         fill_id=target_oid,
+                        stage="镜像交易",
                     )
                     return
                 mirrored_orders.pop(target_oid, None)
@@ -901,6 +911,7 @@ async def _notify_copy_failure(
     category: str,
     reason: str,
     fill_id: str = "",
+    stage: str = "成交跟单",
 ) -> None:
     """Send a best-effort Telegram diagnosis without masking the original failure."""
     logger.warning(
@@ -918,6 +929,7 @@ async def _notify_copy_failure(
                 category=category,
                 reason=reason,
                 fill_id=fill_id,
+                stage=stage,
             )
         except Exception as exc:
             logger.error(f"Unable to send copy failure notification: {exc}")
@@ -990,7 +1002,7 @@ async def on_order_fill(fill_data: dict):
                 symbol=str(fill_data.get("coin", "unknown")), side=str(fill_data.get("dir", "unknown")),
                 target_size=abs(float(fill_data.get("sz", 0) or 0)), follower_size=0,
                 price=float(fill_data.get("px", 0) or 0), category="机器人已暂停",
-                reason="Bot is paused", fill_id=_fill_id(fill_data)
+                reason="Bot is paused", fill_id=_fill_id(fill_data), stage="成交跟单"
             )
         return
 
