@@ -29,6 +29,7 @@ class WalletMonitor:
         self.last_orders: List[Order] = []
         self.is_monitoring = False
         self.observed_fill_ids: set[str] = set()
+        self.observed_order_ids: set[str] = set()
         self.fill_poll_task: Optional[asyncio.Task] = None
         # Hyperliquid can split one order into many fills. Keep fills for the
         # same order together briefly so the copier submits one meaningful
@@ -56,6 +57,7 @@ class WalletMonitor:
         if self.current_state:
             self.last_positions = self.current_state.positions.copy()
             self.last_orders = self.current_state.orders.copy()
+            self.observed_order_ids.update(order.order_id for order in self.last_orders)
 
         return self.current_state
     
@@ -346,21 +348,26 @@ class WalletMonitor:
         logger.info(f"📝 Order update received: {len(orders)} orders")
         
         for order_data in orders:
-            order_id = str(order_data.get("oid", ""))
-            symbol = order_data.get("coin", "")
+            order = order_data.get("order", order_data)
+            order_id = str(order.get("oid", order_data.get("oid", "")))
+            symbol = order.get("coin", order_data.get("coin", ""))
             
             # Check if new order
-            existing = next((o for o in self.last_orders if o.order_id == order_id), None)
+            existing = order_id and (
+                order_id in self.observed_order_ids
+                or next((o for o in self.last_orders if o.order_id == order_id), None)
+            )
             
             if not existing:
+                self.observed_order_ids.add(order_id)
                 logger.success(f"📋 NEW ORDER: {symbol} - ID: {order_id}")
                 
                 if self.on_new_order:
                     try:
                         if asyncio.iscoroutinefunction(self.on_new_order):
-                            await self.on_new_order(order_data)
+                            await self.on_new_order({**order, "_order_status": order_data.get("status")})
                         else:
-                            self.on_new_order(order_data)
+                            self.on_new_order({**order, "_order_status": order_data.get("status")})
                     except Exception as e:
                         logger.error(f"Error in new order callback: {e}")
         

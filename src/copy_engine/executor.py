@@ -31,6 +31,7 @@ class TradeExecutor:
         self._coin_index_cache: Dict[str, int] = {}
         self._coin_size_decimals: Dict[str, int] = {}
         self._metadata_loaded = False
+        self.last_error: Optional[str] = None
 
         # Initialize signing account if we have credentials
         self.account = None
@@ -200,16 +201,20 @@ class TradeExecutor:
                     if response.status == 200:
                         result = await response.json()
                         if result.get("status") == "ok" and not self._result_has_error(result):
+                            self.last_error = None
                             logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
                             return True
+                        self.last_error = f"Hyperliquid rejected leverage update: {result}"
                         logger.error(f"Hyperliquid rejected leverage update: {result}")
                         return False
                     else:
                         error_text = await response.text()
+                        self.last_error = f"HTTP {response.status} updating leverage: {error_text}"
                         logger.error(f"Failed to update leverage: {error_text}")
                         return False
 
         except Exception as e:
+            self.last_error = f"Error updating leverage: {e}"
             logger.error(f"Error updating leverage: {e}")
             return False
 
@@ -267,19 +272,23 @@ class TradeExecutor:
                         result = await response.json()
                         order_id = self._extract_order_id(result)
                         if result.get("status") == "ok" and not self._result_has_error(result):
+                            self.last_error = None
                             logger.success(
                                 f"✅ Market {side.value} order accepted: {symbol} "
                                 f"size={size} leverage={leverage}x"
                             )
                             return order_id or "accepted"
+                        self.last_error = f"Hyperliquid rejected market order: {result}"
                         logger.error(f"Hyperliquid rejected market order: {result}")
                         return None
                     else:
                         error_text = await response.text()
+                        self.last_error = f"HTTP {response.status} executing market order: {error_text}"
                         logger.error(f"Failed to execute market order: {error_text}")
                         return None
 
         except Exception as e:
+            self.last_error = f"Error executing market order: {e}"
             logger.error(f"Error executing market order: {e}")
             return None
 
@@ -339,19 +348,23 @@ class TradeExecutor:
                         result = await response.json()
                         order_id = self._extract_order_id(result)
                         if result.get("status") == "ok" and not self._result_has_error(result):
+                            self.last_error = None
                             logger.success(
                                 f"✅ Limit {side.value} order accepted: {symbol} "
                                 f"size={size} price={price} leverage={leverage}x"
                             )
                             return order_id or "accepted"
+                        self.last_error = f"Hyperliquid rejected limit order: {result}"
                         logger.error(f"Hyperliquid rejected limit order: {result}")
                         return None
                     else:
                         error_text = await response.text()
+                        self.last_error = f"HTTP {response.status} placing limit order: {error_text}"
                         logger.error(f"Failed to place limit order: {error_text}")
                         return None
 
         except Exception as e:
+            self.last_error = f"Error placing limit order: {e}"
             logger.error(f"Error placing limit order: {e}")
             return None
 

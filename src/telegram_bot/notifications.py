@@ -85,6 +85,62 @@ class NotificationService:
                 f"{side.upper()} size={size:.8f}"
             )
         return sent
+
+    async def send_order_detected_notification(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        entry_price: float,
+        leverage: float,
+        target_size: float,
+        status: str = "PENDING",
+    ) -> bool:
+        """Notify about a target order before it is necessarily filled."""
+        message = f"""
+🧪 <b>New Trade Detected!</b> [{status}]
+
+<b>Symbol:</b> {symbol}
+<b>Side:</b> {side.upper()}
+<b>Your Size:</b> {size:.4f}
+<b>Entry:</b> ${entry_price:,.2f}
+<b>Leverage:</b> {leverage:g}x
+<b>Notional:</b> ${size * entry_price:,.2f}
+
+━━━━━━━━━━━━━━━━━━
+<b>Target Size:</b> {target_size:.4f}
+<b>Time:</b> {_now_shanghai().strftime('%H:%M:%S UTC+8')}
+"""
+        return await self.send_message(message.strip())
+
+    async def send_copy_failure_notification(
+        self,
+        symbol: str,
+        side: str,
+        target_size: float,
+        follower_size: float,
+        price: float,
+        category: str,
+        reason: str,
+        fill_id: str = "",
+    ) -> bool:
+        """Report a copy skip/rejection with enough context to diagnose it."""
+        notional = follower_size * price
+        message = f"""
+⚠️ <b>跟单失败 / 已跳过</b>
+
+<b>币种：</b>{symbol}
+<b>方向：</b>{side.upper()}
+<b>目标数量：</b>{target_size:.6f}
+<b>预计跟随数量：</b>{follower_size:.6f}
+<b>预计名义价值：</b>${notional:,.2f}
+<b>分类：</b>{category}
+<b>原因：</b><code>{reason[:900]}</code>
+{f'<b>Fill ID：</b><code>{fill_id}</code>' if fill_id else ''}
+
+<b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
+"""
+        return await self.send_message(message.strip())
     
     async def send_position_close_notification(
         self,

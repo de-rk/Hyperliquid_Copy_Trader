@@ -290,14 +290,28 @@ async def on_new_position(position_data: dict):
         else:
             logger.error("❌ Trade execution failed")
             if notifier:
-                await notifier.send_error_notification(f"Failed to execute trade for {symbol}")
+                await _notify_copy_failure(
+                    symbol=symbol,
+                    direction=side.value,
+                    target_size=abs(size),
+                    follower_size=your_size,
+                    price=entry_price,
+                    category="交易所拒绝或执行器失败",
+                    reason=getattr(executor, "last_error", None) or "Executor returned no order id",
+                )
         
         logger.success("=" * 60)
         
     except Exception as e:
         logger.error(f"Error copying position: {e}")
         if notifier:
-            await notifier.send_error_notification(f"Error copying position: {str(e)}")
+            await _notify_copy_failure(
+                symbol=str(position_data.get("coin", "unknown")),
+                direction="position",
+                target_size=abs(float(position_data.get("szi", 0) or 0)),
+                category="程序异常",
+                reason=str(e),
+            )
 
 
 async def on_position_close(position_data: dict):
@@ -374,96 +388,55 @@ async def on_position_update(position_data: dict):
 
 
 async def on_new_order(order_data: dict):
+    """Notify immediately when a target order is created.
+
+    This callback intentionally never places an order. The fill callback is
+    the single execution path, preventing a pending target order plus its
+    eventual fill from creating duplicate follower exposure.
     """
-    Called when target wallet places a new order
-    Copy limit orders and stop losses
-    """
-    global trades_copied_count, is_paused, simulated_balance
-    
-    # Check if paused
-    if is_paused:
-        logger.warning("⏸️ Bot is paused - skipping order copy")
-        return
-    
-    # ``COPY_EXISTING_ORDERS`` only controls the startup snapshot below.
-    # This callback is fed by WebSocket events and must remain active so a
-    # newly-created target order can be copied even when startup copying is off.
-    
-    # Check max open orders limit
-    if settings.copy_rules.max_open_orders is not None:
-        current_orders = len(monitor.current_state.orders) if monitor.current_state else 0
-        if current_orders >= settings.copy_rules.max_open_orders:
-            logger.warning(f"⚠️ Max open orders limit reached ({current_orders}/{settings.copy_rules.max_open_orders}) - skipping order")
-            return
-    
     try:
         symbol = order_data.get('coin', '')
         side = order_data.get('side', '')
-        order_type = order_data.get('orderType', 'limit')
-        target_size = abs(float(order_data.get('sz', 0)))
-        price = float(order_data.get('limitPx', 0))
-        
-        logger.info("")
-        logger.info(f"{'='*50}")
-        logger.info(f"📋 NEW ORDER DETECTED!")
-        logger.info(f"{'='*50}")
-        logger.info(f"Symbol: {symbol}")
-        logger.info(f"Side: {side}")
-        logger.info(f"Type: {order_type}")
-        logger.info(f"Target Size: {target_size}")
-        logger.info(f"Price: ${price:,.2f}")
-        
-        # Calculate our order size from the current follower/target balance
-        # ratio. This path previously called PositionSizer with an invalid
-        # signature and could not copy limit orders.
+        target_size = abs(float(order_data.get('sz', order_data.get('origSz', 0))))
+        price = float(order_data.get('limitPx', order_data.get('px', 0)) or 0)
+        side_code = side.value if isinstance(side, OrderSide) else str(side).lower()
+        is_buy = side_code in ('b', 'buy')
+        position_side = PositionSide.LONG if is_buy else PositionSide.SHORT
+
+        target_position = _target_position(symbol)
+        target_leverage = target_position.leverage if target_position else 1.0
         if settings.copy_rules.auto_adjust_size:
             follower_balance = await get_follower_balance()
             target_balance = monitor.current_state.balance if monitor.current_state else 0
-            if follower_balance is None or target_balance <= 0:
-                return
-            our_size = target_size * (follower_balance / target_balance)
+            ratio = (
+                follower_balance / target_balance
+                if follower_balance is not None and target_balance > 0
+                else settings.sizing.portfolio_ratio
+            )
+            our_size = target_size * ratio
         else:
             our_size = target_size
-        
-        logger.info("")
-        logger.info(f"📊 Order Sizing:")
-        logger.info(f"   Our Size: {our_size:.4f}")
-        
-        # Execute the order
-        result = await executor.execute_limit_order(
-            symbol=symbol,
-            side=OrderSide.BUY if side == 'B' else OrderSide.SELL,
-            size=our_size,
-            price=price
+
+        # This notification is deliberately sent before any pause, risk-limit,
+        # or exchange validation. It reports detection, not execution.
+        if notifier and not order_data.get('_startup_snapshot'):
+            await notifier.send_order_detected_notification(
+                symbol=symbol,
+                side=position_side.value,
+                size=our_size,
+                entry_price=price,
+                leverage=target_leverage,
+                target_size=target_size,
+                status=str(order_data.get('_order_status') or 'PENDING').upper(),
+            )
+
+        logger.info(
+            f"New target order notified (no order placed): {symbol} "
+            f"{position_side.value} target_size={target_size:.8f} "
+            f"estimated_size={our_size:.8f} price=${price:,.4f}"
         )
-        
-        if result:
-            logger.success(f"✅ Order copied successfully!")
-            trades_copied_count += 1
-            
-            # Log simulated order
-            if settings.simulated_trading:
-                order_value = our_size * price
-                logger.success("")
-                logger.success(f"📋 SIMULATED ORDER PLACED!")
-                logger.success(f"   Order Value: ${order_value:,.2f}")
-                logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
-            
-            # Send notification
-            if notifier:
-                await notifier.send_trade_notification(
-                    symbol=symbol,
-                    side=OrderSide.BUY.value if side == 'B' else OrderSide.SELL.value,
-                    size=our_size,
-                    entry_price=price,
-                    leverage=1.0,  # Orders don't have leverage until filled
-                    target_size=target_size
-                )
-        else:
-            logger.error(f"❌ Failed to copy order")
-            
     except Exception as e:
-        logger.error(f"Error copying order: {e}")
+        logger.error(f"Error notifying new target order: {e}")
 
 
 async def _legacy_on_order_fill(fill_data: dict):
@@ -729,6 +702,38 @@ def _target_position(symbol: str):
     return next((position for position in monitor.current_state.positions if position.symbol == symbol), None)
 
 
+async def _notify_copy_failure(
+    *,
+    symbol: str,
+    direction: str,
+    target_size: float,
+    follower_size: float = 0.0,
+    price: float = 0.0,
+    category: str,
+    reason: str,
+    fill_id: str = "",
+) -> None:
+    """Send a best-effort Telegram diagnosis without masking the original failure."""
+    logger.warning(
+        f"Copy failure [{category}] {symbol} {direction}: {reason} "
+        f"target={target_size:.8f} follower={follower_size:.8f}"
+    )
+    if notifier:
+        try:
+            await notifier.send_copy_failure_notification(
+                symbol=symbol,
+                side=direction or "unknown",
+                target_size=target_size,
+                follower_size=follower_size,
+                price=price,
+                category=category,
+                reason=reason,
+                fill_id=fill_id,
+            )
+        except Exception as exc:
+            logger.error(f"Unable to send copy failure notification: {exc}")
+
+
 async def on_order_fill(fill_data: dict):
     """Copy one target fill using its actual filled quantity.
 
@@ -740,6 +745,13 @@ async def on_order_fill(fill_data: dict):
 
     if is_paused:
         logger.warning("Bot is paused - skipping fill copy")
+        if notifier:
+            await notifier.send_copy_failure_notification(
+                symbol=str(fill_data.get("coin", "unknown")), side=str(fill_data.get("dir", "unknown")),
+                target_size=abs(float(fill_data.get("sz", 0) or 0)), follower_size=0,
+                price=float(fill_data.get("px", 0) or 0), category="机器人已暂停",
+                reason="Bot is paused", fill_id=_fill_id(fill_data)
+            )
         return
 
     try:
@@ -779,6 +791,9 @@ async def on_order_fill(fill_data: dict):
             follower_state = await client.get_user_state(settings.hyperliquid.wallet_address)
             if follower_state is None:
                 logger.error("Unable to read follower wallet state; skipping fill")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           price=price, category="账户查询失败", reason="Unable to read follower wallet state",
+                                           fill_id=fill_id)
                 return
             follower_balance = follower_state.balance
             follower_dex_state = await client.get_user_state(
@@ -787,6 +802,10 @@ async def on_order_fill(fill_data: dict):
             )
             if follower_dex_state is None:
                 logger.error(f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state; skipping fill")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           price=price, category="DEX账户查询失败",
+                                           reason=f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state",
+                                           fill_id=fill_id)
                 return
 
         target_position = _target_position(symbol)
@@ -814,6 +833,10 @@ async def on_order_fill(fill_data: dict):
 
             if follower_size <= 0 or follower_side != position_side.value:
                 logger.info(f"No matching follower {position_side.value} position for {symbol}; skipping reduce-only fill")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           price=price, category="没有匹配的跟随仓位",
+                                           reason=f"Follower position is absent or side is {follower_side}; reduce-only close skipped",
+                                           fill_id=fill_id)
                 return
 
             target_remaining_size = float(
@@ -837,6 +860,9 @@ async def on_order_fill(fill_data: dict):
             )
             if our_size <= 0:
                 logger.warning(f"Cannot calculate proportional close size for {symbol}; skipping safely")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           follower_size=follower_size, price=price, category="比例计算失败",
+                                           reason="Calculated proportional close size is zero", fill_id=fill_id)
                 return
             logger.info(
                 f"Proportional close for {symbol}: target closed {close_ratio:.2%}; "
@@ -848,6 +874,10 @@ async def on_order_fill(fill_data: dict):
             # a residual position indefinitely.
             if our_size * price < MIN_POSITION_SIZE_USD and not target_fully_closed:
                 logger.info(f"Reduce-only residual for {symbol} is below ${MIN_POSITION_SIZE_USD:.2f}; leaving it open")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           follower_size=our_size, price=price, category="低于最小订单金额",
+                                           reason=f"Reduce-only notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}; waiting for more fills",
+                                           fill_id=fill_id)
                 return
 
             order_side = OrderSide.SELL if position_side == PositionSide.LONG else OrderSide.BUY
@@ -863,6 +893,9 @@ async def on_order_fill(fill_data: dict):
             if settings.copy_rules.auto_adjust_size:
                 if target_balance <= 0:
                     logger.error("Target balance is unavailable; skipping fill")
+                    await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                               price=price, category="目标账户余额无效", reason="Target balance is zero or unavailable",
+                                               fill_id=fill_id)
                     return
                 our_size = target_size * (follower_balance / target_balance)
             else:
@@ -870,6 +903,9 @@ async def on_order_fill(fill_data: dict):
 
             if our_size <= 0:
                 logger.warning("Skipping fill because calculated size is zero")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           price=price, category="跟单数量为零", reason="Calculated follower size is zero",
+                                           fill_id=fill_id)
                 return
 
             target_leverage = target_position.leverage if target_position else 1.0
@@ -900,6 +936,9 @@ async def on_order_fill(fill_data: dict):
                         f"Skipping {symbol}: {dex_name} Perp DEX available margin is $0.00. "
                         f"Fund the {dex_name} DEX before copying this asset."
                     )
+                    await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                               follower_size=our_size, price=price, category="保证金不足",
+                                               reason=f"{dex_name} available margin is ${available_margin:.2f}", fill_id=fill_id)
                     return
 
             if (
@@ -908,6 +947,9 @@ async def on_order_fill(fill_data: dict):
                 and open_positions >= settings.copy_rules.max_open_trades
             ):
                 logger.warning(f"Max open trades limit reached ({open_positions}/{settings.copy_rules.max_open_trades}); skipping {symbol}")
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           follower_size=our_size, price=price, category="达到最大持仓数",
+                                           reason=f"Open positions {open_positions} >= limit {settings.copy_rules.max_open_trades}", fill_id=fill_id)
                 return
 
             max_size_from_margin = (
@@ -926,6 +968,10 @@ async def on_order_fill(fill_data: dict):
                     f"Skipping {symbol}: copied fill value ${our_size * price:.2f} is below "
                     f"${MIN_POSITION_SIZE_USD:.2f} after margin/MAX_POSITION_SIZE limits"
                 )
+                await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                           follower_size=our_size, price=price, category="低于最小订单金额",
+                                           reason=f"Follower notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f} after risk limits",
+                                           fill_id=fill_id)
                 return
 
             order_side = OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL
@@ -946,11 +992,15 @@ async def on_order_fill(fill_data: dict):
                 )
 
         if not result:
+            executor_reason = getattr(executor, "last_error", None) or "Executor returned no order id"
             logger.error(
                 f"Failed to copy fill {fill_id}: executor returned no order id; "
                 f"symbol={symbol} direction={direction} size={our_size:.8f} "
                 f"notional=${our_size * price:.2f} simulated={settings.simulated_trading}"
             )
+            await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
+                                       follower_size=our_size, price=price, category="交易所拒绝或执行器失败",
+                                       reason=executor_reason, fill_id=fill_id)
             return
 
         _remember_fill(fill_id)
@@ -996,6 +1046,13 @@ async def on_order_fill(fill_data: dict):
                 )
     except Exception as exc:
         logger.exception(f"Error copying fill: {exc}")
+        await _notify_copy_failure(
+            symbol=str(fill_data.get("coin", "unknown")),
+            direction=str(fill_data.get("dir", "unknown")),
+            target_size=abs(float(fill_data.get("sz", 0) or 0)),
+            price=float(fill_data.get("px", 0) or 0),
+            category="程序异常", reason=str(exc), fill_id=_fill_id(fill_data)
+        )
 
 
 # Telegram bot callback functions
@@ -1584,7 +1641,7 @@ async def main():
     monitor.on_new_position = None
     monitor.on_position_close = None
     monitor.on_position_update = None
-    monitor.on_new_order = None
+    monitor.on_new_order = on_new_order
     monitor.on_order_fill = on_order_fill
     
     # Copy existing positions if enabled
@@ -1830,7 +1887,8 @@ async def main():
                         'side': order.side,
                         'orderType': order.order_type,
                         'sz': str(order.size),
-                        'limitPx': str(order.price)
+                        'limitPx': str(order.price),
+                        '_startup_snapshot': True,
                     }
                     await on_new_order(order_dict)
                 except Exception as e:
