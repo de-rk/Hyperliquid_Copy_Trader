@@ -447,6 +447,13 @@ async def on_new_order(order_data: dict):
 
         target_position = _target_position(symbol)
         target_leverage = target_position.leverage if target_position else 1.0
+        # Match fill/error notifications: describe the position action, not
+        # the raw execution side (BUY/SELL).
+        notification_side = (
+            f"CLOSE {target_position.side.value.upper()}"
+            if reduce_only and target_position
+            else f"OPEN {position_side.value.upper()}"
+        )
         if settings.copy_rules.auto_adjust_size:
             follower_balance = await get_follower_balance()
             target_balance = monitor.current_state.balance if monitor.current_state else 0
@@ -529,9 +536,9 @@ async def on_new_order(order_data: dict):
         )
         if notifier and not order_data.get('_startup_snapshot'):
             await notifier.send_order_detected_notification(
-                symbol=symbol, side=position_side.value, size=our_size,
+                symbol=symbol, side=notification_side, size=our_size,
                 entry_price=price, leverage=leverage, target_size=target_size,
-                status="MIRRORED",
+                status="已镜像", target_leverage=target_leverage,
             )
     except Exception as e:
         logger.error(f"Error notifying new target order: {e}")

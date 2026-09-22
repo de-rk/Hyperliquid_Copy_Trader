@@ -12,3 +12,4 @@ services:
       - ./.env:/app/.env
     environment:
       - TZ=Asia/Shanghai
+      - FILL_POLLING_ENABLED=false

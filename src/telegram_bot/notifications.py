@@ -59,7 +59,9 @@ class NotificationService:
         target_size: float,
         is_simulated: bool = True
     ):
-        """Send notification about a copied trade"""
+        """Legacy trade notification; disabled to avoid misleading close-side labels."""
+        logger.debug("Trade notifications disabled")
+        return False
         
         mode_emoji = "🧪" if is_simulated else "✅"
         mode_text = "[模拟]" if is_simulated else "[实盘]"
@@ -95,21 +97,27 @@ class NotificationService:
         leverage: float,
         target_size: float,
         status: str = "PENDING",
+        target_leverage: float | None = None,
     ) -> bool:
-        """Notify about a target order before it is necessarily filled."""
+        """Notify about a mirrored target order before it is filled."""
+        leverage_text = f"{leverage:g}x"
+        target_leverage_text = (
+            f"{target_leverage:g}x" if target_leverage is not None else leverage_text
+        )
         message = f"""
-🧪 <b>New Trade Detected!</b> [{status}]
+🧪 <b>检测到新镜像订单</b> [{status}]
 
-<b>Symbol:</b> {symbol}
-<b>Side:</b> {side.upper()}
-<b>Your Size:</b> {size:.4f}
-<b>Entry:</b> ${entry_price:,.2f}
-<b>Leverage:</b> {leverage:g}x
-<b>Notional:</b> ${size * entry_price:,.2f}
+<b>币种：</b>{symbol}
+<b>方向：</b>{side.upper()}
+<b>跟随数量：</b>{size:.4f}
+<b>挂单价格：</b>${entry_price:,.2f}
+<b>目标杠杆：</b>{target_leverage_text}
+<b>跟随杠杆：</b>{leverage_text}
+<b>名义价值：</b>${size * entry_price:,.2f}
 
 ━━━━━━━━━━━━━━━━━━
-<b>Target Size:</b> {target_size:.4f}
-<b>Time:</b> {_now_shanghai().strftime('%H:%M:%S UTC+8')}
+<b>目标数量：</b>{target_size:.4f}
+<b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
 """
         return await self.send_message(message.strip())
 
