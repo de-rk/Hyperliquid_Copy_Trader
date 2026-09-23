@@ -77,6 +77,11 @@ class HyperliquidClient:
                 dexes = [dex]
             # merge all dex responses to get complete user state across all dexs
             all_responses = None
+            margin_totals = {
+                "accountValue": 0.0,
+                "totalMarginUsed": 0.0,
+                "totalNtlPos": 0.0,
+            }
             for current_dex in dexes:
                 data = {
                     "type": "clearinghouseState",
@@ -86,7 +91,7 @@ class HyperliquidClient:
                 
                 response = await self._post(self.info_url, data)
                 
-                if not response:
+                if not isinstance(response, dict):
                     continue
                 if all_responses is None:
                     all_responses = response
@@ -102,13 +107,11 @@ class HyperliquidClient:
                         if "openOrders" not in all_responses:
                             all_responses["openOrders"] = []
                         all_responses["openOrders"].extend(response["openOrders"])
-                    
-                    # Update margin summary (balance, margin used, unrealized pnl)
-                    if "marginSummary" in response:
-                        if "marginSummary" not in all_responses:
-                            all_responses["marginSummary"] = response["marginSummary"]
-                        for key in ["accountValue", "totalMarginUsed", "totalNtlPos"]:
-                            all_responses["marginSummary"][key] = float(all_responses["marginSummary"].get(key, 0)) + float(response["marginSummary"].get(key, 0))
+
+                # Sum each DEX exactly once, including responses without positions.
+                summary = response.get("marginSummary", {})
+                for key in margin_totals:
+                    margin_totals[key] += float(summary.get(key, 0) or 0)
                                 
             
             # Parse positions
@@ -151,9 +154,8 @@ class HyperliquidClient:
             
             # Parse account balance. A wallet with no perp state is still a
             # valid account; return a zeroed state instead of raising here.
-            summary = (all_responses or {}).get("marginSummary", {})
-            balance = float(summary.get("accountValue", 0))
-            margin_used = float(summary.get("totalMarginUsed", 0))
+            balance = margin_totals["accountValue"]
+            margin_used = margin_totals["totalMarginUsed"]
             # ``totalNtlPos`` is total position notional, not PnL. Sum the
             # exchange-provided PnL from each open position instead.
             unrealized_pnl = sum(position.unrealized_pnl for position in positions)
@@ -391,7 +393,7 @@ class HyperliquidClient:
             return []
 
     async def get_spot_balances(self, address: str) -> List[Dict[str, Any]]:
-        """Return Spot balances for diagnostics and funding guidance."""
+        """Return Spot balances for diagnostics, sizing, and funding guidance."""
         try:
             response = await self._post(
                 self.info_url,
@@ -401,6 +403,29 @@ class HyperliquidClient:
         except Exception as e:
             logger.error(f"Failed to get Spot balances for {address}: {e}")
             return []
+
+    async def get_wallet_total_equity(self, address: str) -> Optional[float]:
+        """Return aggregate Perps equity plus Spot USDC collateral."""
+        state = await self.get_user_state(address)
+        if state is None:
+            return None
+        try:
+            response = await self._post(
+                self.info_url,
+                {"type": "spotClearinghouseState", "user": address},
+            )
+        except Exception:
+            logger.exception(f"Unable to read Spot collateral for {address}; sizing must not fall back to Perps-only equity")
+            return None
+        if not isinstance(response, dict) or not isinstance(response.get("balances"), list):
+            logger.error(f"Spot collateral response is invalid for {address}; refusing Perps-only sizing")
+            return None
+        spot_usdc = sum(
+            float(item.get("total", 0) or 0)
+            for item in response["balances"]
+            if str(item.get("coin", "")).upper() == "USDC"
+        )
+        return state.balance + spot_usdc
     
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""

@@ -194,9 +194,8 @@ class WalletMonitor:
             self.observed_fill_ids.add(fill_id)
             new_fills.append(fill)
 
-        # Polling can return several fills from one reduce order. Process them
-        # chronologically and annotate each with its own post-fill target size,
-        # rather than using the final position size for every partial fill.
+        # Capture the pre-close size so the copier can scale its reduction by
+        # the same fraction, even when several fills arrive in one batch.
         new_fills.sort(key=lambda fill: int(fill.get("time", 0)))
         pending_close_sizes = {}
         for fill in new_fills:
@@ -210,6 +209,14 @@ class WalletMonitor:
         final_position_sizes = {
             position.symbol.upper(): position.size for position in self.current_state.positions
         } if self.current_state else {}
+        target_pre_close_sizes = {
+            symbol: remaining_size + pending_close_sizes.get(symbol, 0.0)
+            for symbol, remaining_size in final_position_sizes.items()
+        }
+        for symbol, pending_size in pending_close_sizes.items():
+            target_pre_close_sizes[symbol] = (
+                final_position_sizes.get(symbol, 0.0) + pending_size
+            )
 
         for fill in new_fills:
             # Extract symbol from fill data
@@ -217,11 +224,7 @@ class WalletMonitor:
             direction = str(fill.get("dir", ""))
             if "Close" in direction or "Reduce" in direction:
                 fill_size = abs(float(fill.get("sz", 0)))
-                pending_size = pending_close_sizes.get(symbol, 0.0)
-                fill["_target_remaining_size_after_fill"] = (
-                    final_position_sizes.get(symbol, 0.0) + max(0.0, pending_size - fill_size)
-                )
-                pending_close_sizes[symbol] = max(0.0, pending_size - fill_size)
+                fill["_target_pre_close_size"] = target_pre_close_sizes.get(symbol, 0.0)
             
             # Check if asset is blocked
             from config.settings import settings
