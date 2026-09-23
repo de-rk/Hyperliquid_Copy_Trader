@@ -68,7 +68,7 @@ async def get_follower_balance() -> float | None:
     if not settings.hyperliquid.wallet_address:
         logger.error("Live sizing requires HYPERLIQUID_WALLET_ADDRESS")
         return None
-    return await client.get_wallet_total_equity(settings.hyperliquid.wallet_address)
+    return await client.get_portfolio_account_value(settings.hyperliquid.wallet_address)
 
 
 def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
@@ -213,7 +213,7 @@ async def on_new_position(position_data: dict):
         # Get target wallet balance
         target_state = monitor.current_state
         target_balance = (
-            await client.get_wallet_total_equity(settings.target_wallet)
+            await client.get_portfolio_account_value(settings.target_wallet)
             if target_state else 100000
         )
         if target_balance is None or target_balance <= 0:
@@ -449,12 +449,12 @@ async def on_new_order(order_data: dict):
         )
         if settings.copy_rules.auto_adjust_size and not reduce_only:
             follower_balance = await get_follower_balance()
-            target_balance = await client.get_wallet_total_equity(settings.target_wallet)
+            target_balance = await client.get_portfolio_account_value(settings.target_wallet)
             if follower_balance is None or target_balance is None or target_balance <= 0:
                 await _notify_copy_failure(
                     symbol=symbol, direction=notification_side, target_size=target_size,
                     follower_size=0, price=price, category="钱包总资金查询失败",
-                    reason="Unable to read Spot USDC and Perps equity for proportional sizing",
+                    reason="Unable to read portfolio account value for proportional sizing",
                     fill_id=target_oid, stage="镜像交易",
                 )
                 return
@@ -752,7 +752,7 @@ async def _legacy_on_order_fill(fill_data: dict):
         # simulated balance used by the dry-run account tracker.
         follower_balance = simulated_balance
         if not settings.simulated_trading:
-            follower_total_equity = await client.get_wallet_total_equity(
+            follower_total_equity = await client.get_portfolio_account_value(
                 settings.hyperliquid.wallet_address
             )
             if follower_total_equity is None:
@@ -763,7 +763,7 @@ async def _legacy_on_order_fill(fill_data: dict):
         our_size = position_sizer.calculate_size(
             target_position=target_position,
             target_wallet_balance=(
-                await client.get_wallet_total_equity(settings.target_wallet)
+                await client.get_portfolio_account_value(settings.target_wallet)
                 if monitor.current_state else 1000000
             ),
             your_wallet_balance=follower_balance
@@ -1053,7 +1053,7 @@ async def on_order_fill(fill_data: dict):
                                            price=price, category="账户查询失败", reason="Unable to read follower wallet state",
                                            fill_id=fill_id)
                 return
-            follower_balance = await client.get_wallet_total_equity(
+            follower_balance = await client.get_portfolio_account_value(
                 settings.hyperliquid.wallet_address
             )
             if follower_balance is None:
@@ -1150,7 +1150,7 @@ async def on_order_fill(fill_data: dict):
                 reduce_only=True,
             )
         else:
-            target_balance = await client.get_wallet_total_equity(settings.target_wallet)
+            target_balance = await client.get_portfolio_account_value(settings.target_wallet)
             if settings.copy_rules.auto_adjust_size:
                 if target_balance is None or target_balance <= 0:
                     logger.error("Target balance is unavailable; skipping fill")
@@ -1453,16 +1453,12 @@ async def get_pnl() -> str:
     target_line = _wallet_label(settings.target_wallet)
     follower_line = _wallet_label(settings.hyperliquid.wallet_address) if not settings.simulated_trading else "模拟账户"
     target_equity = (
-        await client.get_wallet_total_equity(settings.target_wallet)
+        await client.get_portfolio_account_value(settings.target_wallet)
         if client and target_state else None
     )
-    target_spot_usdc = (
-        max(0.0, target_equity - target_state.balance)
-        if target_equity is not None and target_state else 0.0
-    )
     target_summary = (
-        f"总资金：${target_equity:,.2f}（合约 ${target_state.balance:,.2f} + "
-        f"现货 USDC ${target_spot_usdc:,.2f}）｜未实现盈亏：${target_state.unrealized_pnl:,.2f}"
+        f"账户总金额：${target_equity:,.2f}｜Perps 持仓数：{len(target_state.positions)}｜"
+        f"未实现盈亏：${target_state.unrealized_pnl:,.2f}"
         if target_equity is not None and target_state else "当前状态暂无数据"
     )
     history_note = "模拟模式不提供跟随账户链上历史" if settings.simulated_trading else "按账户净值计算，充值/提现会影响结果"
@@ -1558,11 +1554,18 @@ async def get_wallet_report(address: str, fill_limit: int = 10) -> str:
         return "❌ Hyperliquid 客户端尚未初始化。"
 
     state = await client.get_user_state(address)
+    total_equity = await client.get_portfolio_account_value(address)
     performance = await client.get_portfolio_performance(address)
     fills = await client.get_user_fills(address, fill_limit)
-    if state:
+    if state and total_equity is not None:
         account_summary = (
-            f"• 账户价值：${state.balance:,.2f}\n"
+            f"• 账户总金额：${total_equity:,.2f}\n"
+            f"• 未实现盈亏：${state.unrealized_pnl:,.2f}\n"
+            f"• 当前持仓：{len(state.positions)}｜挂单：{len(state.orders)}"
+        )
+    elif state:
+        account_summary = (
+            "• 账户总金额暂不可用（portfolio 数据缺失）\n"
             f"• 未实现盈亏：${state.unrealized_pnl:,.2f}\n"
             f"• 当前持仓：{len(state.positions)}｜挂单：{len(state.orders)}"
         )
@@ -1738,20 +1741,13 @@ async def main():
     state = await monitor.get_current_state()
     
     if state:
-        target_balance = await client.get_wallet_total_equity(target_address)
+        target_balance = await client.get_portfolio_account_value(target_address)
         if target_balance is None:
             raise RuntimeError("Unable to read total target wallet equity")
-        spot_balances = await client.get_spot_balances(target_address)
-        target_spot_usdc = sum(
-            float(item.get("total", 0) or 0)
-            for item in spot_balances
-            if str(item.get("coin", "")).upper() == "USDC"
-        )
         logger.info("")
         logger.info(f"💼 Target Account:")
         logger.info(f"   Balance: ${target_balance:,.2f}")
         logger.info(f"   Perps Equity: ${state.balance:,.2f}")
-        logger.info(f"   Spot USDC: ${target_spot_usdc:,.2f}")
         logger.info(f"   Equity: ${state.total_equity:,.2f}")
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
         logger.info(f"   Open Positions: {len(state.positions)}")
@@ -1760,7 +1756,7 @@ async def main():
         if not settings.simulated_trading:
             if not settings.hyperliquid.wallet_address or not settings.hyperliquid.private_key:
                 raise RuntimeError("Live trading requires HYPERLIQUID_WALLET_ADDRESS and HYPERLIQUID_PRIVATE_KEY")
-            follower_total_equity = await client.get_wallet_total_equity(settings.hyperliquid.wallet_address)
+            follower_total_equity = await client.get_portfolio_account_value(settings.hyperliquid.wallet_address)
             if follower_total_equity is None:
                 raise RuntimeError("Unable to read follower wallet total equity")
             simulated_balance = follower_total_equity

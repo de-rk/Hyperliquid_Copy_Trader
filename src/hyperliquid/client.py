@@ -214,7 +214,12 @@ class HyperliquidClient:
     def _portfolio_windows(cls, response: Any) -> Dict[str, Any]:
         """Extract day/week/month payloads across documented response shapes."""
         windows: Dict[str, Any] = {}
-        aliases = {"day": "day", "24h": "day", "week": "week", "7d": "week", "month": "month", "30d": "month"}
+        aliases = {
+            "day": "day", "24h": "day", "week": "week", "7d": "week",
+            "month": "month", "30d": "month",
+            "perpday": "perpDay", "perpweek": "perpWeek",
+            "perpmonth": "perpMonth", "perpalltime": "perpAllTime",
+        }
 
         if isinstance(response, dict):
             source = response.get("data", response)
@@ -267,6 +272,22 @@ class HyperliquidClient:
         except Exception as e:
             logger.error(f"Failed to get portfolio performance for {address}: {e}")
             return empty
+
+    async def get_portfolio_account_value(self, address: str) -> Optional[float]:
+        """Return the latest all-account value from Hyperliquid portfolio history."""
+        try:
+            response = await self._post(self.info_url, {"type": "portfolio", "user": address})
+            windows = self._portfolio_windows(response)
+            # The general day/week/month windows represent total account value;
+            # their latest samples should agree, so prefer day and fall back.
+            for window in ("day", "week", "month"):
+                points = self._history_points(windows.get(window))
+                if points:
+                    return points[-1][1]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get portfolio account value for {address}: {e}")
+            return None
 
     async def get_raw_user_fills(self, address: str) -> List[Dict[str, Any]]:
         """Return raw public fills for internal monitoring and formatting."""
