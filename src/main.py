@@ -1460,6 +1460,13 @@ async def get_pnl() -> str:
         await client.get_portfolio_unrealized_pnl(settings.target_wallet)
         if client and target_state else None
     )
+    target_positions = "\n".join(
+        f"• {html.escape(position.symbol)} {position.side.value.upper()}："
+        f"{position.size:,.6f}｜杠杆 {position.leverage:g}x｜"
+        f"入场 ${position.entry_price:,.4f}｜当前 ${position.current_price:,.4f}｜"
+        f"未实现盈亏 ${position.unrealized_pnl:+,.2f}"
+        for position in target_state.positions
+    ) if target_state and target_state.positions else "暂无合约持仓"
     target_summary = (
         f"账户总金额：${target_equity:,.2f}｜Perps 持仓数：{len(target_state.positions)}｜"
         f"未实现盈亏：${target_portfolio_pnl:,.2f}"
@@ -1482,6 +1489,8 @@ async def get_pnl() -> str:
 
 <b>目标钱包：</b><code>{target_line}</code>
 • {target_summary}
+<b>目标钱包持仓</b>
+{target_positions}
 <b>目标钱包周期净值变化</b>
 {_format_performance(target_performance)}
 
