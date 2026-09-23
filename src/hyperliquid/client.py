@@ -289,6 +289,23 @@ class HyperliquidClient:
             logger.error(f"Failed to get portfolio account value for {address}: {e}")
             return None
 
+    async def get_portfolio_unrealized_pnl(self, address: str) -> Optional[float]:
+        """Return the latest all-account PnL value from portfolio history."""
+        try:
+            response = await self._post(self.info_url, {"type": "portfolio", "user": address})
+            windows = self._portfolio_windows(response)
+            for window in ("day", "week", "month"):
+                payload = windows.get(window)
+                points = self._history_points(
+                    payload.get("pnlHistory") if isinstance(payload, dict) else None
+                )
+                if points:
+                    return points[-1][1]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get portfolio PnL for {address}: {e}")
+            return None
+
     async def get_raw_user_fills(self, address: str) -> List[Dict[str, Any]]:
         """Return raw public fills for internal monitoring and formatting."""
         try:

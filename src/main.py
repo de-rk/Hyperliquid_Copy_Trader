@@ -1456,10 +1456,15 @@ async def get_pnl() -> str:
         await client.get_portfolio_account_value(settings.target_wallet)
         if client and target_state else None
     )
+    target_portfolio_pnl = (
+        await client.get_portfolio_unrealized_pnl(settings.target_wallet)
+        if client and target_state else None
+    )
     target_summary = (
         f"账户总金额：${target_equity:,.2f}｜Perps 持仓数：{len(target_state.positions)}｜"
-        f"未实现盈亏：${target_state.unrealized_pnl:,.2f}"
-        if target_equity is not None and target_state else "当前状态暂无数据"
+        f"未实现盈亏：${target_portfolio_pnl:,.2f}"
+        if target_equity is not None and target_portfolio_pnl is not None and target_state
+        else "账户净值 / 盈亏数据暂不可用"
     )
     history_note = "模拟模式不提供跟随账户链上历史" if settings.simulated_trading else "按账户净值计算，充值/提现会影响结果"
     return f"""
