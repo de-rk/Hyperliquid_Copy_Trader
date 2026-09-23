@@ -931,7 +931,7 @@ async def _notify_copy_failure(
         f"Copy failure [{category}] {symbol} {direction}: {reason} "
         f"target={target_size:.8f} follower={follower_size:.8f}"
     )
-    if notifier:
+    if notifier and stage != "成交跟单":
         try:
             await notifier.send_copy_failure_notification(
                 symbol=symbol,
@@ -1010,13 +1010,6 @@ async def on_order_fill(fill_data: dict):
 
     if is_paused:
         logger.warning("Bot is paused - skipping fill copy")
-        if notifier:
-            await notifier.send_copy_failure_notification(
-                symbol=str(fill_data.get("coin", "unknown")), side=str(fill_data.get("dir", "unknown")),
-                target_size=abs(float(fill_data.get("sz", 0) or 0)), follower_size=0,
-                price=float(fill_data.get("px", 0) or 0), category="机器人已暂停",
-                reason="Bot is paused", fill_id=_fill_id(fill_data), stage="成交跟单"
-            )
         return
 
     try:
