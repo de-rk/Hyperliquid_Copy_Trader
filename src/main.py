@@ -1333,6 +1333,19 @@ async def get_status() -> str:
     status_emoji = "🟢" if not is_paused else "⏸️"
     status_text = "运行中" if not is_paused else "已暂停"
     mode = "模拟" if settings.simulated_trading else "实盘"
+    if settings.simulated_trading:
+        position_lines = [
+            f"• {html.escape(symbol)} {str(position.get('side', 'unknown')).upper()}："
+            f"数量 {abs(position.get('size', 0)):.6f}｜未实现盈亏 ${position.get('unrealized_pnl', 0):+,.2f}"
+            for symbol, position in simulated_positions.items()
+        ]
+    else:
+        position_lines = [
+            f"• {html.escape(position.symbol)} {position.side.value.upper()}："
+            f"数量 {position.size:,.6f}｜未实现盈亏 ${position.unrealized_pnl:+,.2f}"
+            for position in (follower_state.positions if follower_state else [])
+        ]
+    position_details = "\n".join(position_lines) if position_lines else "暂无持仓"
     
     return f"""
 📊 <b>跟单运行状态</b>
@@ -1344,6 +1357,9 @@ async def get_status() -> str:
 📈 <b>未实现盈亏：</b>${pnl:,.2f}
 📊 <b>已复制成交：</b>{trades_copied_count}
 📍 <b>持仓数：</b>{len(simulated_positions) if settings.simulated_trading else (len(follower_state.positions) if follower_state else 0)}
+
+<b>自己的持仓</b>
+{position_details}
 ⏰ <b>运行时长：</b>{uptime:.1f} 小时
 
 <b>仓位模式：</b>{settings.sizing.mode.title()}
@@ -1430,7 +1446,12 @@ def _wallet_label(address: str) -> str:
 
 async def get_pnl() -> str:
     """Get PnL for Telegram"""
-    target_state = monitor.current_state if monitor else None
+    # Refresh independently of the monitor cache.  The monitor's snapshot is
+    # used for event reconciliation and must not be overwritten by a command.
+    target_state = (
+        await client.get_user_state(settings.target_wallet)
+        if client else None
+    )
     follower_state = None
     
     if settings.simulated_trading:
