@@ -2,7 +2,13 @@ import asyncio
 import re
 from typing import Optional, Callable
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeChat,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -403,6 +409,27 @@ class TelegramBot:
         
         # Create application
         self.app = Application.builder().token(self.bot_token).build()
+
+        # Populate Telegram's command picker for the authorized chat.
+        commands = [
+            BotCommand("start", "启动机器人"),
+            BotCommand("status", "查看运行状态和自己的持仓"),
+            BotCommand("positions", "查看当前持仓"),
+            BotCommand("orders", "查看当前挂单"),
+            BotCommand("pnl", "查看收益摘要"),
+            BotCommand("wallet", "查询公开账户"),
+            BotCommand("leaderboard", "查看收益排行榜"),
+            BotCommand("pause", "暂停成交跟单"),
+            BotCommand("resume", "恢复成交跟单"),
+            BotCommand("stop", "停止机器人"),
+        ]
+        try:
+            await self.app.bot.set_my_commands(
+                commands,
+                scope=BotCommandScopeChat(chat_id=self.allowed_chat_id),
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to configure Telegram command menu: {exc}")
         
         # Add command handlers
         self.app.add_handler(CommandHandler("start", self._start_command))
