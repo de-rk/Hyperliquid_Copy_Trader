@@ -37,6 +37,10 @@ simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'sid
 simulated_pnl = 0.0
 processed_fill_ids: set[str] = set()
 MAX_PROCESSED_FILL_IDS = 10_000
+# A single target limit order can be reported as many exchange fills.  The
+# runtime report counts copied target orders, so keep one counter entry per
+# target oid instead of incrementing once for every partial fill.
+counted_mirror_order_ids: set[str] = set()
 # target oid -> follower order metadata. Keeping this mapping in memory is
 # sufficient because the target websocket is the source of truth for this run;
 # a restart takes a fresh baseline and never cancels unrelated follower orders.
@@ -1062,7 +1066,9 @@ async def on_order_fill(fill_data: dict):
                         prior_size * position["entry_price"] + follower_fill_size * price
                     ) / total_size
                     position["size"] = total_size if position["size"] > 0 else -total_size
-        trades_copied_count += 1
+        if target_oid not in counted_mirror_order_ids:
+            counted_mirror_order_ids.add(target_oid)
+            trades_copied_count += 1
         logger.info(
             f"Target fill acknowledged for mirrored order {target_oid}; "
             "no duplicate follower order will be submitted"
@@ -1784,10 +1790,11 @@ async def main():
     Main entry point for the copy trading bot
     """
     global monitor, executor, position_sizer, client, telegram_bot, notifier, bot_start_time
-    global simulated_balance, trades_copied_count
+    global simulated_balance, trades_copied_count, counted_mirror_order_ids
     
     bot_start_time = datetime.now(SHANGHAI_TZ)
     trades_copied_count = 0
+    counted_mirror_order_ids.clear()
     
     # Keep this variable as the account balance used by sizing and status
     # reporting. In live mode it is populated from the follower wallet below.
