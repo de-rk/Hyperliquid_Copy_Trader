@@ -401,14 +401,37 @@ async def on_new_order(order_data: dict):
         target_oid = str(order_data.get('_target_oid', order_data.get('oid', '')) or '')
         side_code = side.value if isinstance(side, OrderSide) else str(side).lower()
         is_buy = side_code in ('b', 'buy')
-        position_side = PositionSide.LONG if is_buy else PositionSide.SHORT
-        reduce_only = bool(order_data.get("reduceOnly", order_data.get("reduce_only", False)))
+        raw_direction = str(
+            order_data.get("dir", order_data.get("direction", "")) or ""
+        )
+        direction_lower = raw_direction.lower()
+        is_closing_order = "close" in direction_lower or "reduce" in direction_lower
+        if "short" in direction_lower:
+            position_side = PositionSide.SHORT
+        elif "long" in direction_lower:
+            position_side = PositionSide.LONG
+        else:
+            position_side = PositionSide.LONG if is_buy else PositionSide.SHORT
+        reduce_only = bool(
+            order_data.get("reduceOnly", order_data.get("reduce_only", False))
+            or is_closing_order
+        )
+        # Use position intent in every mirror notification, not raw order side.
+        if reduce_only:
+            close_side = (
+                position_side
+                if "long" in direction_lower or "short" in direction_lower
+                else PositionSide.SHORT if is_buy else PositionSide.LONG
+            )
+            notification_side = f"CLOSE {close_side.value.upper()}"
+        else:
+            notification_side = f"OPEN {position_side.value.upper()}"
 
         if target_oid and target_oid in mirrored_orders:
             return
         if not symbol or not target_oid or target_size <= 0 or price <= 0:
             await _notify_copy_failure(
-                symbol=symbol or "unknown", direction=position_side.value,
+                symbol=symbol or "unknown", direction=notification_side,
                 target_size=target_size, follower_size=0, price=price,
                 category="挂单数据无效", reason=f"Missing oid/symbol/size/price: {order_data}",
                 fill_id=target_oid,
@@ -420,7 +443,7 @@ async def on_new_order(order_data: dict):
                 price = await executor._get_mid_price(symbol)
             except Exception as exc:
                 await _notify_copy_failure(
-                    symbol=symbol, direction=position_side.value, target_size=target_size,
+                    symbol=symbol, direction=notification_side, target_size=target_size,
                     follower_size=0, price=price, category="镜像价格查询失败",
                     reason=str(exc), fill_id=target_oid,
                     stage="镜像交易",
@@ -430,7 +453,7 @@ async def on_new_order(order_data: dict):
             active_mirrors = sum(1 for item in mirrored_orders.values() if item.get("active", True))
             if active_mirrors >= settings.copy_rules.max_open_orders:
                 await _notify_copy_failure(
-                    symbol=symbol, direction=position_side.value, target_size=target_size,
+                    symbol=symbol, direction=notification_side, target_size=target_size,
                     follower_size=0, price=price, category="达到最大挂单数",
                     reason=f"Mirrored open orders {active_mirrors} >= limit {settings.copy_rules.max_open_orders}",
                     fill_id=target_oid,
@@ -442,11 +465,8 @@ async def on_new_order(order_data: dict):
         target_leverage = target_position.leverage if target_position else 1.0
         # Match fill/error notifications: describe the position action, not
         # the raw execution side (BUY/SELL).
-        notification_side = (
-            f"CLOSE {target_position.side.value.upper()}"
-            if reduce_only and target_position
-            else f"OPEN {position_side.value.upper()}"
-        )
+        if reduce_only and target_position:
+            notification_side = f"CLOSE {target_position.side.value.upper()}"
         if settings.copy_rules.auto_adjust_size and not reduce_only:
             follower_balance = await get_follower_balance()
             target_balance = await client.get_portfolio_account_value(settings.target_wallet)
@@ -469,7 +489,49 @@ async def on_new_order(order_data: dict):
         # Apply the same hard exposure and margin ceilings used by fill copies
         # before sending a live resting order.
         max_size = settings.sizing.max_position_size / price
-        if not reduce_only:
+        follower_dex_state = None
+        if reduce_only:
+            if settings.simulated_trading:
+                simulated_position = simulated_positions.get(symbol)
+                follower_close_size = (
+                    abs(simulated_position.get("size", 0))
+                    if simulated_position
+                    and simulated_position.get("side") == position_side.value
+                    else 0.0
+                )
+            else:
+                follower_dex_state = await client.get_user_state(
+                    settings.hyperliquid.wallet_address,
+                    dex=perp_dex_for_symbol(symbol),
+                )
+                if follower_dex_state is None:
+                    await _notify_copy_failure(
+                        symbol=symbol, direction=notification_side, target_size=target_size,
+                        follower_size=0, price=price, category="DEX账户查询失败",
+                        reason=f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state",
+                        fill_id=target_oid, stage="镜像交易",
+                    )
+                    return
+                follower_position = next(
+                    (position for position in follower_dex_state.positions if position.symbol == symbol),
+                    None,
+                )
+                follower_close_size = (
+                    follower_position.size
+                    if follower_position and follower_position.side == position_side
+                    else 0.0
+                )
+            target_pre_close_size = (
+                target_position.size
+                if target_position and target_position.side == position_side
+                else 0.0
+            )
+            close_ratio = (
+                min(1.0, target_size / target_pre_close_size)
+                if target_pre_close_size > 0 else 0.0
+            )
+            our_size = follower_close_size * close_ratio
+        else:
             if settings.simulated_trading:
                 available_margin = simulated_balance
             else:
@@ -479,7 +541,7 @@ async def on_new_order(order_data: dict):
                 )
                 if follower_dex_state is None:
                     await _notify_copy_failure(
-                        symbol=symbol, direction=position_side.value, target_size=target_size,
+                        symbol=symbol, direction=notification_side, target_size=target_size,
                         follower_size=our_size, price=price, category="DEX账户查询失败",
                         reason=f"Unable to read {perp_dex_for_symbol(symbol) or 'default'} DEX state",
                         fill_id=target_oid,
@@ -494,7 +556,7 @@ async def on_new_order(order_data: dict):
         our_size = min(our_size, max_size)
         if our_size * price < MIN_POSITION_SIZE_USD:
             await _notify_copy_failure(
-                symbol=symbol, direction=position_side.value, target_size=target_size,
+                symbol=symbol, direction=notification_side, target_size=target_size,
                 follower_size=our_size, price=price, category="低于最小订单金额",
                 reason=f"Mirrored order notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}",
                 fill_id=target_oid,
@@ -512,7 +574,7 @@ async def on_new_order(order_data: dict):
         )
         if not result:
             await _notify_copy_failure(
-                symbol=symbol, direction=position_side.value, target_size=target_size,
+                symbol=symbol, direction=notification_side, target_size=target_size,
                 follower_size=our_size, price=price, category="镜像挂单失败",
                 reason=getattr(executor, "last_error", None) or "Executor returned no order id",
                 fill_id=target_oid,
@@ -542,7 +604,7 @@ async def on_new_order(order_data: dict):
         try:
             await _notify_copy_failure(
                 symbol=str(order_data.get("coin", "unknown")),
-                direction=str(order_data.get("side", "unknown")),
+                direction=notification_side,
                 target_size=abs(float(order_data.get("sz", order_data.get("origSz", 0)) or 0)),
                 follower_size=0,
                 price=float(order_data.get("limitPx", order_data.get("px", 0)) or 0),
@@ -1014,7 +1076,8 @@ async def on_order_fill(fill_data: dict):
 
     try:
         symbol = fill_data.get("coin", "")
-        direction = fill_data.get("dir", "")
+        direction = str(fill_data.get("dir", "") or "")
+        direction_lower = direction.lower()
         target_size = abs(float(fill_data.get("sz", 0)))
         price = float(fill_data.get("px", 0))
         fill_id = _fill_id(fill_data)
@@ -1029,15 +1092,15 @@ async def on_order_fill(fill_data: dict):
             logger.warning(f"Skipping position flip until it can be reconciled safely: {direction}")
             return
 
-        is_closing = "Close" in direction or "Reduce" in direction
-        is_opening = "Open" in direction or "Add" in direction
+        is_closing = "close" in direction_lower or "reduce" in direction_lower
+        is_opening = "open" in direction_lower or "add" in direction_lower
         if not (is_opening or is_closing):
             logger.warning(f"Skipping unknown fill direction: {direction}")
             return
 
-        if "Long" in direction:
+        if "long" in direction_lower:
             position_side = PositionSide.LONG
-        elif "Short" in direction:
+        elif "short" in direction_lower:
             position_side = PositionSide.SHORT
         else:
             position_side = PositionSide.LONG if fill_data.get("side") == "B" else PositionSide.SHORT
@@ -1579,7 +1642,7 @@ async def get_leaderboard(window: str, sort_by: str, page: int = 0) -> tuple[str
     return "\n".join(lines), total_pages
 
 
-async def get_wallet_report(address: str, fill_limit: int = 10) -> str:
+async def get_wallet_report(address: str, fill_limit: int = 30) -> str:
     """Format public account performance and recent fills for Telegram."""
     if not client:
         return "❌ Hyperliquid 客户端尚未初始化。"

@@ -376,21 +376,21 @@ class TelegramBot:
             await update.message.reply_text("⛔ 未授权的聊天")
             return
         if not context.args:
-            await update.message.reply_text("用法：<code>/wallet 0x钱包地址 [1-20]</code>", parse_mode="HTML")
+            await update.message.reply_text("用法：<code>/wallet 0x钱包地址 [1-30]</code>", parse_mode="HTML")
             return
         address = context.args[0].strip().lower()
         if not re.fullmatch(r"0x[a-f0-9]{40}", address):
             await update.message.reply_text("❌ 地址格式无效，请输入 0x 开头的 40 位十六进制钱包地址。")
             return
-        limit = 10
+        limit = 30
         if len(context.args) > 1:
             try:
                 limit = int(context.args[1])
             except ValueError:
-                await update.message.reply_text("❌ 成交数量必须是 1 到 20 的整数。")
+                await update.message.reply_text("❌ 成交数量必须是 1 到 30 的整数。")
                 return
-        if not 1 <= limit <= 20:
-            await update.message.reply_text("❌ 成交数量必须是 1 到 20。")
+        if not 1 <= limit <= 30:
+            await update.message.reply_text("❌ 成交数量必须是 1 到 30。")
             return
         if not self.get_wallet_callback:
             await update.message.reply_text("账户查询尚未配置")

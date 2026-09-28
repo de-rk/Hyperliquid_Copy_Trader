@@ -199,8 +199,9 @@ class WalletMonitor:
         new_fills.sort(key=lambda fill: int(fill.get("time", 0)))
         pending_close_sizes = {}
         for fill in new_fills:
-            direction = str(fill.get("dir", ""))
-            if "Close" in direction or "Reduce" in direction:
+            direction = str(fill.get("dir", "") or "")
+            direction_lower = direction.lower()
+            if "close" in direction_lower or "reduce" in direction_lower:
                 symbol = str(fill.get("coin", "")).upper()
                 pending_close_sizes[symbol] = pending_close_sizes.get(symbol, 0.0) + abs(
                     float(fill.get("sz", 0))
@@ -221,8 +222,9 @@ class WalletMonitor:
         for fill in new_fills:
             # Extract symbol from fill data
             symbol = fill.get("coin", "").upper()
-            direction = str(fill.get("dir", ""))
-            if "Close" in direction or "Reduce" in direction:
+            direction = str(fill.get("dir", "") or "")
+            direction_lower = direction.lower()
+            if "close" in direction_lower or "reduce" in direction_lower:
                 fill_size = abs(float(fill.get("sz", 0)))
                 fill["_target_pre_close_size"] = target_pre_close_sizes.get(symbol, 0.0)
             

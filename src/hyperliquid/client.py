@@ -337,7 +337,7 @@ class HyperliquidClient:
                 "timestamp": int(timestamp),
             })
         fills.sort(key=lambda fill: fill["timestamp"], reverse=True)
-        return fills[:max(1, min(limit, 20))]
+        return fills[:max(1, min(limit, 30))]
 
     @staticmethod
     def _leaderboard_rows(response: Any) -> List[Dict[str, Any]]:
