@@ -1,4 +1,5 @@
 import asyncio
+from time import monotonic
 from typing import Callable, Optional, List
 from loguru import logger
 from hyperliquid.client import HyperliquidClient
@@ -27,6 +28,12 @@ class WalletMonitor:
         self.current_state: Optional[UserState] = None
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
+        # A single target action can emit fills, positions and orderUpdates in
+        # rapid succession. These must share one account snapshot instead of
+        # each querying every available Perp DEX.
+        self._state_refresh_lock = asyncio.Lock()
+        self._last_state_refresh_at = 0.0
+        self._state_refresh_min_interval_seconds = 1.0
         self.is_monitoring = False
         self.observed_fill_ids: set[str] = set()
         self.observed_order_ids: set[str] = set()
@@ -52,21 +59,41 @@ class WalletMonitor:
         
         logger.info(f"Wallet Monitor initialized for {target_address}")
     
-    async def get_current_state(self) -> Optional[UserState]:
-        """Fetch current state of target wallet"""
-        self.current_state = await self.client.get_user_state(self.target_address)
+    async def get_current_state(self, force: bool = False) -> Optional[UserState]:
+        """Refresh target state at most once per short event burst."""
+        now = monotonic()
+        if (
+            not force
+            and self.current_state is not None
+            and now - self._last_state_refresh_at < self._state_refresh_min_interval_seconds
+        ):
+            return self.current_state
 
-        if self.current_state:
-            self.last_positions = self.current_state.positions.copy()
-            self.last_orders = self.current_state.orders.copy()
-            # Seed the initial snapshot once. Subsequent refreshes must not add
-            # a newly-created target oid to the baseline before its websocket
-            # order event is delivered.
-            if not self.order_baseline_seeded:
-                self.observed_order_ids.update(order.order_id for order in self.last_orders)
-                self.order_baseline_seeded = True
+        async with self._state_refresh_lock:
+            now = monotonic()
+            if (
+                not force
+                and self.current_state is not None
+                and now - self._last_state_refresh_at < self._state_refresh_min_interval_seconds
+            ):
+                return self.current_state
 
-        return self.current_state
+            state = await self.client.get_user_state(self.target_address)
+            # Avoid retry storms when the Info API is rate-limiting us. A later
+            # event will retry after the short debounce window.
+            self._last_state_refresh_at = monotonic()
+            if state:
+                self.current_state = state
+                self.last_positions = state.positions.copy()
+                self.last_orders = state.orders.copy()
+                # Seed the initial snapshot once. Subsequent refreshes must not add
+                # a newly-created target oid to the baseline before its websocket
+                # order event is delivered.
+                if not self.order_baseline_seeded:
+                    self.observed_order_ids.update(order.order_id for order in self.last_orders)
+                    self.order_baseline_seeded = True
+
+            return self.current_state
     
     async def start_monitoring(self):
         """Start monitoring the target wallet"""
@@ -77,6 +104,8 @@ class WalletMonitor:
         # state snapshot. New fills after this point are handled by polling
         # even if the WebSocket subscription is still connecting.
         await self._seed_fill_baseline()
+        # The application may already have fetched this snapshot for startup
+        # sizing, so reuse it when it is still within the debounce window.
         await self.get_current_state()
         if self.fill_polling_enabled:
             self.fill_poll_task = asyncio.create_task(self._poll_fills())
@@ -357,7 +386,8 @@ class WalletMonitor:
                     except Exception as e:
                         logger.error(f"Error in position update callback: {e}")
         
-        # Update state
+        # Refresh through the one-second single-flight guard so position state
+        # remains current without multiplying DEX requests during a burst.
         await self.get_current_state()
     
     async def _handle_orders(self, orders: List[dict]):
@@ -428,8 +458,9 @@ class WalletMonitor:
                 except Exception as e:
                     logger.error(f"Error in order cancel callback: {e}")
         
-        # Update state
-        await self.get_current_state()
+        # The order WebSocket payload is the source of truth for mirroring.
+        # Refreshing all DEX state here creates one Info burst per order and
+        # is unnecessary; fills/positions refresh through the debounced path.
         
     async def _handle_order_update(self, update: WebSocketUpdate):
         """Handle order updates from WebSocket"""
