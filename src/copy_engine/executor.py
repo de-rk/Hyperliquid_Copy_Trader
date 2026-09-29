@@ -2,7 +2,7 @@
 import asyncio
 import time
 from typing import Optional, Dict, Any
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from eth_account import Account
 import aiohttp
 
@@ -138,6 +138,29 @@ class TradeExecutor:
         rounded = round(float(price), decimals)
         rounded = float(f"{rounded:.5g}")
         return float_to_wire(rounded)
+
+    @staticmethod
+    def _wire_limit_price(
+        price: Decimal,
+        size_decimals: int,
+        side: OrderSide,
+    ) -> str:
+        """Format a valid Hyperliquid limit price without worsening the limit.
+
+        A merged order's weighted average often lands between valid price ticks.
+        Hyperliquid permits at most five significant figures and
+        ``6 - szDecimals`` decimal places for perp prices. Buy limits round
+        down; sell limits round up, preserving the user's price boundary.
+        """
+        value = Decimal(str(price))
+        if value <= 0:
+            raise ValueError("Limit price must be positive")
+
+        max_decimal_tick = Decimal(1).scaleb(-max(0, 6 - size_decimals))
+        significant_tick = Decimal(1).scaleb(value.adjusted() - 4)
+        tick = max(max_decimal_tick, significant_tick)
+        rounding = ROUND_FLOOR if side == OrderSide.BUY else ROUND_CEILING
+        return float_to_wire(value.quantize(tick, rounding=rounding))
 
     def _sign_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Sign an action using the official Hyperliquid L1 scheme."""
@@ -336,15 +359,19 @@ class TradeExecutor:
 
             asset_index, size_decimals = await self._get_asset_info(symbol)
             tif = "Alo" if post_only else "Gtc"
+            wire_price = self._wire_limit_price(price, size_decimals, side)
+            if Decimal(wire_price) != Decimal(str(price)):
+                logger.info(
+                    f"Normalized {symbol} limit price ${price} -> ${wire_price} "
+                    f"for exchange tick size"
+                )
 
             action = {
                 "type": "order",
                 "orders": [{
                     "a": asset_index,
                     "b": side == OrderSide.BUY,
-                    # Target limit prices are already exchange-valid; keep
-                    # their precision as the official SDK does.
-                    "p": float_to_wire(price),
+                    "p": wire_price,
                     "s": self._wire_size(size, size_decimals),
                     "r": reduce_only,
                     "t": {"limit": {"tif": tif}}

@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import json
+from time import monotonic
 from typing import Optional, List, Dict, Any
 from loguru import logger
 from .models import Position, Order, UserState, PositionSide, OrderSide
@@ -23,6 +24,13 @@ class HyperliquidClient:
         # are discovered from the official perpDexs endpoint at runtime.
         self.dexs = [""]
         self.session: Optional[aiohttp.ClientSession] = None
+        # A target order burst can request several account snapshots at once.
+        # Keep Info calls bounded and share an immediately recent portfolio
+        # response rather than amplifying a temporary API slowdown.
+        self._request_semaphore = asyncio.Semaphore(4)
+        self._portfolio_cache: Dict[str, tuple[float, Any]] = {}
+        self._portfolio_locks: Dict[str, asyncio.Lock] = {}
+        self._portfolio_cache_ttl_seconds = 5.0
         
         
     async def __aenter__(self):
@@ -38,18 +46,67 @@ class HyperliquidClient:
             await self.session.close()
         self.session = None
     
-    async def _post(self, url: str, data: dict) -> dict:
-        """Make POST request to API"""
+    async def _post(self, url: str, data: dict) -> Any:
+        """Make one bounded Info request with retry for transient failures."""
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
-            
-        try:
-            async with self.session.post(url, json=data) as response:
-                response.raise_for_status()
-                return await response.json()
-        except aiohttp.ClientError as e:
-            logger.error(f"API request failed: {e}")
-            raise
+
+        last_error: Optional[Exception] = None
+        async with self._request_semaphore:
+            for attempt in range(3):
+                try:
+                    async with self.session.post(
+                        url,
+                        json=data,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as response:
+                        if response.status == 429 or response.status >= 500:
+                            error_text = await response.text()
+                            last_error = RuntimeError(
+                                f"HTTP {response.status}: {error_text[:300]}"
+                            )
+                        else:
+                            response.raise_for_status()
+                            return await response.json()
+                except aiohttp.ClientResponseError as exc:
+                    # Request validation and authentication errors do not
+                    # improve with retries.
+                    if 400 <= exc.status < 500 and exc.status != 429:
+                        logger.error(f"API request failed: {exc}")
+                        raise
+                    last_error = exc
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    last_error = exc
+
+                if attempt < 2:
+                    delay = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        f"Info request failed ({last_error}); retrying in {delay:.1f}s "
+                        f"({attempt + 1}/3): {data.get('type', 'unknown')}"
+                    )
+                    await asyncio.sleep(delay)
+
+        logger.error(f"API request failed after retries: {last_error}")
+        raise last_error or RuntimeError("API request failed without an error")
+
+    async def _get_portfolio(self, address: str) -> Any:
+        """Return a short-lived shared portfolio response for one wallet."""
+        cached = self._portfolio_cache.get(address)
+        now = monotonic()
+        if cached and now - cached[0] < self._portfolio_cache_ttl_seconds:
+            return cached[1]
+
+        lock = self._portfolio_locks.setdefault(address, asyncio.Lock())
+        async with lock:
+            cached = self._portfolio_cache.get(address)
+            now = monotonic()
+            if cached and now - cached[0] < self._portfolio_cache_ttl_seconds:
+                return cached[1]
+            response = await self._post(
+                self.info_url, {"type": "portfolio", "user": address}
+            )
+            self._portfolio_cache[address] = (monotonic(), response)
+            return response
     
     async def get_user_state(
         self, address: str, dex: Optional[str] = None
@@ -250,7 +307,7 @@ class HyperliquidClient:
         """
         empty = {"24H": None, "7D": None, "30D": None}
         try:
-            response = await self._post(self.info_url, {"type": "portfolio", "user": address})
+            response = await self._get_portfolio(address)
             windows = self._portfolio_windows(response)
             periods = {"24H": "day", "7D": "week", "30D": "month"}
             result: Dict[str, Optional[Dict[str, float]]] = {}
@@ -276,7 +333,7 @@ class HyperliquidClient:
     async def get_portfolio_account_value(self, address: str) -> Optional[float]:
         """Return the latest all-account value from Hyperliquid portfolio history."""
         try:
-            response = await self._post(self.info_url, {"type": "portfolio", "user": address})
+            response = await self._get_portfolio(address)
             windows = self._portfolio_windows(response)
             # The general day/week/month windows represent total account value;
             # their latest samples should agree, so prefer day and fall back.
@@ -292,7 +349,7 @@ class HyperliquidClient:
     async def get_portfolio_unrealized_pnl(self, address: str) -> Optional[float]:
         """Return the latest all-account PnL value from portfolio history."""
         try:
-            response = await self._post(self.info_url, {"type": "portfolio", "user": address})
+            response = await self._get_portfolio(address)
             windows = self._portfolio_windows(response)
             for window in ("day", "week", "month"):
                 payload = windows.get(window)
