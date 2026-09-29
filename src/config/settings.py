@@ -51,6 +51,8 @@ class CopyRulesConfig(BaseModel):
     max_margin_usage_ratio: float = 0.40
     fill_polling_enabled: bool = False
     fill_poll_interval_seconds: int = 15
+    # Coalesce bursts of same-intent target orders into one follower order.
+    pending_order_merge_window_seconds: float = 5.0
     min_position_size_usd: float = 10.0
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 
@@ -137,6 +139,10 @@ class Settings(BaseModel):
         settings.copy_rules.fill_polling_enabled = fill_polling in ('true', '1', 'yes')
         settings.copy_rules.fill_poll_interval_seconds = max(
             15, int(os.getenv('FILL_POLL_INTERVAL_SECONDS', '15'))
+        )
+        settings.copy_rules.pending_order_merge_window_seconds = min(
+            60.0,
+            max(0.0, float(os.getenv('PENDING_ORDER_MERGE_WINDOW_SECONDS', '5'))),
         )
         
         # Leverage adjustment

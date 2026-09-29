@@ -28,6 +28,7 @@ notifier: Any = None
 
 # State tracking
 is_paused = False
+is_stopped = False
 trades_copied_count = 0
 bot_start_time = None
 
@@ -45,6 +46,15 @@ counted_mirror_order_ids: set[str] = set()
 # sufficient because the target websocket is the source of truth for this run;
 # a restart takes a fresh baseline and never cancels unrelated follower orders.
 mirrored_orders: dict[str, dict] = {}
+# A burst of small target orders can exhaust the exchange action bucket. Queue
+# matching intents briefly, then mirror their aggregate as one follower order.
+pending_order_batches: dict[str, list[dict]] = {}
+pending_order_tasks: dict[str, asyncio.Task] = {}
+pending_target_order_ids: set[str] = set()
+pending_target_fills: dict[str, list[dict]] = {}
+# Serializes follower exchange actions with /stop. Without this, a mirror
+# coroutine that passed its stop check could submit just after /stop cancels.
+trade_execution_lock = asyncio.Lock()
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -388,14 +398,177 @@ async def on_position_update(position_data: dict):
     # TODO: Update your position to match
 
 
+def _pending_order_intent(order_data: dict) -> tuple[str, str, str]:
+    """Return a stable merge key that never combines opposite trade intents."""
+    symbol = str(order_data.get("coin", "") or "")
+    side = order_data.get("side", "")
+    side_code = side.value if isinstance(side, OrderSide) else str(side).lower()
+    is_buy = side_code in ("b", "buy")
+    direction = str(order_data.get("dir", order_data.get("direction", "")) or "").lower()
+    reduce_only = bool(
+        order_data.get("reduceOnly", order_data.get("reduce_only", False))
+        or "close" in direction
+        or "reduce" in direction
+    )
+    if "short" in direction:
+        position_side = "short"
+    elif "long" in direction:
+        position_side = "long"
+    elif reduce_only:
+        position_side = "short" if is_buy else "long"
+    else:
+        position_side = "long" if is_buy else "short"
+    return symbol, "close" if reduce_only else "open", position_side
+
+
 async def on_new_order(order_data: dict):
+    """Queue a target resting order so dense bursts use one exchange action."""
+    if not settings.copy_rules.mirror_pending_orders or is_paused or is_stopped:
+        return
+
+    target_oid = str(order_data.get("_target_oid", order_data.get("oid", "")) or "")
+    if not target_oid:
+        await _mirror_new_order(order_data)
+        return
+    if target_oid in mirrored_orders or target_oid in pending_target_order_ids:
+        return
+
+    key = "|".join(_pending_order_intent(order_data))
+    pending_target_order_ids.add(target_oid)
+    pending_order_batches.setdefault(key, []).append(order_data)
+    previous = pending_order_tasks.get(key)
+    if previous and not previous.done():
+        previous.cancel()
+    pending_order_tasks[key] = asyncio.create_task(_flush_pending_order_batch(key))
+
+
+async def _flush_pending_order_batch(key: str) -> None:
+    """Mirror one aggregate order after the burst has gone quiet."""
+    try:
+        await asyncio.sleep(settings.copy_rules.pending_order_merge_window_seconds)
+    except asyncio.CancelledError:
+        return
+
+    orders = pending_order_batches.pop(key, [])
+    pending_order_tasks.pop(key, None)
+    target_order_ids = [
+        str(order.get("_target_oid", order.get("oid", "")) or "")
+        for order in orders
+    ]
+    try:
+        if not orders:
+            return
+        filled_order_ids = {
+            target_oid for target_oid in target_order_ids
+            if pending_target_fills.get(target_oid)
+        }
+        resting_orders = [
+            order for order in orders
+            if str(order.get("_target_oid", order.get("oid", "")) or "")
+            not in filled_order_ids
+        ]
+        if resting_orders:
+            await _mirror_pending_order_batch(key, resting_orders)
+
+        fill_events = [
+            fill
+            for target_oid in filled_order_ids
+            for fill in pending_target_fills.pop(target_oid, [])
+        ]
+        if fill_events:
+            pending_target_order_ids.difference_update(filled_order_ids)
+            await _copy_pending_order_fills(fill_events)
+    finally:
+        pending_target_order_ids.difference_update(target_order_ids)
+        for target_oid in target_order_ids:
+            pending_target_fills.pop(target_oid, None)
+
+
+async def _mirror_pending_order_batch(key: str, orders: list[dict]) -> None:
+    """Create one follower limit order for the still-resting target orders."""
+    if len(orders) == 1:
+        await _mirror_new_order(orders[0])
+        return
+
+    total_size = sum(
+        abs(float(order.get("sz", order.get("origSz", 0)) or 0))
+        for order in orders
+    )
+    weighted_notional = sum(
+        abs(float(order.get("sz", order.get("origSz", 0)) or 0))
+        * float(order.get("limitPx", order.get("px", 0)) or 0)
+        for order in orders
+    )
+    if total_size <= 0 or weighted_notional <= 0:
+        await _mirror_new_order(orders[-1])
+        return
+
+    target_order_ids = [
+        str(order.get("_target_oid", order.get("oid", "")) or "")
+        for order in orders
+    ]
+    batch_id = "merged:" + ",".join(target_order_ids)
+    merged_order = {
+        **orders[-1],
+        "sz": total_size,
+        "origSz": total_size,
+        "limitPx": weighted_notional / total_size,
+        "_target_oid": batch_id,
+        "_merged_target_order_ids": target_order_ids,
+    }
+    logger.info(
+        f"Coalescing {len(orders)} target orders into one mirror: "
+        f"{key} size={total_size:.8f} price=${merged_order['limitPx']:,.4f}"
+    )
+    await _mirror_new_order(merged_order)
+    mirror = mirrored_orders.get(batch_id)
+    if mirror:
+        mirror["merged_target_order_ids"] = target_order_ids
+        for target_oid in target_order_ids:
+            if target_oid:
+                mirrored_orders[target_oid] = mirror
+
+
+async def _copy_pending_order_fills(fills: list[dict]) -> None:
+    """Copy fills that arrived before their pending-order batch was flushed."""
+    fills.sort(key=lambda fill: int(fill.get("time", 0) or 0))
+    if len(fills) == 1:
+        await on_order_fill(fills[0])
+        return
+
+    total_size = sum(abs(float(fill.get("sz", 0) or 0)) for fill in fills)
+    if total_size <= 0:
+        return
+    weighted_price = sum(
+        abs(float(fill.get("sz", 0) or 0)) * float(fill.get("px", 0) or 0)
+        for fill in fills
+    ) / total_size
+    merged_fill = dict(fills[-1])
+    merged_fill["oid"] = "merged-fill:" + ",".join(
+        str(fill.get("oid", "")) for fill in fills
+    )
+    merged_fill["tid"] = "merged-fill:" + ",".join(_fill_id(fill) for fill in fills)
+    merged_fill["sz"] = total_size
+    merged_fill["px"] = weighted_price
+    if any("close" in str(fill.get("dir", "")).lower() for fill in fills):
+        merged_fill["_target_pre_close_size"] = max(
+            float(fill.get("_target_pre_close_size", 0) or 0) for fill in fills
+        )
+    logger.info(
+        f"Coalescing {len(fills)} target fills into one follower execution: "
+        f"size={total_size:.8f} price=${weighted_price:,.4f}"
+    )
+    await on_order_fill(merged_fill)
+
+
+async def _mirror_new_order(order_data: dict):
     """Mirror a target resting order immediately and remember its oid mapping."""
     global mirrored_orders
     try:
         if not settings.copy_rules.mirror_pending_orders:
             return
-        if is_paused:
-            logger.warning("Bot is paused - skipping pending order mirror")
+        if is_paused or is_stopped:
+            logger.warning("Bot is paused or stopped - skipping pending order mirror")
             return
 
         symbol = order_data.get('coin', '')
@@ -454,7 +627,9 @@ async def on_new_order(order_data: dict):
                 )
                 return
         if settings.copy_rules.max_open_orders is not None:
-            active_mirrors = sum(1 for item in mirrored_orders.values() if item.get("active", True))
+            active_mirrors = len({
+                id(item) for item in mirrored_orders.values() if item.get("active", True)
+            })
             if active_mirrors >= settings.copy_rules.max_open_orders:
                 await _notify_copy_failure(
                     symbol=symbol, direction=notification_side, target_size=target_size,
@@ -568,14 +743,18 @@ async def on_new_order(order_data: dict):
             )
             return
 
-        result = await executor.execute_limit_order(
-            symbol=symbol,
-            side=OrderSide.BUY if is_buy else OrderSide.SELL,
-            size=Decimal(str(our_size)),
-            price=Decimal(str(price)),
-            leverage=leverage,
-            reduce_only=reduce_only,
-        )
+        async with trade_execution_lock:
+            if is_stopped:
+                logger.info("Bot stopped while preparing mirror order; no exchange request sent")
+                return
+            result = await executor.execute_limit_order(
+                symbol=symbol,
+                side=OrderSide.BUY if is_buy else OrderSide.SELL,
+                size=Decimal(str(our_size)),
+                price=Decimal(str(price)),
+                leverage=leverage,
+                reduce_only=reduce_only,
+            )
         if not result:
             await _notify_copy_failure(
                 symbol=symbol, direction=notification_side, target_size=target_size,
@@ -627,6 +806,12 @@ async def on_order_cancel(order_data: dict):
     mirror = mirrored_orders.get(target_oid)
     if not mirror or not mirror.get("active"):
         return
+    if mirror.get("merged_target_order_ids"):
+        logger.info(
+            f"Ignoring target cancellation for merged mirror {target_oid}; "
+            "the shared follower order remains active"
+        )
+        return
     if not settings.copy_rules.cancel_mirrored_orders:
         return
     try:
@@ -663,9 +848,17 @@ async def on_order_cancel(order_data: dict):
 
 async def on_order_update(order_data: dict):
     """Track target updates and replace a mirrored order when its price changes."""
+    if is_stopped:
+        return
     target_oid = str(order_data.get("_target_oid", order_data.get("oid", "")) or "")
     mirror = mirrored_orders.get(target_oid)
     if mirror:
+        if mirror.get("merged_target_order_ids"):
+            logger.info(
+                f"Ignoring individual price update for merged mirror {target_oid}; "
+                "the shared follower order keeps its aggregate price"
+            )
+            return
         status = str(order_data.get("_order_status", "") or "").lower()
         if status:
             mirror["target_status"] = status
@@ -1023,7 +1216,18 @@ async def on_order_fill(fill_data: dict):
     """
     global trades_copied_count
 
+    if is_stopped:
+        logger.info("Bot is stopped - skipping fill copy")
+        return
+
     target_oid = str(fill_data.get("oid", "") or "")
+    if target_oid in pending_target_order_ids:
+        pending_target_fills.setdefault(target_oid, []).append(fill_data)
+        logger.info(
+            f"Target fill {target_oid} arrived during pending-order merge; "
+            "queueing it to prevent a duplicate follower order"
+        )
+        return
     mirror = mirrored_orders.get(target_oid)
     if mirror:
         # The follower already has a resting limit order for this target oid.
@@ -1212,12 +1416,16 @@ async def on_order_fill(fill_data: dict):
 
             order_side = OrderSide.SELL if position_side == PositionSide.LONG else OrderSide.BUY
             leverage = 1
-            result = await executor.execute_market_order(
-                symbol=symbol,
-                side=order_side,
-                size=Decimal(str(our_size)),
-                reduce_only=True,
-            )
+            async with trade_execution_lock:
+                if is_stopped:
+                    logger.info("Bot stopped while preparing close fill; no exchange request sent")
+                    return
+                result = await executor.execute_market_order(
+                    symbol=symbol,
+                    side=order_side,
+                    size=Decimal(str(our_size)),
+                    reduce_only=True,
+                )
         else:
             target_balance = await client.get_portfolio_account_value(settings.target_wallet)
             if settings.copy_rules.auto_adjust_size:
@@ -1305,21 +1513,25 @@ async def on_order_fill(fill_data: dict):
                 return
 
             order_side = OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL
-            if settings.copy_rules.use_limit_orders:
-                result = await executor.execute_limit_order(
-                    symbol=symbol,
-                    side=order_side,
-                    size=Decimal(str(our_size)),
-                    price=Decimal(str(price)),
-                    leverage=leverage,
-                )
-            else:
-                result = await executor.execute_market_order(
-                    symbol=symbol,
-                    side=order_side,
-                    size=Decimal(str(our_size)),
-                    leverage=leverage,
-                )
+            async with trade_execution_lock:
+                if is_stopped:
+                    logger.info("Bot stopped while preparing opening fill; no exchange request sent")
+                    return
+                if settings.copy_rules.use_limit_orders:
+                    result = await executor.execute_limit_order(
+                        symbol=symbol,
+                        side=order_side,
+                        size=Decimal(str(our_size)),
+                        price=Decimal(str(price)),
+                        leverage=leverage,
+                    )
+                else:
+                    result = await executor.execute_market_order(
+                        symbol=symbol,
+                        side=order_side,
+                        size=Decimal(str(our_size)),
+                        leverage=leverage,
+                    )
 
         if not result:
             executor_reason = getattr(executor, "last_error", None) or "Executor returned no order id"
@@ -1399,8 +1611,8 @@ async def get_status() -> str:
         balance = follower_state.balance if follower_state else 0
         pnl = follower_state.unrealized_pnl if follower_state else 0
     
-    status_emoji = "🟢" if not is_paused else "⏸️"
-    status_text = "运行中" if not is_paused else "已暂停"
+    status_emoji = "🔴" if is_stopped else ("🟢" if not is_paused else "⏸️")
+    status_text = "已停止" if is_stopped else ("运行中" if not is_paused else "已暂停")
     mode = "模拟" if settings.simulated_trading else "实盘"
     if settings.simulated_trading:
         position_lines = [
@@ -1722,35 +1934,59 @@ async def handle_pause():
 async def handle_resume():
     """Handle resume request from Telegram"""
     global is_paused
+    if is_stopped:
+        logger.warning("Resume ignored because the bot was stopped; restart is required")
+        return False
     is_paused = False
     logger.info("▶️ Bot resumed by Telegram command")
+    return True
 
 
 async def handle_stop(close_positions: bool = False):
     """Handle stop request from Telegram"""
+    global is_paused, is_stopped
     logger.warning(f"🛑 Stop requested from Telegram (close_positions={close_positions})")
+    is_paused = True
+    is_stopped = True
+
+    # Do not let an order batch scheduled before /stop place a follower order
+    # after monitoring has been shut down.
+    for task in pending_order_tasks.values():
+        if not task.done():
+            task.cancel()
+    pending_order_tasks.clear()
+    pending_order_batches.clear()
+    pending_target_order_ids.clear()
+    pending_target_fills.clear()
     
-    # Cancel all orders
-    if executor:
-        await executor.cancel_all_orders()
-    
-    # Close positions if requested
-    if close_positions and monitor and monitor.current_state:
-        for pos in monitor.current_state.positions:
-            logger.info(f"Closing position: {pos.symbol}")
-            await executor.close_position(pos.symbol)
+    # Wait for an already-started copy action before cancelling orders. Once
+    # this lock is held, no earlier mirror coroutine can submit after /stop.
+    async with trade_execution_lock:
+        if executor:
+            await executor.cancel_all_orders()
+
+        # Close follower positions, never the target wallet's cached positions.
+        if close_positions:
+            follower_state = await _get_follower_state() if not settings.simulated_trading else None
+            positions = (
+                follower_state.positions if follower_state else []
+            ) if not settings.simulated_trading else []
+            for pos in positions:
+                logger.info(f"Closing position: {pos.symbol}")
+                close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+                await executor.close_position(
+                    pos.symbol,
+                    size=Decimal(str(pos.size)),
+                    side=close_side,
+                )
     
     # Stop monitoring
     if monitor:
         await monitor.stop_monitoring()
-    
-    # Stop Telegram bot
-    if telegram_bot:
-        await telegram_bot.stop()
-    
-    # Exit
-    import sys
-    sys.exit(0)
+
+    # Keep Telegram alive to report the stopped status. Exiting here would be
+    # restarted by Docker's `restart: unless-stopped` policy and resume copying.
+    logger.warning("🛑 Bot stopped. Restart the container explicitly to enable copying again.")
 
 
 async def send_hourly_reports():
@@ -1759,7 +1995,7 @@ async def send_hourly_reports():
         try:
             await asyncio.sleep(3600)  # Wait 1 hour
             
-            if notifier and monitor and monitor.current_state:
+            if not is_stopped and notifier and monitor and monitor.current_state:
                 state = await _get_follower_state() if not settings.simulated_trading else None
                 if settings.simulated_trading:
                     account_pnl = simulated_pnl
@@ -1790,11 +2026,16 @@ async def main():
     Main entry point for the copy trading bot
     """
     global monitor, executor, position_sizer, client, telegram_bot, notifier, bot_start_time
-    global simulated_balance, trades_copied_count, counted_mirror_order_ids
+    global simulated_balance, trades_copied_count, counted_mirror_order_ids, is_stopped
     
     bot_start_time = datetime.now(SHANGHAI_TZ)
     trades_copied_count = 0
+    is_stopped = False
     counted_mirror_order_ids.clear()
+    pending_order_batches.clear()
+    pending_order_tasks.clear()
+    pending_target_order_ids.clear()
+    pending_target_fills.clear()
     
     # Keep this variable as the account balance used by sizing and status
     # reporting. In live mode it is populated from the follower wallet below.
@@ -1999,6 +2240,10 @@ async def main():
         f"{'enabled (' + str(settings.copy_rules.fill_poll_interval_seconds) + 's)' if settings.copy_rules.fill_polling_enabled else 'disabled'}"
     )
     logger.info(f"   Pending Order Mirror: {settings.copy_rules.mirror_pending_orders}")
+    logger.info(
+        f"   Pending Order Merge Window: "
+        f"{settings.copy_rules.pending_order_merge_window_seconds:g}s"
+    )
     logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
     
     position_sizer = PositionSizer(
@@ -2230,6 +2475,10 @@ async def main():
         logger.info(f"   Copy Open Positions: {settings.copy_rules.copy_open_positions}")
         logger.info(f"   Copy Existing Orders: {settings.copy_rules.copy_existing_orders}")
         logger.info(f"   Mirror Pending Orders: {settings.copy_rules.mirror_pending_orders}")
+        logger.info(
+            f"   Pending Order Merge Window: "
+            f"{settings.copy_rules.pending_order_merge_window_seconds:g}s"
+        )
         logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
         logger.info(f"   Auto Adjust Size: {settings.copy_rules.auto_adjust_size}")
         logger.info(f"   Max Open Trades: {'Unlimited' if settings.copy_rules.max_open_trades is None else settings.copy_rules.max_open_trades}")
@@ -2248,6 +2497,11 @@ async def main():
         
         # Start monitoring
         await monitor.start_monitoring()
+        if is_stopped:
+            # Keep Telegram queries available and avoid Docker's
+            # `restart: unless-stopped` policy immediately restarting trading.
+            logger.info("Trading is stopped; Telegram remains online until the container is manually restarted")
+            await asyncio.Event().wait()
         
     except KeyboardInterrupt:
         logger.info("")

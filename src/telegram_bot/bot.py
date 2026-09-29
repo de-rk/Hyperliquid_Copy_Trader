@@ -181,7 +181,13 @@ class TelegramBot:
         
         if self.on_resume_requested:
             try:
-                await self.on_resume_requested()
+                resumed = await self.on_resume_requested()
+                if resumed is False:
+                    await update.message.reply_text(
+                        "🔴 <b>机器人已停止</b>\n\n停止后不会被 /resume 唤醒；请手动重启机器人后再恢复跟单。",
+                        parse_mode="HTML"
+                    )
+                    return
                 await update.message.reply_text(
                     "▶️ <b>机器人已恢复</b>\n\n正在继续复制新成交。",
                     parse_mode="HTML"
@@ -308,7 +314,7 @@ class TelegramBot:
                 "🛑 <b>正在停止机器人...</b>\n\n"
                 "• 正在取消全部挂单\n"
                 "• 正在平掉全部仓位\n"
-                "• 正在退出\n\n"
+                "• 跟单将保持停止\n\n"
                 "请稍候...",
                 parse_mode="HTML"
             )
@@ -330,7 +336,7 @@ class TelegramBot:
                 "🛑 <b>正在停止机器人...</b>\n\n"
                 "• 正在取消全部挂单\n"
                 "• 保留现有仓位\n"
-                "• 正在退出\n\n"
+                "• 跟单将保持停止\n\n"
                 "请稍候...",
                 parse_mode="HTML"
             )
@@ -420,8 +426,8 @@ class TelegramBot:
             BotCommand("wallet", "查询公开账户"),
             BotCommand("leaderboard", "查看收益排行榜"),
             BotCommand("pause", "暂停成交跟单"),
-            BotCommand("resume", "恢复成交跟单"),
-            BotCommand("stop", "停止机器人"),
+            BotCommand("resume", "恢复暂停的跟单"),
+            BotCommand("stop", "停止跟单，重启后恢复"),
         ]
         try:
             await self.app.bot.set_my_commands(

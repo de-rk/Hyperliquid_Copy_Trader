@@ -1,4 +1,5 @@
 """Trade execution engine for Hyperliquid"""
+import asyncio
 import time
 from typing import Optional, Dict, Any
 from decimal import Decimal, ROUND_DOWN
@@ -32,6 +33,10 @@ class TradeExecutor:
         self._coin_size_decimals: Dict[str, int] = {}
         self._metadata_loaded = False
         self.last_error: Optional[str] = None
+        # Hyperliquid leverage is symbol-level state. Repeating the same
+        # update before every mirrored order burns exchange-action capacity.
+        self._configured_leverages: Dict[str, int] = {}
+        self._leverage_lock = asyncio.Lock()
 
         # Initialize signing account if we have credentials
         self.account = None
@@ -218,6 +223,19 @@ class TradeExecutor:
             logger.error(f"Error updating leverage: {e}")
             return False
 
+    async def _ensure_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage once per symbol/value during this process lifetime."""
+        if leverage <= 1:
+            return True
+        async with self._leverage_lock:
+            if self._configured_leverages.get(symbol) == leverage:
+                logger.debug(f"Leverage already configured for {symbol}: {leverage}x")
+                return True
+            if not await self._update_leverage(symbol, leverage):
+                return False
+            self._configured_leverages[symbol] = leverage
+            return True
+
     async def execute_market_order(
         self,
         symbol: str,
@@ -236,10 +254,9 @@ class TradeExecutor:
             )
 
         try:
-            if leverage > 1:
-                if not await self._update_leverage(symbol, leverage):
-                    logger.error(f"Cannot place {symbol} order because leverage update failed")
-                    return None
+            if not await self._ensure_leverage(symbol, leverage):
+                logger.error(f"Cannot place {symbol} order because leverage update failed")
+                return None
 
             asset_index, size_decimals = await self._get_asset_info(symbol)
             mid_price = await self._get_mid_price(symbol)
@@ -313,10 +330,9 @@ class TradeExecutor:
             )
 
         try:
-            if leverage > 1:
-                if not await self._update_leverage(symbol, leverage):
-                    logger.error(f"Cannot place {symbol} order because leverage update failed")
-                    return None
+            if not await self._ensure_leverage(symbol, leverage):
+                logger.error(f"Cannot place {symbol} order because leverage update failed")
+                return None
 
             asset_index, size_decimals = await self._get_asset_info(symbol)
             tif = "Alo" if post_only else "Gtc"
