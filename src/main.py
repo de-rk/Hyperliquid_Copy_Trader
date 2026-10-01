@@ -1,7 +1,11 @@
 import asyncio
 import html
+import os
+import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
 from loguru import logger
@@ -25,6 +29,7 @@ position_sizer: PositionSizer = None
 client: HyperliquidClient = None
 telegram_bot: Any = None
 notifier: Any = None
+target_switch_lock = asyncio.Lock()
 
 # State tracking
 is_paused = False
@@ -73,6 +78,62 @@ def calculate_scaled_close_size(
         return 0.0, 0.0
     close_ratio = min(1.0, target_fill_size / target_pre_close_size)
     return min(follower_size, follower_size * close_ratio), close_ratio
+
+
+def configure_monitor_callbacks(wallet_monitor: WalletMonitor) -> None:
+    """Attach the process-level handlers to a target wallet monitor."""
+    # Fills are the real-time source of truth. Position callbacks describe the
+    # same target action and would otherwise submit duplicate mirror orders.
+    wallet_monitor.on_new_position = None
+    wallet_monitor.on_position_close = None
+    wallet_monitor.on_position_update = None
+    wallet_monitor.on_new_order = on_new_order
+    wallet_monitor.on_order_update = on_order_update
+    wallet_monitor.on_order_cancel = on_order_cancel
+    wallet_monitor.on_order_fill = on_order_fill
+
+
+def persist_target_wallet(address: str) -> None:
+    """Persist the active target address in the project-level .env file."""
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    original_exists = env_path.exists()
+    original_mode = env_path.stat().st_mode & 0o777 if original_exists else 0o600
+    content = env_path.read_text(encoding="utf-8") if original_exists else ""
+    lines = content.splitlines(keepends=True)
+    assignment = re.compile(r"^(\s*TARGET_WALLET_ADDRESS\s*=).*?(\r?\n)?$")
+    replaced = False
+
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        match = assignment.match(line)
+        if not match:
+            continue
+        newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        lines[index] = f"{match.group(1)}{address}{newline}"
+        replaced = True
+        break
+
+    if not replaced:
+        if lines and not content.endswith(("\n", "\r")):
+            lines.append("\n")
+        lines.append(f"TARGET_WALLET_ADDRESS={address}\n")
+
+    updated = "".join(lines)
+    temp_fd, temp_name = tempfile.mkstemp(
+        prefix=".env.", suffix=".tmp", dir=env_path.parent
+    )
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8", newline="") as temp_file:
+            temp_file.write(updated)
+        os.chmod(temp_name, original_mode)
+        os.replace(temp_name, env_path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 async def get_follower_balance() -> float | None:
@@ -1942,6 +2003,81 @@ async def handle_resume():
     return True
 
 
+async def handle_follow(address: str) -> str:
+    """Switch the monitored target wallet without restarting the process."""
+    global monitor
+
+    normalized = str(address or "").strip().lower()
+    if not re.fullmatch(r"0x[a-f0-9]{40}", normalized):
+        return "❌ 地址格式无效：请输入 0x 开头的 40 位十六进制钱包地址。"
+    if is_stopped:
+        return "🔴 机器人已停止，请先手动重启容器后再更换跟单地址。"
+    if normalized == str(settings.target_wallet).lower():
+        return f"ℹ️ 当前已经在跟随：<code>{html.escape(_wallet_label(normalized))}</code>"
+    if not client:
+        return "❌ Hyperliquid 客户端尚未就绪。"
+
+    async with target_switch_lock:
+        if not await client.validate_wallet_address(normalized):
+            return "❌ 地址不存在、不可查询或暂时无法连接 Hyperliquid。"
+        try:
+            persist_target_wallet(normalized)
+        except Exception as exc:
+            logger.error(f"Unable to persist target wallet in .env: {exc}")
+            return "❌ 地址验证通过，但写入 .env 失败，跟单地址未切换。"
+
+        logger.warning(
+            f"🔄 Switching follow target: {settings.target_wallet} -> {normalized}"
+        )
+        old_monitor = monitor
+        new_monitor = WalletMonitor(
+            normalized,
+            settings.hyperliquid.api_url,
+            settings.hyperliquid.ws_url,
+            fill_polling_enabled=settings.copy_rules.fill_polling_enabled,
+            fill_poll_interval_seconds=settings.copy_rules.fill_poll_interval_seconds,
+        )
+        configure_monitor_callbacks(new_monitor)
+        # Publish the replacement before closing the old websocket. The main
+        # monitor loop can then never mistake the old instance for the active
+        # target when its listener returns after the close.
+        settings.target_wallet = normalized
+        monitor = new_monitor
+
+        # Stop the old websocket and its fill polling before replacing the
+        # monitor's active event stream.
+        if old_monitor:
+            await old_monitor.stop_monitoring()
+
+        # Remove only mirror orders owned by this process. Do not cancel the
+        # follower's unrelated manual orders.
+        seen_mirrors: set[int] = set()
+        for mirror in list(mirrored_orders.values()):
+            if id(mirror) in seen_mirrors or not mirror.get("active"):
+                continue
+            seen_mirrors.add(id(mirror))
+            try:
+                await executor.cancel_order(mirror["symbol"], mirror["follower_oid"])
+            except Exception as exc:
+                logger.warning(f"Unable to cancel old mirror order: {exc}")
+        mirrored_orders.clear()
+        pending_order_batches.clear()
+        for task in pending_order_tasks.values():
+            if not task.done():
+                task.cancel()
+        pending_order_tasks.clear()
+        pending_target_order_ids.clear()
+        pending_target_fills.clear()
+        processed_fill_ids.clear()
+        counted_mirror_order_ids.clear()
+
+    return (
+        "✅ <b>跟单地址已切换</b>\n\n"
+        f"目标钱包：<code>{html.escape(_wallet_label(normalized))}</code>\n"
+        "已建立新地址基线，不会补跟此前历史成交。"
+    )
+
+
 async def handle_stop(close_positions: bool = False):
     """Handle stop request from Telegram"""
     global is_paused, is_stopped
@@ -2020,6 +2156,21 @@ async def send_hourly_reports():
                 )
         except Exception as e:
             logger.error(f"Error sending hourly report: {e}")
+
+
+async def run_target_monitor():
+    """Keep monitoring the current target and support hot target switches."""
+    global monitor
+    while True:
+        current_monitor = monitor
+        await current_monitor.start_monitoring()
+        if is_stopped:
+            # /stop deliberately keeps Telegram alive, but this task must not
+            # reconnect or consume new target events afterward.
+            await asyncio.Event().wait()
+        if monitor is current_monitor:
+            logger.warning("Target monitor stopped unexpectedly; reconnecting")
+            await asyncio.sleep(1)
 
 async def main():
     """
@@ -2254,15 +2405,7 @@ async def main():
         max_total_exposure=settings.sizing.max_total_exposure
     )
     
-    # Fills are the real-time source of truth. Position and order callbacks
-    # describe the same target action and would otherwise duplicate an order.
-    monitor.on_new_position = None
-    monitor.on_position_close = None
-    monitor.on_position_update = None
-    monitor.on_new_order = on_new_order
-    monitor.on_order_update = on_order_update
-    monitor.on_order_cancel = on_order_cancel
-    monitor.on_order_fill = on_order_fill
+    configure_monitor_callbacks(monitor)
     
     # Copy existing positions if enabled
     if settings.copy_rules.copy_open_positions and state and state.positions:
@@ -2418,6 +2561,7 @@ async def main():
         telegram_bot.on_pause_requested = handle_pause
         telegram_bot.on_resume_requested = handle_resume
         telegram_bot.on_stop_requested = handle_stop
+        telegram_bot.on_follow_requested = handle_follow
         
         # Start Telegram bot
         await telegram_bot.start()
@@ -2496,12 +2640,7 @@ async def main():
             )
         
         # Start monitoring
-        await monitor.start_monitoring()
-        if is_stopped:
-            # Keep Telegram queries available and avoid Docker's
-            # `restart: unless-stopped` policy immediately restarting trading.
-            logger.info("Trading is stopped; Telegram remains online until the container is manually restarted")
-            await asyncio.Event().wait()
+        await run_target_monitor()
         
     except KeyboardInterrupt:
         logger.info("")

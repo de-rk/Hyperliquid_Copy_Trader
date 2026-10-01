@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import json
+import re
 from time import monotonic
 from typing import Optional, List, Dict, Any
 from loguru import logger
@@ -231,6 +232,19 @@ class HyperliquidClient:
         except Exception as e:
             logger.error(f"Failed to get user state for {address}: {e}")
             return None
+
+    async def validate_wallet_address(self, address: str) -> bool:
+        """Check address format and confirm it is queryable on Hyperliquid."""
+        normalized = str(address or "").strip().lower()
+        if not re.fullmatch(r"0x[a-f0-9]{40}", normalized):
+            return False
+        try:
+            # A single default-DEX state query is enough to distinguish an
+            # invalid/nonexistent account without scanning every HIP-3 DEX.
+            return await self.get_user_state(normalized, dex="") is not None
+        except Exception as exc:
+            logger.warning(f"Unable to validate wallet {normalized}: {exc}")
+            return False
 
     @staticmethod
     def _as_float(value: Any) -> Optional[float]:
