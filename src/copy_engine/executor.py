@@ -259,6 +259,18 @@ class TradeExecutor:
             self._configured_leverages[symbol] = leverage
             return True
 
+    async def prepare_leverage(self, symbol: str, leverage: int) -> bool:
+        """Configure leverage before a unified-account capacity preflight."""
+        if self.dry_run:
+            return True
+        async with self._leverage_lock:
+            if self._configured_leverages.get(symbol) == leverage:
+                return True
+            if not await self._update_leverage(symbol, leverage):
+                return False
+            self._configured_leverages[symbol] = leverage
+            return True
+
     async def execute_market_order(
         self,
         symbol: str,

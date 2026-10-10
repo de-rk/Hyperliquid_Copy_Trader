@@ -13,6 +13,7 @@ class HyperliquidConfig(BaseModel):
     leaderboard_url: str = Field(default="https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
     wallet_address: Optional[str] = None
     private_key: Optional[str] = None
+    account_mode: str = "standard"  # follower account: "standard" or "unified"
 
 class TelegramConfig(BaseModel):
     bot_token: Optional[str] = None
@@ -99,6 +100,12 @@ class Settings(BaseModel):
         )
         settings.hyperliquid.wallet_address = os.getenv('HYPERLIQUID_WALLET_ADDRESS')
         settings.hyperliquid.private_key = os.getenv('HYPERLIQUID_PRIVATE_KEY')
+        account_mode = os.getenv('HYPERLIQUID_ACCOUNT_MODE', 'standard').strip().lower()
+        if account_mode not in {'standard', 'unified'}:
+            raise ValueError(
+                "HYPERLIQUID_ACCOUNT_MODE must be either 'standard' or 'unified'"
+            )
+        settings.hyperliquid.account_mode = account_mode
         
         settings.target_wallet = os.getenv('TARGET_WALLET_ADDRESS', settings.target_wallet)
         

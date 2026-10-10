@@ -94,7 +94,7 @@ class UserState:
     
     @property
     def available_balance(self) -> float:
-        """Calculate available balance"""
+        """Perp-Dex available balance; meaningful for Standard accounts only."""
         return self.balance - self.margin_used
     
     @property

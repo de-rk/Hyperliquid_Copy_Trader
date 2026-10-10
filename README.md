@@ -12,7 +12,7 @@
 - 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
 - 平仓按目标本次减仓占其平仓前仓位的比例执行；仅在跟随钱包存在同方向仓位时使用 `reduce-only`，不会反手开仓。
 - 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
-- 新开仓会限制在订单所属 Perp DEX 可用保证金的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内，并遵守 `MAX_OPEN_TRADES`。
+- 新开仓会按跟随钱包的账户模式读取市场可交易额度，再限制在 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内，并遵守 `MAX_OPEN_TRADES`。
 - 默认只使用 WebSocket 监听成交；`FILL_POLLING_ENABLED=true` 时才会按 `FILL_POLL_INTERVAL_SECONDS`（默认 15 秒）查询 REST 接口补回断线期间漏掉的成交。启动前的历史 fills 仅作为基线，不会自动补单。
 - 容器日志和 Telegram 通知使用中国标准时间（UTC+8）。
 
@@ -45,10 +45,16 @@ MAX_OPEN_TRADES=1
 ```properties
 HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址
 HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
+HYPERLIQUID_ACCOUNT_MODE=standard
 TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```
 
-`HYPERLIQUID_WALLET_ADDRESS` 必须与私钥推导出的地址一致。用于实盘的 USDC 必须位于 Hyperliquid 的 **Perp** 账户，不是 Spot 账户。HIP-3 标的（例如 `xyz:SKHX`）还要求保证金位于其所属的 `xyz` Perp DEX；默认 Perp 账户的余额不能用于 `xyz:*` 下单。
+`HYPERLIQUID_WALLET_ADDRESS` 必须填写由 `HYPERLIQUID_PRIVATE_KEY` 推导出的钱包地址（当前程序要求两者匹配）。`HYPERLIQUID_ACCOUNT_MODE` 要与跟随账户在 Hyperliquid 中的模式一致：
+
+- `standard`：现货、默认 Perp 和各 HIP-3 Perp DEX 的保证金分开。资金须位于该市场可用的 Perp 账户/DEX。
+- `unified`：同一抵押币种的余额在现货与支持该币种的 Perp 市场间统一。程序使用 `activeAssetData` 读取当前市场、交易方向的可交易额度。不同抵押币种不会自动互换或合并。
+
+目标地址可以是 Standard 或 Unified；跟单比例使用账户级 `portfolio` 净值。目标持仓状态和目标账户净值分开读取。
 
 ### 2. 启动 Docker 服务
 
@@ -110,6 +116,8 @@ HYPERLIQUID_LEADERBOARD_URL=https://stats-data.hyperliquid.xyz/Mainnet/leaderboa
 # 跟随钱包。实盘时两个值必须填写且地址必须匹配。
 HYPERLIQUID_WALLET_ADDRESS=
 HYPERLIQUID_PRIVATE_KEY=
+# 跟随钱包模式：standard 或 unified，必须与 Hyperliquid 账户设置一致。
+HYPERLIQUID_ACCOUNT_MODE=standard
 
 # 目标钱包或 Vault 地址
 TARGET_WALLET_ADDRESS=
@@ -136,7 +144,7 @@ AUTO_ADJUST_SIZE=true
 # false 为带滑点保护的 IOC 市价单；true 为限价单。
 USE_LIMIT_ORDERS=false
 MAX_SLIPPAGE_PCT=1.0
-# 每笔开仓最多使用可用保证金的比例。HIP-3 标的实际保证金可能高于显示杠杆的简单估算。
+# 每笔开仓最多使用可交易额度的比例。Standard 按该 DEX 可用保证金和杠杆估算；Unified 按 activeAssetData 的方向额度限制。
 MAX_MARGIN_USAGE_RATIO=0.40
 # 默认关闭 REST 成交补漏；需要时改为 true
 FILL_POLLING_ENABLED=false
@@ -169,7 +177,7 @@ INSTALL_TELEGRAM=true
 - 资金比例为 `1%`
 - 跟随数量为 `0.1` 个币
 - 程序检查该数量的名义价值是否至少 `$10`
-- 程序再检查该订单所需保证金是否不超过该标的所属 Perp DEX 可用保证金的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）
+- 程序再检查该订单是否不超过对应账户模式下可交易额度的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）
 
 启动日志中的 `Your Copy` 是“若复制目标当前全部旧仓位”的预估，不代表已下单。只有 `COPY_OPEN_POSITIONS=true` 才会在启动时执行该操作。
 

@@ -146,6 +146,52 @@ async def get_follower_balance() -> float | None:
     return await client.get_portfolio_account_value(settings.hyperliquid.wallet_address)
 
 
+async def get_follower_order_notional_cap(
+    symbol: str,
+    side: OrderSide,
+    leverage: float,
+    dex_state=None,
+    prepare_leverage: bool = False,
+) -> float | None:
+    """Return the configured per-order notional cap for the follower wallet.
+
+    Standard accounts use the selected Perp DEX's free margin. Unified
+    accounts use Hyperliquid's market- and direction-specific available
+    trading notional because individual Perp DEX balances are not authoritative
+    for unified accounts.
+    """
+    usage_ratio = settings.copy_rules.max_margin_usage_ratio
+    if settings.simulated_trading:
+        return max(0.0, simulated_balance) * max(1.0, leverage) * usage_ratio
+
+    address = settings.hyperliquid.wallet_address
+    if not address:
+        return None
+
+    if settings.hyperliquid.account_mode == "unified":
+        if prepare_leverage and not await executor.prepare_leverage(
+            symbol, int(max(1, leverage))
+        ):
+            return None
+        available_notional = await client.get_available_to_trade_notional(
+            address,
+            symbol,
+            side.value,
+            target_leverage=max(1, leverage),
+        )
+        if available_notional is None:
+            return None
+        return max(0.0, available_notional) * usage_ratio
+
+    if dex_state is None:
+        dex_state = await client.get_user_state(
+            address, dex=perp_dex_for_symbol(symbol)
+        )
+    if dex_state is None:
+        return None
+    return max(0.0, dex_state.available_balance) * max(1.0, leverage) * usage_ratio
+
+
 def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
     """
     Calculate adjusted leverage with proper rounding and max leverage limits.
@@ -235,7 +281,10 @@ async def on_new_position(position_data: dict):
     
     # Check account equity limit
     if settings.copy_rules.max_account_equity is not None:
-        current_equity = monitor.current_state.total_equity if monitor.current_state else 0
+        current_equity = await client.get_portfolio_account_value(settings.target_wallet)
+        if current_equity is None:
+            logger.error("Unable to read target account equity for MAX_ACCOUNT_EQUITY check")
+            return
         if current_equity >= settings.copy_rules.max_account_equity:
             logger.warning(f"⚠️ Max account equity reached (${current_equity:,.2f}/${settings.copy_rules.max_account_equity:,.2f}) - stopping copy trading")
             is_paused = True
@@ -772,9 +821,7 @@ async def _mirror_new_order(order_data: dict):
             )
             our_size = follower_close_size * close_ratio
         else:
-            if settings.simulated_trading:
-                available_margin = simulated_balance
-            else:
+            if not settings.simulated_trading:
                 follower_dex_state = await client.get_user_state(
                     settings.hyperliquid.wallet_address,
                     dex=perp_dex_for_symbol(symbol),
@@ -788,11 +835,22 @@ async def _mirror_new_order(order_data: dict):
                         stage="镜像交易",
                     )
                     return
-                available_margin = max(0.0, follower_dex_state.available_balance)
-            max_size = min(
-                max_size,
-                available_margin * leverage * settings.copy_rules.max_margin_usage_ratio / price,
+            max_order_notional = await get_follower_order_notional_cap(
+                symbol,
+                OrderSide.BUY if is_buy else OrderSide.SELL,
+                leverage,
+                dex_state=follower_dex_state,
+                prepare_leverage=True,
             )
+            if max_order_notional is None:
+                await _notify_copy_failure(
+                    symbol=symbol, direction=notification_side, target_size=target_size,
+                    follower_size=our_size, price=price, category="可交易额度查询失败",
+                    reason="Unable to read the follower's available order capacity",
+                    fill_id=target_oid, stage="镜像交易",
+                )
+                return
+            max_size = min(max_size, max_order_notional / price)
         our_size = min(our_size, max_size)
         if our_size * price < MIN_POSITION_SIZE_USD:
             await _notify_copy_failure(
@@ -1520,25 +1578,37 @@ async def on_order_fill(fill_data: dict):
             )
             if settings.simulated_trading:
                 follower_position = simulated_positions.get(symbol)
-                available_margin = simulated_balance
                 open_positions = len(simulated_positions)
             else:
                 follower_position = next(
                     (position for position in follower_dex_state.positions if position.symbol == symbol), None
                 )
-                available_margin = max(0.0, follower_dex_state.available_balance)
                 open_positions = len(follower_state.positions)
 
-                if available_margin <= 0:
-                    dex_name = perp_dex_for_symbol(symbol) or "default"
-                    logger.warning(
-                        f"Skipping {symbol}: {dex_name} Perp DEX available margin is $0.00. "
-                        f"Fund the {dex_name} DEX before copying this asset."
-                    )
-                    await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
-                                               follower_size=our_size, price=price, category="保证金不足",
-                                               reason=f"{dex_name} available margin is ${available_margin:.2f}", fill_id=fill_id)
-                    return
+            max_order_notional = await get_follower_order_notional_cap(
+                symbol,
+                OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL,
+                leverage,
+                dex_state=follower_dex_state,
+                prepare_leverage=True,
+            )
+            if max_order_notional is None:
+                logger.error(f"Unable to read available order capacity for {symbol}")
+                await _notify_copy_failure(
+                    symbol=symbol, direction=direction, target_size=target_size,
+                    follower_size=our_size, price=price, category="可交易额度查询失败",
+                    reason="Unable to read the follower's available order capacity",
+                    fill_id=fill_id,
+                )
+                return
+            if max_order_notional <= 0:
+                await _notify_copy_failure(
+                    symbol=symbol, direction=direction, target_size=target_size,
+                    follower_size=our_size, price=price, category="保证金不足",
+                    reason=f"Available order capacity for {symbol} is ${max_order_notional:.2f}",
+                    fill_id=fill_id,
+                )
+                return
 
             if (
                 settings.copy_rules.max_open_trades is not None
@@ -1551,11 +1621,7 @@ async def on_order_fill(fill_data: dict):
                                            reason=f"Open positions {open_positions} >= limit {settings.copy_rules.max_open_trades}", fill_id=fill_id)
                 return
 
-            max_size_from_margin = (
-                available_margin
-                * leverage
-                * settings.copy_rules.max_margin_usage_ratio
-            ) / price
+            max_size_from_margin = max_order_notional / price
             existing_position_value = follower_position.notional_value if follower_position else 0.0
             remaining_position_value = max(
                 0.0, settings.sizing.max_position_size - existing_position_value
@@ -1669,7 +1735,7 @@ async def get_status() -> str:
         balance = simulated_balance
         pnl = simulated_pnl
     else:
-        balance = follower_state.balance if follower_state else 0
+        balance = await get_follower_balance() or 0
         pnl = follower_state.unrealized_pnl if follower_state else 0
     
     status_emoji = "🔴" if is_stopped else ("🟢" if not is_paused else "⏸️")
@@ -1803,8 +1869,8 @@ async def get_pnl() -> str:
         mode = "模拟"
     else:
         follower_state = await _get_follower_state()
-        balance = follower_state.balance if follower_state else 0
-        equity = follower_state.total_equity if follower_state else 0
+        equity = await get_follower_balance() or 0
+        balance = equity
         pnl = follower_state.unrealized_pnl if follower_state else 0
         mode = "实盘"
 
@@ -2142,7 +2208,9 @@ async def send_hourly_reports():
                     continue
                 else:
                     account_pnl = state.unrealized_pnl
-                    account_balance = state.balance
+                    account_balance = await get_follower_balance()
+                    if account_balance is None:
+                        continue
                     open_positions = len(state.positions)
                     open_orders = len(state.orders)
                 
@@ -2239,9 +2307,7 @@ async def main():
             raise RuntimeError("Unable to read total target wallet equity")
         logger.info("")
         logger.info(f"💼 Target Account:")
-        logger.info(f"   Balance: ${target_balance:,.2f}")
-        logger.info(f"   Perps Equity: ${state.balance:,.2f}")
-        logger.info(f"   Equity: ${state.total_equity:,.2f}")
+        logger.info(f"   Account Equity: ${target_balance:,.2f}")
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
         logger.info(f"   Open Positions: {len(state.positions)}")
         
@@ -2313,12 +2379,10 @@ async def main():
                     adjustment_ratio=settings.leverage.adjustment_ratio,
                     symbol=pos.symbol
                 )
-                # Startup copying must use the same risk caps as live fills.
-                # The exchange reserves margin and fees, so using the entire
-                # displayed balance can be rejected as insufficient margin.
-                if settings.simulated_trading:
-                    available_margin = simulated_balance
-                else:
+                # Estimate startup capacity using the same account-mode-aware
+                # per-market limit used by live order paths.
+                follower_dex_state = None
+                if not settings.simulated_trading:
                     current_follower_state = await client.get_user_state(
                         settings.hyperliquid.wallet_address,
                         dex=perp_dex_for_symbol(pos.symbol),
@@ -2326,19 +2390,20 @@ async def main():
                     if current_follower_state is None:
                         logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
                         continue
-                    available_margin = max(0.0, current_follower_state.available_balance)
-                    if available_margin <= 0:
-                        dex_name = perp_dex_for_symbol(pos.symbol) or "default"
-                        logger.warning(
-                            f"   ⚠️ {pos.symbol} belongs to the {dex_name} Perp DEX, "
-                            "which has $0.00 available margin. No order will be sent."
-                        )
+                    follower_dex_state = current_follower_state
 
-                margin_limited_value = (
-                    available_margin
-                    * your_leverage
-                    * settings.copy_rules.max_margin_usage_ratio
+                order_side = (
+                    OrderSide.BUY if pos.side == PositionSide.LONG else OrderSide.SELL
                 )
+                margin_limited_value = await get_follower_order_notional_cap(
+                    pos.symbol,
+                    order_side,
+                    your_leverage,
+                    dex_state=follower_dex_state,
+                )
+                if margin_limited_value is None:
+                    logger.error(f"   ❌ Cannot read available order capacity for {pos.symbol}")
+                    continue
                 max_position_value = settings.sizing.max_position_size
                 capped_position_value = min(
                     target_position_value * auto_ratio,
@@ -2383,6 +2448,7 @@ async def main():
     logger.info(f"   Sizing Mode: {settings.sizing.mode}")
     logger.info(f"   Leverage Adjustment: {settings.leverage.adjustment_ratio}x")
     logger.info(f"   Max Position Size: ${settings.sizing.max_position_size:,.2f}")
+    logger.info(f"   Follower Account Mode: {settings.hyperliquid.account_mode}")
     logger.info(
         f"   Max Margin Usage: {settings.copy_rules.max_margin_usage_ratio:.0%}"
     )
@@ -2425,9 +2491,8 @@ async def main():
                     adjustment_ratio=settings.leverage.adjustment_ratio,
                     symbol=pos.symbol
                 )
-                if settings.simulated_trading:
-                    available_margin = simulated_balance
-                else:
+                follower_dex_state = None
+                if not settings.simulated_trading:
                     current_follower_state = await client.get_user_state(
                         settings.hyperliquid.wallet_address,
                         dex=perp_dex_for_symbol(pos.symbol),
@@ -2435,20 +2500,26 @@ async def main():
                     if current_follower_state is None:
                         logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
                         continue
-                    available_margin = max(0.0, current_follower_state.available_balance)
-                    if available_margin <= 0:
-                        dex_name = perp_dex_for_symbol(pos.symbol) or "default"
-                        logger.warning(
-                            f"   ⚠️ {pos.symbol} belongs to the {dex_name} Perp DEX, "
-                            "which has $0.00 available margin. No order will be sent."
-                        )
+                    follower_dex_state = current_follower_state
+
+                order_side = (
+                    OrderSide.BUY if pos.side == PositionSide.LONG else OrderSide.SELL
+                )
+                max_order_notional = await get_follower_order_notional_cap(
+                    pos.symbol,
+                    order_side,
+                    your_leverage,
+                    dex_state=follower_dex_state,
+                    prepare_leverage=True,
+                )
+                if max_order_notional is None:
+                    logger.error(f"   ❌ Cannot read available order capacity for {pos.symbol}")
+                    continue
 
                 requested_position_value = target_position_value * auto_ratio
                 capped_position_value = min(
                     requested_position_value,
-                    available_margin
-                    * your_leverage
-                    * settings.copy_rules.max_margin_usage_ratio,
+                    max_order_notional,
                     settings.sizing.max_position_size,
                 )
                 if capped_position_value < MIN_POSITION_SIZE_USD:
@@ -2553,7 +2624,6 @@ async def main():
         
         # Set up Telegram callbacks
         telegram_bot.get_status_callback = get_status
-        telegram_bot.get_positions_callback = get_positions_formatted
         telegram_bot.get_orders_callback = get_orders
         telegram_bot.get_pnl_callback = get_pnl
         telegram_bot.get_leaderboard_callback = get_leaderboard
@@ -2580,10 +2650,14 @@ async def main():
         state = await monitor.get_current_state()
         
         if state:
+            target_total_equity = await client.get_portfolio_account_value(target_address)
             logger.info("")
             logger.info(f"💼 Target Account:")
-            logger.info(f"   Balance: ${state.balance:,.2f}")
-            logger.info(f"   Equity: ${state.total_equity:,.2f}")
+            logger.info(
+                f"   Account Equity: ${target_total_equity:,.2f}"
+                if target_total_equity is not None
+                else "   Account Equity: unavailable"
+            )
             logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
             logger.info(f"   Open Positions: {len(state.positions)}")
             

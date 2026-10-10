@@ -45,7 +45,6 @@ class TelegramBot:
         self.on_pause_requested: Optional[Callable] = None
         self.on_resume_requested: Optional[Callable] = None
         self.get_status_callback: Optional[Callable] = None
-        self.get_positions_callback: Optional[Callable] = None
         self.get_orders_callback: Optional[Callable] = None
         self.get_pnl_callback: Optional[Callable] = None
         self.get_leaderboard_callback: Optional[Callable] = None
@@ -73,7 +72,6 @@ class TelegramBot:
 <b>可用命令：</b>
 
 /status - 查看运行状态
-/positions - 查看当前持仓
 /orders - 查看当前挂单
 /pnl - 查看收益摘要
 /leaderboard - 查看公开收益排行榜
@@ -124,20 +122,8 @@ class TelegramBot:
             await update.message.reply_text(f"❌ 更换跟单地址失败：{exc}")
     
     async def _positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /positions command"""
-        if not self._check_authorized(update):
-            await update.message.reply_text("⛔ 未授权的聊天")
-            return
-        
-        if self.get_positions_callback:
-            try:
-                positions = await self.get_positions_callback()
-                await update.message.reply_text(positions, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"Error getting positions: {e}")
-                await update.message.reply_text(f"❌ 获取仓位失败：{e}")
-        else:
-            await update.message.reply_text("📍 仓位查询尚未配置")
+        """Keep /positions as a backward-compatible alias for /status."""
+        await self._status_command(update, context)
     
     async def _orders_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /orders command"""
@@ -442,7 +428,6 @@ class TelegramBot:
         commands = [
             BotCommand("start", "启动机器人"),
             BotCommand("status", "查看运行状态和自己的持仓"),
-            BotCommand("positions", "查看当前持仓"),
             BotCommand("orders", "查看当前挂单"),
             BotCommand("pnl", "查看收益摘要"),
             BotCommand("wallet", "查询公开账户"),

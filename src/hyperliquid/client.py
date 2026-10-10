@@ -513,28 +513,56 @@ class HyperliquidClient:
             logger.error(f"Failed to get Spot balances for {address}: {e}")
             return []
 
-    async def get_wallet_total_equity(self, address: str) -> Optional[float]:
-        """Return aggregate Perps equity plus Spot USDC collateral."""
-        state = await self.get_user_state(address)
-        if state is None:
-            return None
+    async def get_available_to_trade_notional(
+        self,
+        address: str,
+        symbol: str,
+        side: str,
+        target_leverage: Optional[float] = None,
+    ) -> Optional[float]:
+        """Return Hyperliquid's per-market available notional for one side.
+
+        ``activeAssetData.availableToTrade`` is ordered buy then sell and is
+        account-aware, including for unified accounts. The Info API receives
+        the actual user address, never the API/agent signer address.
+        """
+        side_index = 0 if str(side).lower() in {"buy", "long", "b"} else 1
         try:
             response = await self._post(
                 self.info_url,
-                {"type": "spotClearinghouseState", "user": address},
+                {"type": "activeAssetData", "user": address, "coin": symbol},
             )
-        except Exception:
-            logger.exception(f"Unable to read Spot collateral for {address}; sizing must not fall back to Perps-only equity")
+            values = response.get("availableToTrade") if isinstance(response, dict) else None
+            if not isinstance(values, (list, tuple)) or len(values) <= side_index:
+                logger.error(
+                    f"activeAssetData did not include availableToTrade for {address} {symbol}"
+                )
+                return None
+            available = self._as_float(values[side_index])
+            if available is None:
+                return None
+            current_leverage = self._as_float(
+                (response.get("leverage") or {}).get("value")
+            )
+            # If the account is currently set above the copier's intended
+            # leverage, scale capacity down conservatively. A higher intended
+            # leverage is applied before live unified-account preflight.
+            if (
+                target_leverage is not None
+                and current_leverage is not None
+                and current_leverage > target_leverage > 0
+            ):
+                available *= target_leverage / current_leverage
+            return available
+        except Exception as e:
+            logger.error(
+                f"Failed to get available trading notional for {address} {symbol}: {e}"
+            )
             return None
-        if not isinstance(response, dict) or not isinstance(response.get("balances"), list):
-            logger.error(f"Spot collateral response is invalid for {address}; refusing Perps-only sizing")
-            return None
-        spot_usdc = sum(
-            float(item.get("total", 0) or 0)
-            for item in response["balances"]
-            if str(item.get("coin", "")).upper() == "USDC"
-        )
-        return state.balance + spot_usdc
+
+    async def get_wallet_total_equity(self, address: str) -> Optional[float]:
+        """Return mode-independent total account equity from portfolio history."""
+        return await self.get_portfolio_account_value(address)
     
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""
