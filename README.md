@@ -9,14 +9,22 @@
 - 默认镜像机器人启动后的目标**限价挂单**：目标挂单后立即按同一价格创建跟随挂单；目标取消、过期或被拒时，撤销仍未成交的跟随挂单。
 - 目标挂单成交时不会再次创建跟随订单；跟随挂单自身的成交负责改变跟随仓位。若目标订单部分成交，跟随挂单保留剩余数量。
 - `COPY_OPEN_POSITIONS=false` 时，不会在启动时追入目标已有仓位。
+- `COPY_OPEN_POSITIONS=true` 时可按盈亏筛选要追的旧仓位：`COPY_OPEN_PNL_FILTER=loss` 只追目标**当前浮亏**的仓位（你在更好的价位进场），`profit` 只追浮盈的，`all` 全追（旧行为，默认）。筛选按交易所返回的 `unrealizedPnl` 判断，恰好持平的仓位不计入 `loss`。
 - 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
 - 平仓按目标本次减仓占其平仓前仓位的比例执行；仅在跟随钱包存在同方向仓位时使用 `reduce-only`，不会反手开仓。
 - 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
-- 新开仓会按跟随钱包的账户模式读取市场可交易额度，再限制在 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内，并遵守 `MAX_OPEN_TRADES`。
+- 新开仓会按跟随钱包的账户模式读取市场可交易额度，再限制在 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内。
+- `MAX_POSITION_SIZE`、`MAX_TOTAL_EXPOSURE`、`MAX_OPEN_TRADES` 默认都是 `x`（不限制），目标持几个仓位就跟几个。此时仓位大小只由可交易额度与 `MAX_MARGIN_USAGE_RATIO` 决定，详见[资金与仓位示例](#资金与仓位示例)。
+- 杠杆按交易所 `meta` 中该标的的 `maxLeverage` 截断，`onlyIsolated` 标的自动使用逐仓。不会向低杠杆标的（如 `flx:BTC` 1x、`GMX` 3x）发送必被拒绝的杠杆值。
+- 只复制永续成交。现货成交会被跳过，包括交易所自动把残渣兑换成 USDC 产生的 `Spot Dust Conversion`，这类成交只在日志里记一条 INFO，不影响仓位。
+- 资产表在进程内缓存：遇到未知币种时刷新一次，之后在 `ASSET_METADATA_TTL_SECONDS`（默认 300 秒）内不再重复请求。新上架的 HIP-3 标的无需重启即可解析。
 - 默认只使用 WebSocket 监听成交；`FILL_POLLING_ENABLED=true` 时才会按 `FILL_POLL_INTERVAL_SECONDS`（默认 15 秒）查询 REST 接口补回断线期间漏掉的成交。启动前的历史 fills 仅作为基线，不会自动补单。
+- 每小时报告的统计块首行是跟单状态（`🟢 正在跟单` / `⏸️ 暂停跟单，自 MM-DD HH:MM 起` / `🔴 已停止`）。暂停期间仍按时发报，但报告会明确标出已暂停多久。
 - 容器日志和 Telegram 通知使用中国标准时间（UTC+8）。
 
 如果机器人启动前目标已经开仓，且需要主动复制该已有仓位，必须由使用者明确设置 `COPY_OPEN_POSITIONS=true` 并重启服务。该设置会产生真实订单；默认 `false` 不会追入已有仓位。
+
+只想接目标的**浮亏**仓位时，同时设置 `COPY_OPEN_PNL_FILTER=loss`（见[配置项](#2-编辑-env)）。`COPY_OPEN_POSITIONS=false` 时该筛选不生效——两个开关是与关系，不是一个开关的两个取值。
 
 ## 快速开始
 
@@ -31,6 +39,7 @@ cp .env.example .env
 ```properties
 SIMULATED_TRADING=true
 COPY_OPEN_POSITIONS=false
+COPY_OPEN_PNL_FILTER=loss
 COPY_EXISTING_ORDERS=false
 COPY_PENDING_ORDERS=true
 CANCEL_MIRRORED_ORDERS=true
@@ -117,6 +126,8 @@ asset = 100000 + perp_dex_index × 10000 + index_in_meta
 
 `perpDexs[0]` 是默认 Perp DEX，`xyz` 是 `perpDexs[1]`，所以 `xyz:SKHX` 的编号是 `100000 + 1 × 10000 + 22 = 110022`。
 
+builder DEX 的杠杆上限普遍低于默认 Perp（默认 Perp 的 `BTC` 是 40x）：`xyz:SKHX` 是 10x，`GMX`、`SNX` 只有 3x，`flx:BTC` 只有 1x 且强制逐仓。程序启动时并发读取全部 DEX 的 `meta`（11 个 DEX、553 个标的，约 0.4 秒），下单前按实际上限截断杠杆，`onlyIsolated` 标的自动切成逐仓，因此不需要手动维护杠杆表。新上架的标的最迟会在一次未知币种刷新后被识别，不必重启容器。
+
 先跑只读诊断，确认解析、DEX 状态、`availableToTrade` 和将要发送的订单体：
 
 ```bash
@@ -155,6 +166,11 @@ SIMULATED_ACCOUNT_BALANCE=1000.0
 
 # 启动时是否复制目标已有仓位。建议保持 false。
 COPY_OPEN_POSITIONS=false
+# 追入已有仓位时的盈亏范围（仅在 COPY_OPEN_POSITIONS=true 时生效）：
+#   loss   只追目标当前浮亏的仓位：你在比目标更好的价位进场，等于“接目标的水下仓”
+#   profit 只追目标当前浮盈的仓位：等于追高，慎用
+#   all    全部追入（旧行为，默认）
+COPY_OPEN_PNL_FILTER=loss
 
 # 启动时是否复制目标已有挂单。建议保持 false。
 COPY_EXISTING_ORDERS=false
@@ -164,6 +180,8 @@ COPY_PENDING_ORDERS=true
 CANCEL_MIRRORED_ORDERS=true
 # true 使用目标限价；false 使用跟随账户读取的当前中间价。
 MIRROR_ORDER_PRICE=true
+# 同币种、同方向的密集挂单在该静默窗口（秒）内合并为一笔镜像挂单。
+PENDING_ORDER_MERGE_WINDOW_SECONDS=5
 
 # true 时，单笔跟随数量 = 目标本次成交量 × 跟随资金 / 目标资金
 AUTO_ADJUST_SIZE=true
@@ -176,6 +194,9 @@ MAX_MARGIN_USAGE_RATIO=0.40
 # 默认关闭 REST 成交补漏；需要时改为 true
 FILL_POLLING_ENABLED=false
 FILL_POLL_INTERVAL_SECONDS=15
+# 未知币种的负缓存时长（秒，最小 30）。同时决定新上架标的最迟多久被识别；
+# 已知标的始终走内存，不会按该间隔重复拉取资产表。
+ASSET_METADATA_TTL_SECONDS=300
 
 # 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
 LEVERAGE_ADJUSTMENT=0.5
@@ -201,6 +222,11 @@ BLOCKED_ASSETS=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 INSTALL_TELEGRAM=true
+
+# 数据库与日志
+DATABASE_URL=sqlite:///./data/trading.db
+LOG_LEVEL=INFO
+LOG_FILE=./logs/trading.log
 ```
 
 ### 资金与仓位示例
@@ -212,7 +238,27 @@ INSTALL_TELEGRAM=true
 - 程序检查该数量的名义价值是否至少 `$10`
 - 程序再检查该订单是否不超过对应账户模式下可交易额度的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）
 
+### 仓位上限一览
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `MAX_MARGIN_USAGE_RATIO` | `0.40` | **默认唯一生效的规模约束**：单笔开仓最多使用可交易额度的 40% |
+| `LEVERAGE_ADJUSTMENT` | `0.5` | 使用目标杠杆的一半，实际值再按交易所上限截断 |
+| `MAX_POSITION_SIZE` | `x` | 单个仓位名义价值上限；填数字才生效 |
+| `MAX_TOTAL_EXPOSURE` | `x` | 全部仓位合计名义价值上限；填数字才生效 |
+| `MAX_OPEN_TRADES` | `x` | 同时跟随的仓位数；填 `1` 只跟第一个仓位 |
+| `MAX_ACCOUNT_EQUITY` | `x` | 跟随账户权益达到该值时自动暂停 |
+| `MIN_POSITION_SIZE_USD` | `$10` | 代码内常量（交易所最低订单额），低于则跳过并推送 Telegram 通知 |
+
+三个美元额度上限（`MAX_POSITION_SIZE`、`MAX_TOTAL_EXPOSURE`、`MAX_OPEN_TRADES`）默认都是不限制，实际生效的规模约束只有 `MAX_MARGIN_USAGE_RATIO`。这意味着：目标在 `xyz:SKHX` 上持有 `$900,000` 名义、跟随资金是目标的 `1%` 时，会真的按 `$9,000` 下这一笔，而不是被压到某个固定美元额度。这类尺寸完全依赖 `MAX_MARGIN_USAGE_RATIO` 兜底，所以不要为了“多跟一点”把它调到 0.9 以上——目标账户净值读取异常时，它是最后一道闸门。
+
+反过来，如果只想拿小额试水，显式写 `MAX_POSITION_SIZE=200` 比下调 `MAX_MARGIN_USAGE_RATIO` 更合适：前者只压单仓，不影响多仓位同时跟进。
+
 启动日志中的 `Your Copy` 是“若复制目标当前全部旧仓位”的预估，不代表已下单。只有 `COPY_OPEN_POSITIONS=true` 才会在启动时执行该操作。
+
+启动时的旧仓位复制受 `COPY_OPEN_PNL_FILTER` 控制：日志会打印 `PnL Filter: loss -> copying 2/7 position(s)`，预览段和实际下单段都只处理这 2 个仓位，`Your Copy` 合计也按这 2 个仓位统计。如果目标当前所有仓位都不符合筛选（例如 `loss` 但全部浮盈），启动复制段整段跳过，不会下任何单。
+
+追浮亏仓位的经济含义：跟随钱包永远按**当前市价**成交，不吃目标的历史成本。目标浮亏时，它的入场价位于市价不利的一侧，你在更有利的一侧接同样的方向；反之 `profit` 意味着你比目标买得更贵。这也是为什么 `loss` 是更常见的默认值。
 
 ## Telegram
 
@@ -221,7 +267,7 @@ INSTALL_TELEGRAM=true
 - `/status` 查看运行状态和跟随账户信息
 - `/positions` 查看当前仓位
 - `/orders` 查看挂单
-- `/pnl` 查看收益摘要
+- `/pnl` 查看收益摘要，含目标钱包与跟随钱包的完整地址
 - `/leaderboard` 查看 Hyperliquid 公开排行榜，可按 24H、7D、30D 的收益额或收益率筛选；最多读取 200 名，每页 10 名
 - `/wallet 0x地址 [1-20]` 查询任意公开地址的账户状态、24H/7D/30D 净值变化和最近成交；默认显示 10 笔
 - `/pause` 暂停复制新成交，保留已有仓位
@@ -230,7 +276,17 @@ INSTALL_TELEGRAM=true
 
 同一个 Telegram Token 只能由一个实例轮询。出现 `terminated by other getUpdates request` 时，关闭使用同一 Token 的其他机器人实例。
 
-`/pnl` 会分别显示目标钱包和跟随钱包。实盘模式下，24H、7D、30D 使用账户净值历史计算；充值或提现也会影响净值变化。模拟模式没有跟随钱包的链上历史，因此这些周期显示为暂无数据。
+`/pnl` 会打印目标钱包与跟随钱包的完整 42 位地址，方便直接核对、复制到区块浏览器，而不是 `0x62f8…e7ac` 这类截断形式。实盘模式下，24H、7D、30D 使用账户净值历史计算；充值或提现也会影响净值变化。模拟模式没有跟随钱包的链上历史，因此这些周期显示为暂无数据。
+
+每小时报告的第一行是跟单状态：
+
+```text
+🤖 跟单状态：🟢 正在跟单
+🤖 跟单状态：⏸️ 暂停跟单，自 10-31 08:28 起（持仓保留，不复制新成交与挂单）
+🤖 跟单状态：🔴 已停止（不再复制任何成交）
+```
+
+暂停后仍会每小时发报（用于确认进程还活着），所以状态行是区分“在跑”和“被我停了”的唯一依据。`🔴 已停止` 只在进程即将退出时出现，正常停机由单独的关机通知负责。
 
 ### 排行榜与地址查询
 
@@ -266,15 +322,30 @@ docker compose up -d --build
 
 ### 只收到小时报告，没有跟单
 
-检查目标是否真的有新的 `Open` 或 `Add` 成交；`Close` 或 `Reduce` 成交只有在跟随账户已有相同仓位时才会发送平仓单。用以下命令查看相关日志：
+先看报告第一行的 `🤖 跟单状态`：
+
+- `⏸️ 暂停跟单`：被 `/pause` 或 `MAX_ACCOUNT_EQUITY` 自动暂停了。前者发 `/resume` 恢复；后者要先确认账户权益已回落再恢复，否则下一笔又会触发暂停。
+- `🔴 已停止`：进程收到过 `/stop`，`/resume` 会被忽略，必须重启容器。
+
+状态是 `🟢 正在跟单` 时，再检查目标是否真的有新的 `Open` 或 `Add` 成交；`Close` 或 `Reduce` 成交只有在跟随账户已有相同仓位时才会发送平仓单。用以下命令查看相关日志：
 
 ```bash
 docker compose logs --since 24h copy-trader | grep -E 'FILL DETECTED|Fill copied|Failed to copy fill|Hyperliquid rejected'
 ```
 
+如果日志里成交笔数正常但没有下单，注意 `$10` 最低名义额：目标的小额碎片化成交（例如 SKHX 常见的中位单笔 `$1,250`，按 `1%` 比例只有 `$12.5`）刚好在门槛附近，更小的会被跳过并单独推送 Telegram 通知。
+
+### 日志出现 `Unknown asset symbol`
+
+说明成交里的币种不在当前资产表中。程序会立刻刷新一次资产表重试；仍找不到时，该币种在 `ASSET_METADATA_TTL_SECONDS`（默认 300 秒）内不再触发刷新，避免一个不支持的标的把每笔成交都变成一次资产表拉取。
+
+先确认拼写：builder DEX 标的是 `{dex}:{coin}`，dex 名区分行情来源，例如 `xyz:SKHX`（`perpDexs` 里的名字），而不是 `SKHX` 或 `SKHX-USD`。若确认拼写正确，可能是刚上架、索引尚未同步，等一个缓存周期再看。
+
 ### 余额显示为 0
 
-请将 USDC 从 Hyperliquid 的 Spot 账户转入 Perp 账户。实盘下单和仓位保证金只使用 Perp 余额。
+`standard` 模式下，请将 USDC 从 Hyperliquid 的 Spot 账户转入 Perp 账户；该模式下每个 HIP-3 DEX 的保证金也是独立的，资金需要位于目标标的所属的 DEX 或默认 Perp 账户。
+
+`unified` 模式下同一抵押币种的余额在现货与支持该币种的 Perp 市场间共用，但仍不能跨抵押币种互换。跟单时以 `activeAssetData` 返回的 `availableToTrade` 为准：`/positions` 里的余额为 0、而 `availableToTrade` 有额度属于正常情况，下单不会被拦。
 
 ## 本地运行
 

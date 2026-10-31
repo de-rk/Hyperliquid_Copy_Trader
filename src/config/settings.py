@@ -9,6 +9,31 @@ load_dotenv()
 
 _UNLIMITED_TOKENS = {'x', 'none', 'unlimited', 'off', 'false'}
 
+# Which existing target positions may be copied at startup.
+#   all    -> copy every open position (historical behaviour)
+#   loss   -> only positions the target is currently underwater on
+#   profit -> only positions the target is currently in profit on
+_PNL_FILTER_ALIASES = {
+    'all': 'all', 'any': 'all', 'both': 'all', 'none': 'all', 'off': 'all',
+    'loss': 'loss', 'losing': 'loss', 'losers': 'loss',
+    'underwater': 'loss', 'negative': 'loss', 'red': 'loss',
+    'profit': 'profit', 'profitable': 'profit', 'winning': 'profit',
+    'winners': 'profit', 'positive': 'profit', 'green': 'profit',
+}
+
+
+def normalize_pnl_filter(value: Optional[str], default: str = 'all') -> str:
+    """Map a user-facing existing-position filter to 'all' | 'loss' | 'profit'."""
+    if value is None or not str(value).strip():
+        return default
+    token = str(value).strip().lower()
+    if token in _PNL_FILTER_ALIASES:
+        return _PNL_FILTER_ALIASES[token]
+    raise ValueError(
+        "COPY_OPEN_PNL_FILTER must be one of all/loss/profit, "
+        f"got {value!r}"
+    )
+
 
 def _optional_limit(name: str, default: Optional[float]) -> Optional[float]:
     """Read an optional dollar cap from the environment.
@@ -61,6 +86,10 @@ class CopyRulesConfig(BaseModel):
     copy_existing_positions: bool = True
     copy_existing_orders: bool = True
     copy_open_positions: bool = True
+    # Existing-position PnL scope: "all" | "loss" | "profit".
+    # "loss" copies only the positions the target is currently losing on, so
+    # the follower enters at a better price than the target's own entry.
+    copy_open_pnl_filter: str = "all"
     # Mirror target resting orders immediately and cancel the follower order
     # when the target order is cancelled/expired/rejected.
     mirror_pending_orders: bool = True
@@ -144,6 +173,9 @@ class Settings(BaseModel):
         # Copy trading settings
         copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'true').lower()
         settings.copy_rules.copy_open_positions = copy_open_pos in ('true', '1', 'yes')
+        settings.copy_rules.copy_open_pnl_filter = normalize_pnl_filter(
+            os.getenv('COPY_OPEN_PNL_FILTER')
+        )
         
         copy_orders = os.getenv('COPY_EXISTING_ORDERS', 'true').lower()
         settings.copy_rules.copy_existing_orders = copy_orders in ('true', '1', 'yes')

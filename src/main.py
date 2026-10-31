@@ -96,6 +96,64 @@ def perp_dex_for_symbol(symbol: str) -> str:
     return ""
 
 
+def position_unrealized_pnl(position) -> float:
+    """Unrealized PnL of one target position, preferring the exchange value.
+
+    Falls back to a price-based estimate when the venue omits ``unrealizedPnl``.
+    ``current_price`` is derived from ``positionValue``, whose sign convention
+    differs between long and short positions, so the magnitude is used.
+    """
+    pnl = float(getattr(position, "unrealized_pnl", 0.0) or 0.0)
+    if pnl != 0.0:
+        return pnl
+
+    entry = float(getattr(position, "entry_price", 0.0) or 0.0)
+    mark = abs(float(getattr(position, "current_price", 0.0) or 0.0))
+    size = abs(float(getattr(position, "size", 0.0) or 0.0))
+    if entry <= 0 or mark <= 0 or size <= 0:
+        return 0.0
+
+    signed_size = size if position.side == PositionSide.LONG else -size
+    return (mark - entry) * signed_size
+
+
+def select_existing_positions(positions, pnl_filter: str = "all") -> list:
+    """Return the existing target positions that may be copied at startup.
+
+    ``all`` keeps the previous behaviour (every open position). ``loss`` only
+    keeps positions the target is currently underwater on: entering the same
+    side now gives the follower a better average price than the target has.
+    ``profit`` keeps the winners, which means paying a worse price than the
+    target — useful only for mirroring a momentum book.
+    """
+    selected = []
+    skipped_in_profit = 0
+    skipped_at_loss = 0
+
+    for position in positions or []:
+        pnl = position_unrealized_pnl(position)
+        if pnl_filter == "loss" and pnl >= 0:
+            skipped_in_profit += 1
+            continue
+        if pnl_filter == "profit" and pnl <= 0:
+            skipped_at_loss += 1
+            continue
+        selected.append(position)
+
+    if pnl_filter == "loss" and skipped_in_profit:
+        logger.warning(
+            f"PnL filter 'loss': skipping {skipped_in_profit} existing position(s) "
+            "the target is not losing on"
+        )
+    if pnl_filter == "profit" and skipped_at_loss:
+        logger.warning(
+            f"PnL filter 'profit': skipping {skipped_at_loss} existing position(s) "
+            "the target is not profiting on"
+        )
+
+    return selected
+
+
 def copying_status() -> str:
     """Describe whether new target activity is being copied right now.
 
@@ -2417,6 +2475,7 @@ async def main():
     logger.info("")
     logger.info(f"📊 Fetching initial state...")
     state = await monitor.get_current_state()
+    startup_positions: list = []
     
     if state:
         target_balance = await client.get_portfolio_account_value(target_address)
@@ -2427,6 +2486,19 @@ async def main():
         logger.info(f"   Account Equity: ${target_balance:,.2f}")
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
         logger.info(f"   Open Positions: {len(state.positions)}")
+
+        # Existing-position copy scope. ``all`` keeps the historical behaviour;
+        # ``loss`` only mirrors positions the target is currently underwater on,
+        # so the follower enters at a better price than the target did.
+        startup_pnl_filter = settings.copy_rules.copy_open_pnl_filter
+        startup_positions = select_existing_positions(
+            state.positions, startup_pnl_filter
+        )
+        if startup_pnl_filter != "all":
+            logger.info(
+                f"   PnL Filter: {startup_pnl_filter} -> copying "
+                f"{len(startup_positions)}/{len(state.positions)} position(s)"
+            )
         
         # In live mode, size against the follower wallet's actual balance.
         if not settings.simulated_trading:
@@ -2460,9 +2532,9 @@ async def main():
             logger.success(f"   This means: For every ${int(1/auto_ratio)} target trades, you copy ${1}")
         
         # Calculate minimum balance needed for $10 minimum order size
-        if state.positions:
+        if startup_positions:
             # Find smallest target position value
-            smallest_target_value = min(abs(pos.size) * pos.entry_price for pos in state.positions)
+            smallest_target_value = min(abs(pos.size) * pos.entry_price for pos in startup_positions)
             # Calculate minimum balance needed to copy at $10
             min_balance_needed = MIN_POSITION_SIZE_USD * (target_balance / smallest_target_value)
             
@@ -2473,21 +2545,21 @@ async def main():
             logger.info(f"   Min Balance Needed (for this ratio): ${min_balance_needed:,.2f}")
             
             if simulated_balance < min_balance_needed:
-                positions_below_min = sum(1 for pos in state.positions 
+                positions_below_min = sum(1 for pos in startup_positions 
                                          if (abs(pos.size) * pos.entry_price * auto_ratio) < MIN_POSITION_SIZE_USD)
                 logger.warning(f"   ⚠️  WARNING: Your balance ${simulated_balance:,.2f} is below recommended minimum!")
-                logger.warning(f"   {positions_below_min} out of {len(state.positions)} positions will be SKIPPED (below $10)")
+                logger.warning(f"   {positions_below_min} out of {len(startup_positions)} positions will be SKIPPED (below $10)")
                 logger.warning(f"   Consider increasing balance to ${min_balance_needed:,.2f} to copy all positions")
             else:
                 logger.success(f"   ✅ Your balance is sufficient to copy all positions!")
         
-        if state.positions:
+        if startup_positions:
             logger.info("")
             logger.info(f"📊 Current Positions:")
             logger.info(f"=" * 60)
             
             total_simulated_margin = 0
-            for i, pos in enumerate(state.positions, 1):
+            for i, pos in enumerate(startup_positions, 1):
                 target_position_value = abs(pos.size) * pos.entry_price
                 your_position_value = target_position_value * auto_ratio
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
@@ -2529,7 +2601,7 @@ async def main():
                 )
                 if capped_position_value < MIN_POSITION_SIZE_USD:
                     logger.warning(
-                        f"⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}; "
+                        f"⚠️  Skipping Position {i}/{len(startup_positions)}: {pos.symbol}; "
                         f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
                     )
                     continue
@@ -2548,13 +2620,19 @@ async def main():
                 logger.info(f"   Position {i}: {pos.symbol} {pos.side.value.upper()}")
                 logger.info(f"   Target: {pos.size:.4f} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
                 logger.info(f"   Target Value: ${target_position_value:,.2f}")
+                logger.info(f"   Target Unrealized PnL: ${position_unrealized_pnl(pos):,.2f}")
                 logger.success(f"   → Your Copy: {your_size:.4f} @ ${pos.entry_price:,.2f} ({your_leverage}x)")
                 logger.success(f"   → Your Value: ${your_position_value:,.2f}")
                 logger.success(f"   → Margin Needed: ${margin_needed:,.2f}")
             
             logger.info("")
             logger.info("=" * 60)
-            logger.warning(f"📊 If you copied all {len(state.positions)} positions:")
+            scope_note = (
+                "" if startup_pnl_filter == "all"
+                else f" (PnL filter: {startup_pnl_filter},"
+                     f" {len(startup_positions)}/{len(state.positions)} selected)"
+            )
+            logger.warning(f"📊 If you copied all {len(startup_positions)} positions{scope_note}:")
             logger.warning(f"   Total Margin Needed: ${total_simulated_margin:,.2f}")
             logger.warning(f"   Your Balance: ${simulated_balance:,.2f}")
             logger.warning(f"   Remaining: ${simulated_balance - total_simulated_margin:,.2f}")
@@ -2580,6 +2658,10 @@ async def main():
         f"{settings.copy_rules.pending_order_merge_window_seconds:g}s"
     )
     logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
+    logger.info(f"   Copy Existing Positions: {settings.copy_rules.copy_open_positions}")
+    logger.info(
+        f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
+    )
     
     position_sizer = PositionSizer(
         mode=settings.sizing.mode,
@@ -2592,13 +2674,18 @@ async def main():
     configure_monitor_callbacks(monitor)
     
     # Copy existing positions if enabled
-    if settings.copy_rules.copy_open_positions and state and state.positions:
+    if settings.copy_rules.copy_open_positions and startup_positions:
         logger.info("=" * 60)
         logger.success("🔄 COPYING EXISTING POSITIONS ON STARTUP")
+        if settings.copy_rules.copy_open_pnl_filter != "all":
+            logger.warning(
+                f"   PnL filter: {settings.copy_rules.copy_open_pnl_filter} "
+                f"({len(startup_positions)}/{len(state.positions)} positions)"
+            )
         logger.info("=" * 60)
         
         copied_count = 0
-        for i, pos in enumerate(state.positions, 1):
+        for i, pos in enumerate(startup_positions, 1):
             try:
                 # Calculate your copy
                 target_position_value = abs(pos.size) * pos.entry_price
@@ -2643,7 +2730,7 @@ async def main():
                 )
                 if capped_position_value < MIN_POSITION_SIZE_USD:
                     logger.warning(
-                        f"⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}; "
+                        f"⚠️  Skipping Position {i}/{len(startup_positions)}: {pos.symbol}; "
                         f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
                     )
                     continue
@@ -2660,14 +2747,15 @@ async def main():
                 # Check minimum position size
                 if your_position_value < MIN_POSITION_SIZE_USD:
                     logger.warning("")
-                    logger.warning(f"⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}")
+                    logger.warning(f"⚠️  Skipping Position {i}/{len(startup_positions)}: {pos.symbol}")
                     logger.warning(f"   Position value ${your_position_value:.2f} below Hyperliquid minimum ${MIN_POSITION_SIZE_USD:.2f}")
                     continue
                 
                 logger.info("")
-                logger.info(f"📊 Copying Position {i}/{len(state.positions)}: {pos.symbol}")
+                logger.info(f"📊 Copying Position {i}/{len(startup_positions)}: {pos.symbol}")
                 logger.info(f"   Target: {pos.size:.4f} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
                 logger.info(f"   Target Value: ${target_position_value:,.2f}")
+                logger.info(f"   Target Unrealized PnL: ${position_unrealized_pnl(pos):,.2f}")
                 logger.success(f"   → Your Size: {your_size:.4f} @ ${pos.entry_price:,.2f} ({your_leverage}x)")
                 logger.success(f"   → Your Value: ${your_position_value:,.2f}")
                 logger.success(f"   → Margin: ${margin_needed:,.2f}")
@@ -2709,7 +2797,7 @@ async def main():
             logger.success("✅ EXISTING POSITIONS COPIED!")
             logger.info("=" * 60)
             logger.success(f"💰 Simulated Account Update:")
-            logger.success(f"   Total Positions Copied: {copied_count}/{len(state.positions)}")
+            logger.success(f"   Total Positions Copied: {copied_count}/{len(startup_positions)}")
             logger.success(f"   Total Margin Used: ${total_margin_used:,.2f}")
             logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
             logger.success(f"   Available Balance: ${simulated_balance - total_margin_used:,.2f}")
@@ -2779,12 +2867,21 @@ async def main():
             )
             logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
             logger.info(f"   Open Positions: {len(state.positions)}")
+            if settings.copy_rules.copy_open_pnl_filter != "all":
+                logger.info(
+                    f"   Existing Position PnL Filter: "
+                    f"{settings.copy_rules.copy_open_pnl_filter}"
+                )
             
             if state.positions:
                 logger.info("")
                 logger.info(f" Current Positions:")
                 for i, pos in enumerate(state.positions, 1):
-                    logger.info(f"   {i}. {pos.symbol} {pos.side.value.upper()}: {pos.size} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
+                    logger.info(
+                        f"   {i}. {pos.symbol} {pos.side.value.upper()}: {pos.size} "
+                        f"@ ${pos.entry_price:,.2f} ({pos.leverage}x) "
+                        f"PnL ${position_unrealized_pnl(pos):,.2f}"
+                    )
         
         # Copy existing open orders if configured
         if settings.copy_rules.copy_existing_orders and state and state.orders:
@@ -2810,6 +2907,9 @@ async def main():
         logger.info(f"🔌 Starting monitoring...")
         logger.info("✅ Bot is now LIVE and monitoring for trades!")
         logger.info(f"   Copy Open Positions: {settings.copy_rules.copy_open_positions}")
+        logger.info(
+            f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
+        )
         logger.info(f"   Copy Existing Orders: {settings.copy_rules.copy_existing_orders}")
         logger.info(f"   Mirror Pending Orders: {settings.copy_rules.mirror_pending_orders}")
         logger.info(
