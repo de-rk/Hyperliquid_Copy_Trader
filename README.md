@@ -264,7 +264,7 @@ LOG_FILE=./logs/trading.log
 
 填写 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID` 后，机器人会发送中文通知，并支持：
 
-- `/status` 查看运行状态和跟随账户信息
+- `/status` 查看运行状态和跟随账户信息（末尾附带当前的追入旧仓位策略）
 - `/positions` 查看当前仓位
 - `/orders` 查看挂单
 - `/pnl` 查看收益摘要，含目标钱包与跟随钱包的完整地址
@@ -287,6 +287,15 @@ LOG_FILE=./logs/trading.log
 ```
 
 暂停后仍会每小时发报（用于确认进程还活着），所以状态行是区分“在跑”和“被我停了”的唯一依据。`🔴 已停止` 只在进程即将退出时出现，正常停机由单独的关机通知负责。
+
+启动通知和 `/status` 末尾都会显示当前的旧仓位追入策略，取值来自同一处逻辑：
+
+```text
+• 追入旧仓位：不追入（只跟启动后的新成交）        COPY_OPEN_POSITIONS=false
+• 追入旧仓位：只追浮亏仓位（你在更好的价位进场）   COPY_OPEN_POSITIONS=true, COPY_OPEN_PNL_FILTER=loss
+• 追入旧仓位：只追浮盈仓位（等于追高）             COPY_OPEN_POSITIONS=true, COPY_OPEN_PNL_FILTER=profit
+• 追入旧仓位：全部已有仓位                         COPY_OPEN_POSITIONS=true, COPY_OPEN_PNL_FILTER=all
+```
 
 ### 排行榜与地址查询
 

@@ -175,6 +175,22 @@ def copying_status() -> str:
     return "🟢 正在跟单"
 
 
+def existing_position_policy_text() -> str:
+    """Describe how startup copies treat the target's already-open positions.
+
+    Lives next to the code that applies the rule so the log, /status and the
+    startup notification cannot describe three different policies.
+    """
+    if not settings.copy_rules.copy_open_positions:
+        return "不追入（只跟启动后的新成交）"
+    rule = settings.copy_rules.copy_open_pnl_filter
+    if rule == "loss":
+        return "只追浮亏仓位（你在更好的价位进场）"
+    if rule == "profit":
+        return "只追浮盈仓位（等于追高）"
+    return "全部已有仓位"
+
+
 def calculate_scaled_close_size(
     target_fill_size: float,
     target_pre_close_size: float,
@@ -1920,6 +1936,7 @@ async def get_status() -> str:
 
 <b>仓位模式：</b>{settings.sizing.mode.title()}
 <b>杠杆：</b>目标杠杆的 {settings.leverage.adjustment_ratio} 倍
+<b>追入旧仓位：</b>{existing_position_policy_text()}
     """.strip()
 
 
@@ -2929,7 +2946,8 @@ async def main():
                 target_wallet=settings.target_wallet,
                 sizing_mode=settings.sizing.mode,
                 ratio=f"1:{int(1/settings.sizing.portfolio_ratio)}",
-                leverage_adjustment=settings.leverage.adjustment_ratio
+                leverage_adjustment=settings.leverage.adjustment_ratio,
+                existing_position_policy=existing_position_policy_text(),
             )
         
         # Start monitoring

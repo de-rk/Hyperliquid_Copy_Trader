@@ -222,9 +222,15 @@ class NotificationService:
         target_wallet: str,
         sizing_mode: str,
         ratio: str,
-        leverage_adjustment: float
+        leverage_adjustment: float,
+        existing_position_policy: str = "",
     ):
         """Send bot startup notification"""
+        policy_line = (
+            f"• 追入旧仓位：{existing_position_policy}\n"
+            if existing_position_policy
+            else ""
+        )
         message = f"""
 🚀 <b>跟单机器人已启动</b>
 
@@ -235,7 +241,7 @@ class NotificationService:
 • 仓位模式：{sizing_mode.title()}
 • 资金比例：{ratio}
 • 杠杆：目标杠杆的 {leverage_adjustment} 倍
-• 状态：<b>运行中</b> 🟢
+{policy_line}• 状态：<b>运行中</b> 🟢
 
 正在监听目标钱包的新挂单、撤单和成交。
 """
