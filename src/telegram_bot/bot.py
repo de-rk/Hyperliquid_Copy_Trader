@@ -44,6 +44,7 @@ class TelegramBot:
         self.on_follow_requested: Optional[Callable] = None
         self.on_pause_requested: Optional[Callable] = None
         self.on_resume_requested: Optional[Callable] = None
+        self.on_copy_existing_requested: Optional[Callable] = None
         self.get_status_callback: Optional[Callable] = None
         self.get_orders_callback: Optional[Callable] = None
         self.get_pnl_callback: Optional[Callable] = None
@@ -77,6 +78,7 @@ class TelegramBot:
 /leaderboard - 查看公开收益排行榜
 /wallet 地址 [数量] - 查询公开账户收益和最近成交
 /follow 地址 - 更换跟单目标钱包
+/copyloss [loss|all|profit] [confirm] - 按现价一键复制目标现有仓位（默认只复制浮亏的；先预览，加 confirm 执行）
 /pause - 暂停复制新成交，保留仓位
 /resume - 恢复复制
 /stop - 停止机器人，可选择是否平仓
@@ -121,6 +123,36 @@ class TelegramBot:
             logger.error(f"Error switching follow wallet: {exc}")
             await update.message.reply_text(f"❌ 更换跟单地址失败：{exc}")
     
+    async def _copyloss_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /copyloss - one-shot copy of the target's open positions.
+
+        Two-step on purpose: without ``confirm`` it only previews what would be
+        bought, because in live mode this places real market orders.
+        """
+        if not self._check_authorized(update):
+            await update.message.reply_text("⛔ 未授权的聊天")
+            return
+        if not self.on_copy_existing_requested:
+            await update.message.reply_text("一键复制功能尚未配置")
+            return
+
+        args = [arg.strip().lower() for arg in (context.args or [])]
+        mode = "loss"
+        confirm = False
+        for arg in args:
+            if arg in ("confirm", "go", "yes", "执行"):
+                confirm = True
+            else:
+                mode = arg
+
+        try:
+            await update.message.reply_text("⏳ 正在读取目标持仓...", parse_mode="HTML")
+            result = await self.on_copy_existing_requested(mode, confirm)
+            await update.message.reply_text(result, parse_mode="HTML")
+        except Exception as exc:
+            logger.error(f"Error in one-shot copy: {exc}")
+            await update.message.reply_text(f"❌ 一键复制失败：{exc}")
+
     async def _positions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Keep /positions as a backward-compatible alias for /status."""
         await self._status_command(update, context)
@@ -432,6 +464,7 @@ class TelegramBot:
             BotCommand("pnl", "查看收益摘要"),
             BotCommand("wallet", "查询公开账户"),
             BotCommand("follow", "更换跟单目标钱包"),
+            BotCommand("copyloss", "一键按现价复制目标现有仓位"),
             BotCommand("leaderboard", "查看收益排行榜"),
             BotCommand("pause", "暂停成交跟单"),
             BotCommand("resume", "恢复暂停的跟单"),
@@ -449,6 +482,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("start", self._start_command))
         self.app.add_handler(CommandHandler("status", self._status_command))
         self.app.add_handler(CommandHandler("follow", self._follow_command))
+        self.app.add_handler(CommandHandler("copyloss", self._copyloss_command))
         self.app.add_handler(CommandHandler("positions", self._positions_command))
         self.app.add_handler(CommandHandler("orders", self._orders_command))
         self.app.add_handler(CommandHandler("pause", self._pause_command))

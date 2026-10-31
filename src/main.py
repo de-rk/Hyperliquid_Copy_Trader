@@ -9,7 +9,7 @@ import re
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 from loguru import logger
-from config.settings import settings
+from config.settings import normalize_pnl_filter, settings
 from utils.logger import setup_logger
 from hyperliquid.client import HyperliquidClient
 from hyperliquid.websocket import HyperliquidWebSocket
@@ -86,6 +86,8 @@ pending_target_fills: dict[str, list[dict]] = {}
 # Serializes follower exchange actions with /stop. Without this, a mirror
 # coroutine that passed its stop check could submit just after /stop cancels.
 trade_execution_lock = asyncio.Lock()
+# Serializes the /copyloss command; a double tap must not double the position.
+copy_existing_lock = asyncio.Lock()
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -201,6 +203,229 @@ def calculate_scaled_close_size(
         return 0.0, 0.0
     close_ratio = min(1.0, target_fill_size / target_pre_close_size)
     return min(follower_size, follower_size * close_ratio), close_ratio
+
+
+async def copy_existing_position_snapshot(
+    pos,
+    auto_ratio: float,
+    index: int,
+    total: int,
+) -> tuple[bool, str]:
+    """Copy one currently-open target position at the live market price.
+
+    Shared by the startup catch-up and the /copyloss command so sizing,
+    leverage clamping, margin caps and the simulated book can never drift
+    between the two paths. Returns ``(success, failure_reason)``.
+    """
+    target_position_value = abs(pos.size) * pos.entry_price
+    requested_position_value = target_position_value * auto_ratio
+    your_leverage = calculate_adjusted_leverage(
+        target_leverage=pos.leverage,
+        adjustment_ratio=settings.leverage.adjustment_ratio,
+        symbol=pos.symbol,
+        max_leverage=await executor.get_max_leverage(pos.symbol),
+    )
+
+    follower_dex_state = None
+    if not settings.simulated_trading:
+        current_follower_state = await client.get_user_state(
+            settings.hyperliquid.wallet_address,
+            dex=perp_dex_for_symbol(pos.symbol),
+        )
+        if current_follower_state is None:
+            logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
+            return False, "无法读取跟随钱包状态"
+        follower_dex_state = current_follower_state
+
+    order_side = OrderSide.BUY if pos.side == PositionSide.LONG else OrderSide.SELL
+    max_order_notional = await get_follower_order_notional_cap(
+        pos.symbol,
+        order_side,
+        your_leverage,
+        dex_state=follower_dex_state,
+        prepare_leverage=True,
+    )
+    if max_order_notional is None:
+        logger.error(f"   ❌ Cannot read available order capacity for {pos.symbol}")
+        return False, "无法读取可交易额度"
+
+    capped_position_value = cap_position_value(
+        requested_position_value,
+        max_order_notional,
+        settings.sizing.max_position_size,
+    )
+    if capped_position_value < MIN_POSITION_SIZE_USD:
+        logger.warning(
+            f"⚠️  Skipping Position {index}/{total}: {pos.symbol}; "
+            f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
+        )
+        return False, (
+            f"可下单金额 ${capped_position_value:.2f} 低于交易所最低 "
+            f"${MIN_POSITION_SIZE_USD:.2f}"
+        )
+    if capped_position_value < requested_position_value:
+        logger.warning(
+            f"⚠️  Capping {pos.symbol} copy from "
+            f"${requested_position_value:,.2f} to ${capped_position_value:,.2f} "
+            f"(available-margin or position-cap limit)"
+        )
+
+    your_position_value = capped_position_value
+    your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
+    margin_needed = your_position_value / your_leverage
+
+    logger.info("")
+    logger.info(f"📊 Copying Position {index}/{total}: {pos.symbol}")
+    logger.info(f"   Target: {pos.size:.4f} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
+    logger.info(f"   Target Value: ${target_position_value:,.2f}")
+    logger.info(f"   Target Unrealized PnL: ${position_unrealized_pnl(pos):,.2f}")
+    logger.success(f"   → Your Size: {your_size:.4f} @ ${pos.entry_price:,.2f} ({your_leverage}x)")
+    logger.success(f"   → Your Value: ${your_position_value:,.2f}")
+    logger.success(f"   → Margin: ${margin_needed:,.2f}")
+
+    result = await executor.execute_market_order(
+        symbol=pos.symbol,
+        side=order_side,
+        size=your_size,
+        leverage=your_leverage,
+    )
+    if not result:
+        logger.error("   ❌ Failed to copy position")
+        return False, "下单失败（见容器日志）"
+
+    if settings.simulated_trading:
+        simulated_positions[pos.symbol] = {
+            'size': your_size if pos.side == PositionSide.LONG else -your_size,
+            'entry_price': pos.entry_price,
+            'side': pos.side.value.upper(),
+            'leverage': your_leverage,
+            'value': your_position_value,
+            'margin_used': margin_needed
+        }
+
+    logger.success("   ✅ Position copied successfully!")
+    return True, ""
+
+
+async def handle_copy_existing(mode: str = "loss", confirm: bool = False) -> str:
+    """One-shot copy of the target's currently open positions via Telegram.
+
+    Defaults to the losing book: the follower always fills at the live price,
+    so a target that is underwater gives the follower the better entry. Runs
+    in two steps (preview, then ``confirm``) because it places real orders in
+    live mode.
+    """
+    if is_stopped:
+        return "🔴 机器人已停止，无法执行。请重启容器后再使用。"
+    if not client or not executor or not monitor:
+        return "❌ 机器人尚未就绪，请稍后再试。"
+
+    try:
+        rule = normalize_pnl_filter(mode)
+    except ValueError:
+        return (
+            "❌ 无效的范围参数。\n\n"
+            "用法：<code>/copyloss [loss|all|profit] [confirm]</code>\n"
+            "默认 <code>loss</code>：按现价买入目标当前浮亏的仓位。"
+        )
+
+    state = await monitor.get_current_state()
+    if not state:
+        return "❌ 无法读取目标钱包当前状态，请稍后再试。"
+
+    target_equity = await client.get_portfolio_account_value(settings.target_wallet)
+    if not target_equity or target_equity <= 0:
+        return "❌ 无法读取目标钱包净值，无法计算跟单比例。"
+
+    if settings.simulated_trading:
+        follower_equity = simulated_balance
+    else:
+        follower_equity = await get_follower_balance()
+    if not follower_equity or follower_equity <= 0:
+        return "❌ 无法读取跟随钱包净值，无法计算跟单比例。"
+
+    auto_ratio = follower_equity / target_equity
+    candidates = select_existing_positions(state.positions, rule)
+    held_symbols = await _follower_position_symbols()
+    fresh = [p for p in candidates if p.symbol not in held_symbols]
+    skipped_held = [p.symbol for p in candidates if p.symbol in held_symbols]
+
+    if not candidates:
+        scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "可复制"}[rule]
+        return (
+            f"ℹ️ 目标当前没有{scope_name}仓位"
+            f"（共 {len(state.positions)} 个持仓），无需操作。"
+        )
+
+    scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "全部"}[rule]
+    ratio_text = f"1:{int(1 / auto_ratio)}" if auto_ratio > 0 else "0"
+    lines = [
+        f"🎯 <b>一键复制目标{scope_name}仓位{'（预览）' if not confirm else ''}</b>",
+        "",
+        f"目标净值 ${target_equity:,.2f}｜跟随净值 ${follower_equity:,.2f}"
+        f"（比例 {ratio_text}）",
+    ]
+    total_your_value = 0.0
+    for pos in fresh:
+        target_value = abs(pos.size) * pos.entry_price
+        your_value = target_value * auto_ratio
+        total_your_value += your_value
+        pnl = position_unrealized_pnl(pos)
+        marker = "⚠️ 低于交易所 $10 最低，将被跳过" if your_value < MIN_POSITION_SIZE_USD else ""
+        line = (
+            f"• {html.escape(pos.symbol)} {pos.side.value.upper()}｜"
+            f"目标 ${target_value:,.0f}｜你 ≈ ${your_value:,.0f}｜"
+            f"PnL ${pnl:+,.0f}｜{pos.leverage}x"
+        )
+        lines.append(f"{line}{('｜' + marker) if marker else ''}")
+    for symbol in skipped_held:
+        lines.append(f"• {html.escape(symbol)}：跟随钱包已持有，跳过（避免重复买入）")
+    lines.append(f"\n将按<b>当前市价</b>下单，合计 ≈ ${total_your_value:,.2f}。")
+
+    if not confirm:
+        lines.append(
+            f"确认无误请发送 <code>/copyloss {rule} confirm</code> 执行。"
+            if not settings.simulated_trading
+            else f"模拟模式：发送 <code>/copyloss {rule} confirm</code> 执行演练。"
+        )
+        return "\n".join(lines)
+
+    if copy_existing_lock.locked():
+        return "⏳ 上一次一键复制仍在执行，请稍后再试。"
+
+    async with copy_existing_lock:
+        copied = 0
+        failures: list[str] = []
+        for i, pos in enumerate(fresh, 1):
+            try:
+                success, reason = await copy_existing_position_snapshot(
+                    pos, auto_ratio, i, len(fresh)
+                )
+                if success:
+                    copied += 1
+                else:
+                    failures.append(f"{html.escape(pos.symbol)}（{reason}）")
+            except Exception as exc:
+                logger.error(f"/copyloss failed for {pos.symbol}: {exc}")
+                failures.append(f"{html.escape(pos.symbol)}（异常：{exc}）")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"✅ 执行完成：成功 {copied}/{len(fresh)}")
+    if failures:
+        lines.append("失败：" + "；".join(failures))
+    if is_paused:
+        lines.append("⚠️ 机器人处于暂停状态：本次是手动下单，自动跟单仍未恢复。")
+    return "\n".join(lines)
+
+
+async def _follower_position_symbols() -> set[str]:
+    """Symbols the follower already holds, for one-click-copy dedup."""
+    if settings.simulated_trading:
+        return set(simulated_positions.keys())
+    follower_state = await _get_follower_state()
+    if not follower_state:
+        return set()
+    return {position.symbol for position in follower_state.positions}
 
 
 def configure_monitor_callbacks(wallet_monitor: WalletMonitor) -> None:
@@ -2704,105 +2929,11 @@ async def main():
         copied_count = 0
         for i, pos in enumerate(startup_positions, 1):
             try:
-                # Calculate your copy
-                target_position_value = abs(pos.size) * pos.entry_price
-                your_position_value = target_position_value * auto_ratio
-                your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
-                your_leverage = calculate_adjusted_leverage(
-                    target_leverage=pos.leverage,
-                    adjustment_ratio=settings.leverage.adjustment_ratio,
-                    symbol=pos.symbol,
-                    max_leverage=await executor.get_max_leverage(pos.symbol),
+                ok, _ = await copy_existing_position_snapshot(
+                    pos, auto_ratio, i, len(startup_positions)
                 )
-                follower_dex_state = None
-                if not settings.simulated_trading:
-                    current_follower_state = await client.get_user_state(
-                        settings.hyperliquid.wallet_address,
-                        dex=perp_dex_for_symbol(pos.symbol),
-                    )
-                    if current_follower_state is None:
-                        logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
-                        continue
-                    follower_dex_state = current_follower_state
-
-                order_side = (
-                    OrderSide.BUY if pos.side == PositionSide.LONG else OrderSide.SELL
-                )
-                max_order_notional = await get_follower_order_notional_cap(
-                    pos.symbol,
-                    order_side,
-                    your_leverage,
-                    dex_state=follower_dex_state,
-                    prepare_leverage=True,
-                )
-                if max_order_notional is None:
-                    logger.error(f"   ❌ Cannot read available order capacity for {pos.symbol}")
-                    continue
-
-                requested_position_value = target_position_value * auto_ratio
-                capped_position_value = cap_position_value(
-                    requested_position_value,
-                    max_order_notional,
-                    settings.sizing.max_position_size,
-                )
-                if capped_position_value < MIN_POSITION_SIZE_USD:
-                    logger.warning(
-                        f"⚠️  Skipping Position {i}/{len(startup_positions)}: {pos.symbol}; "
-                        f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
-                    )
-                    continue
-                if capped_position_value < requested_position_value:
-                    logger.warning(
-                        f"⚠️  Capping {pos.symbol} startup copy from "
-                        f"${requested_position_value:,.2f} to ${capped_position_value:,.2f} "
-                        f"(available-margin or position-cap limit)"
-                    )
-                your_position_value = capped_position_value
-                your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
-                margin_needed = your_position_value / your_leverage
-                
-                # Check minimum position size
-                if your_position_value < MIN_POSITION_SIZE_USD:
-                    logger.warning("")
-                    logger.warning(f"⚠️  Skipping Position {i}/{len(startup_positions)}: {pos.symbol}")
-                    logger.warning(f"   Position value ${your_position_value:.2f} below Hyperliquid minimum ${MIN_POSITION_SIZE_USD:.2f}")
-                    continue
-                
-                logger.info("")
-                logger.info(f"📊 Copying Position {i}/{len(startup_positions)}: {pos.symbol}")
-                logger.info(f"   Target: {pos.size:.4f} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
-                logger.info(f"   Target Value: ${target_position_value:,.2f}")
-                logger.info(f"   Target Unrealized PnL: ${position_unrealized_pnl(pos):,.2f}")
-                logger.success(f"   → Your Size: {your_size:.4f} @ ${pos.entry_price:,.2f} ({your_leverage}x)")
-                logger.success(f"   → Your Value: ${your_position_value:,.2f}")
-                logger.success(f"   → Margin: ${margin_needed:,.2f}")
-                
-                # Execute the copy
-                position_side = pos.side
-                result = await executor.execute_market_order(
-                    symbol=pos.symbol,
-                    side=OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL,
-                    size=your_size,
-                    leverage=your_leverage
-                )
-                
-                if result:
-                    # Update simulated account
-                    if settings.simulated_trading:
-                        simulated_positions[pos.symbol] = {
-                            'size': your_size if position_side == PositionSide.LONG else -your_size,
-                            'entry_price': pos.entry_price,
-                            'side': position_side.value.upper(),
-                            'leverage': your_leverage,
-                            'value': your_position_value,
-                            'margin_used': margin_needed
-                        }
-                    
+                if ok:
                     copied_count += 1
-                    logger.success(f"   ✅ Position copied successfully!")
-                else:
-                    logger.error(f"   ❌ Failed to copy position")
-                    
             except Exception as e:
                 logger.error(f"   ❌ Error copying position {pos.symbol}: {e}")
         
@@ -2856,6 +2987,7 @@ async def main():
         telegram_bot.on_resume_requested = handle_resume
         telegram_bot.on_stop_requested = handle_stop
         telegram_bot.on_follow_requested = handle_follow
+        telegram_bot.on_copy_existing_requested = handle_copy_existing
         
         # Start Telegram bot
         await telegram_bot.start()
