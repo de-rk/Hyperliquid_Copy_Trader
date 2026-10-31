@@ -80,7 +80,7 @@ class TelegramBot:
 /leaderboard - 查看公开收益排行榜
 /wallet 地址 [数量] - 查询公开账户收益和最近成交
 /follow 地址 - 更换跟单目标钱包
-/copyloss [loss|all|profit] [序号...] [confirm] - 手动复制目标现有仓位：先列清单，可只买指定序号，执行后回执
+/copyloss [loss|all|profit] [序号...] [confirm] [force] - 手动复制目标现有仓位：先列清单，可只买指定序号，执行后回执；已持有或刚复制过的会自动拦下，确需叠加再加 force
 /pause - 暂停复制新成交，保留仓位
 /resume - 恢复复制
 /stop - 停止机器人，可选择是否平仓
@@ -132,6 +132,9 @@ class TelegramBot:
         Two steps on purpose: without ``confirm`` it only lists what would be
         bought, because in live mode this places real market orders. Numbers in
         the arguments pick a subset of that list, e.g. ``/copyloss 1 3 confirm``.
+
+        ``force`` bypasses the "already copied this symbol" guard once; the
+        duplicate check itself lives in main so every caller gets it.
         """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
@@ -145,10 +148,14 @@ class TelegramBot:
         # command and the /status policy line cannot disagree.
         mode = None
         confirm = False
+        force = False
         selection: list[int] = []
         for arg in args:
             if arg in ("confirm", "go", "yes", "执行"):
                 confirm = True
+                continue
+            if arg in ("force", "强制", "重复"):
+                force = True
                 continue
             numbers = [part for part in re.split(r"[,，、\s]+", arg) if part]
             if numbers and all(part.isdigit() for part in numbers):
@@ -159,7 +166,7 @@ class TelegramBot:
         try:
             await update.message.reply_text("⏳ 正在读取目标持仓...", parse_mode="HTML")
             result = await self.on_copy_existing_requested(
-                mode, confirm, selection or None
+                mode, confirm, selection or None, force
             )
             await update.message.reply_text(result, parse_mode="HTML")
         except Exception as exc:

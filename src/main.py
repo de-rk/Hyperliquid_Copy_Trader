@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from config.settings import normalize_pnl_filter, settings
 from utils.logger import setup_logger
+from utils import copy_ledger
 from hyperliquid.client import HyperliquidClient
 from hyperliquid.websocket import HyperliquidWebSocket
 from hyperliquid.models import WebSocketUpdate, PositionSide, OrderSide
@@ -207,12 +208,17 @@ async def copy_existing_position_snapshot(
     auto_ratio: float,
     index: int,
     total: int,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Copy one currently-open target position at the live market price.
 
     Returns a receipt record instead of a bare bool: the Telegram receipt has
     to report the size, leverage and order id that actually went out, and
     "failed" alone leaves the user with nothing to check against the exchange.
+
+    Two independent duplicate guards run here, immediately before the order and
+    not once per batch: the follower's live book (read from the same call that
+    prices the order) and the on-disk ledger of earlier manual copies.
     """
     target_position_value = abs(pos.size) * pos.entry_price
     requested_position_value = target_position_value * auto_ratio
@@ -220,6 +226,7 @@ async def copy_existing_position_snapshot(
         "symbol": pos.symbol,
         "side": pos.side.value.upper(),
         "ok": False,
+        "blocked": False,
         "reason": "",
         "size": 0.0,
         "notional": requested_position_value,
@@ -232,14 +239,6 @@ async def copy_existing_position_snapshot(
         "fill_size": None,
     }
 
-    your_leverage = calculate_adjusted_leverage(
-        target_leverage=pos.leverage,
-        adjustment_ratio=settings.leverage.adjustment_ratio,
-        symbol=pos.symbol,
-        max_leverage=await executor.get_max_leverage(pos.symbol),
-    )
-    record["leverage"] = your_leverage
-
     follower_dex_state = None
     if not settings.simulated_trading:
         current_follower_state = await client.get_user_state(
@@ -248,9 +247,31 @@ async def copy_existing_position_snapshot(
         )
         if current_follower_state is None:
             logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
-            record["reason"] = "无法读取跟随钱包状态"
+            record["reason"] = "无法读取跟随钱包状态，已取消（宁可不买也不重复买）"
             return record
         follower_dex_state = current_follower_state
+        held = {
+            position.symbol: position.side.value.upper()
+            for position in current_follower_state.positions
+            if abs(position.size) > 0
+        }
+    else:
+        held = await _follower_positions_by_symbol() or {}
+
+    blocked = copy_guard_block(pos, held, force)
+    if blocked:
+        logger.warning(f"   ⏭  Skipping {pos.symbol}: {blocked['text']}")
+        record["blocked"] = True
+        record["reason"] = blocked["text"]
+        return record
+
+    your_leverage = calculate_adjusted_leverage(
+        target_leverage=pos.leverage,
+        adjustment_ratio=settings.leverage.adjustment_ratio,
+        symbol=pos.symbol,
+        max_leverage=await executor.get_max_leverage(pos.symbol),
+    )
+    record["leverage"] = your_leverage
 
     order_side = OrderSide.BUY if pos.side == PositionSide.LONG else OrderSide.SELL
     max_order_notional = await get_follower_order_notional_cap(
@@ -317,6 +338,16 @@ async def copy_existing_position_snapshot(
     record["size"] = float(your_size)
     record["notional"] = your_position_value
     record["order_id"] = str(result)
+    # Arm the guard before anything else can fail: the order is out, so the
+    # next /copyloss (or a restart) must know about it even if the venue has
+    # not reported the position yet.
+    copy_ledger.record(
+        pos.symbol,
+        pos.side.value.upper(),
+        your_position_value,
+        record["order_id"],
+        simulated=settings.simulated_trading,
+    )
 
     if settings.simulated_trading:
         simulated_positions[pos.symbol] = {
@@ -373,6 +404,11 @@ def _copy_receipt_text(
     lines.append(
         f"合计：成功 {len(filled)}/{len(records)}｜成交名义 ${total_notional:,.2f}"
     )
+    blocked = [record for record in records if record.get("blocked")]
+    if blocked:
+        lines.append(
+            f"下单检查拦下 {len(blocked)} 笔（已持有 / 刚复制过），这些没有下单。"
+        )
     return "\n".join(lines)
 
 
@@ -396,6 +432,7 @@ async def handle_copy_existing(
     mode: Optional[str] = None,
     confirm: bool = False,
     selection: Optional[list[int]] = None,
+    force: bool = False,
 ) -> str:
     """Copy the target's currently open positions on demand, via Telegram.
 
@@ -403,6 +440,12 @@ async def handle_copy_existing(
     numbers every candidate, ``selection`` (1-based) takes a subset, and every
     run ends with a per-position receipt, because the previous auto-copy path
     placed real orders that the user only noticed on the exchange.
+
+    Every candidate passes :func:`copy_guard_block` twice: once for the preview
+    (so the list shows what will be skipped before anything is confirmed) and
+    again inside the snapshot immediately before the order, on a freshly read
+    follower book. ``force`` relaxes the "already copied" rules for deliberate
+    adds; an opposite-side position still blocks.
     """
     if is_stopped:
         return "🔴 机器人已停止，无法执行。请重启容器后再使用。"
@@ -444,16 +487,35 @@ async def handle_copy_existing(
             f"（共 {len(state.positions)} 个持仓），无需操作。"
         )
 
-    held_symbols = await _follower_position_symbols()
-    # Number the whole candidate list, including symbols the follower already
-    # holds: numbering only the copyable subset shifted every index after the
-    # first copy, so re-sending a number silently hit a different position.
-    copyable = [pos for pos in candidates if pos.symbol not in held_symbols]
-    if not copyable:
+    held = await _follower_positions_by_symbol()
+    if held is None:
+        # Fail closed: an unreadable book used to look like "holds nothing",
+        # which is exactly how a duplicate buy can slip through.
         return (
-            f"ℹ️ 目标当前的{scope_name}仓位（{len(candidates)} 个）跟随钱包都已持有，"
-            "无需重复复制。"
+            "❌ 无法读取跟随钱包当前持仓，为避免重复下单已取消。\n"
+            "请稍后重试；若持续失败，检查 API 连接或钱包地址配置。"
         )
+
+    # Number the whole candidate list, including symbols the guard will skip:
+    # numbering only the copyable subset shifted every index after the first
+    # copy, so re-sending a number silently hit a different position.
+    guard: dict[str, dict[str, str]] = {}
+    for pos in candidates:
+        block = copy_guard_block(pos, held, force)
+        if block:
+            guard[pos.symbol] = block
+    copyable = [pos for pos in candidates if pos.symbol not in guard]
+    if not copyable:
+        head = (
+            f"ℹ️ 目标当前的{scope_name}仓位（{len(candidates)} 个）全部命中下单检查，"
+            "本次不会下任何单："
+        )
+        rows = [
+            f"• {html.escape(pos.symbol)}：{html.escape(guard[pos.symbol]['text'])}"
+            for pos in candidates
+        ]
+        tail = "" if force else "\n\n确实要再买一次，请追加 <code>force</code>（反向持仓除外）。"
+        return "\n".join([head, ""] + rows) + tail
 
     chosen = copyable
     if selection:
@@ -486,18 +548,17 @@ async def handle_copy_existing(
         total_your_value += your_value
         pnl = position_unrealized_pnl(pos)
         picked = " ✅" if id(pos) in selected_numbers and selection else ""
-        held_note = (
-            "｜跟随钱包已持有，会跳过" if pos.symbol in held_symbols else ""
-        )
+        blocked = guard.get(pos.symbol)
+        guard_note = blocked["short"] if blocked else ""
         below_min = (
             f"｜⚠️ 低于 ${MIN_POSITION_SIZE_USD:.0f} 最低，将被跳过"
-            if your_value < MIN_POSITION_SIZE_USD and not held_note
+            if your_value < MIN_POSITION_SIZE_USD and not guard_note
             else ""
         )
         lines.append(
             f"{index}. {html.escape(pos.symbol)} {pos.side.value.upper()}｜"
             f"目标 ${target_value:,.0f}｜你 ≈ ${your_value:,.0f}｜"
-            f"PnL ${pnl:+,.0f}｜{pos.leverage}x{picked}{below_min}{held_note}"
+            f"PnL ${pnl:+,.0f}｜{pos.leverage}x{picked}{below_min}{guard_note}"
         )
     lines.append("")
     lines.append(f"全部复制合计 ≈ ${total_your_value:,.2f}。")
@@ -506,24 +567,24 @@ async def handle_copy_existing(
         selected_total = sum(
             abs(pos.size) * pos.entry_price * auto_ratio
             for pos in chosen
-            if pos.symbol not in held_symbols
+            if pos.symbol not in guard
         )
         if selection:
             numbers = " ".join(
                 str(next(i for i, row in enumerate(candidates, 1) if row is pos))
                 for pos in chosen
             )
-            held_chosen = [
-                pos.symbol for pos in chosen if pos.symbol in held_symbols
+            blocked_chosen = [
+                pos.symbol for pos in chosen if pos.symbol in guard
             ]
             lines.append(
-                f"已选 {len(chosen) - len(held_chosen)} 笔，"
+                f"已选 {len(chosen) - len(blocked_chosen)} 笔，"
                 f"合计 ≈ ${selected_total:,.2f}。"
             )
-            if held_chosen:
+            if blocked_chosen:
                 lines.append(
-                    "其中跟随钱包已持有、会跳过："
-                    + "、".join(html.escape(symbol) for symbol in held_chosen)
+                    "其中会被下单检查跳过："
+                    + "、".join(html.escape(symbol) for symbol in blocked_chosen)
                 )
             lines.append(
                 f"发送 <code>/copyloss {rule} {numbers} confirm</code> 执行。"
@@ -546,25 +607,13 @@ async def handle_copy_existing(
     async with copy_existing_lock:
         records: list[dict[str, Any]] = []
         for index, pos in enumerate(chosen, 1):
-            if pos.symbol in held_symbols:
-                records.append({
-                    "symbol": pos.symbol,
-                    "side": pos.side.value.upper(),
-                    "ok": False,
-                    "reason": "跟随钱包已持有，跳过（避免重复买入）",
-                    "size": 0.0,
-                    "notional": 0.0,
-                    "requested_notional": 0.0,
-                    "leverage": 0,
-                    "order_id": None,
-                    "fill_price": None,
-                    "fill_size": None,
-                })
-                continue
+            # No batch-level shortcut: the guard runs inside the snapshot, on
+            # the same live read that prices the order, so a stale list cannot
+            # let a second buy through.
             try:
                 records.append(
                     await copy_existing_position_snapshot(
-                        pos, auto_ratio, index, len(chosen)
+                        pos, auto_ratio, index, len(chosen), force=force
                     )
                 )
             except Exception as exc:
@@ -573,6 +622,7 @@ async def handle_copy_existing(
                     "symbol": pos.symbol,
                     "side": pos.side.value.upper(),
                     "ok": False,
+                    "blocked": False,
                     "reason": f"异常：{exc}",
                     "size": 0.0,
                     "notional": 0.0,
@@ -599,21 +649,100 @@ async def handle_copy_existing(
     rejected = [
         record
         for record in records
-        if not record["ok"] and "已持有" not in str(record["reason"])
+        if not record["ok"] and not record.get("blocked")
     ]
     if rejected:
         notes.append("失败项的原因见上；下单被拒时交易所原文在容器日志里。")
+    if force and any(record["ok"] for record in records):
+        notes.append("⚠️ 本次使用了 force：已绕过“重复复制”检查，仓位可能被叠加。")
     return receipt + ("\n\n" + "\n".join(notes) if notes else "")
 
 
-async def _follower_position_symbols() -> set[str]:
-    """Symbols the follower already holds, for one-click-copy dedup."""
+async def _follower_positions_by_symbol() -> Optional[dict[str, str]]:
+    """Follower positions as ``symbol -> side``, or ``None`` if unreadable.
+
+    ``None`` is deliberately distinct from ``{}``: a failed read used to look
+    like "holds nothing", which is how a duplicate buy could slip through. The
+    caller must refuse to order when the book cannot be read.
+    """
     if settings.simulated_trading:
-        return set(simulated_positions.keys())
+        held: dict[str, str] = {}
+        for symbol, data in simulated_positions.items():
+            size = float(data.get("size", 0.0) or 0.0)
+            if size == 0:
+                continue
+            # Older writers stored only the signed size; derive the side from
+            # it rather than trusting a key that may be missing.
+            side = str(data.get("side") or ("LONG" if size > 0 else "SHORT"))
+            held[symbol] = side.upper()
+        return held
     follower_state = await _get_follower_state()
     if not follower_state:
-        return set()
-    return {position.symbol for position in follower_state.positions}
+        return None
+    return {
+        position.symbol: position.side.value.upper()
+        for position in follower_state.positions
+        if abs(position.size) > 0
+    }
+
+
+def copy_guard_block(
+    pos,
+    held: dict[str, str],
+    force: bool = False,
+) -> Optional[dict[str, str]]:
+    """Why this position must not be bought again right now, or ``None``.
+
+    Three independent checks, because each catches a different duplicate:
+
+    * the follower already holds the same side -> a repeat would silently add;
+    * the follower holds the opposite side -> the order would close or flip it;
+    * a copy of the same symbol/side just went through -> the exchange has not
+      reported the new position yet, so the position check still says "no".
+
+    Returns ``{"code", "text", "short"}``: ``text`` goes into the receipt, and
+    ``short`` into the numbered preview where a full sentence would not fit.
+
+    ``force`` is the escape hatch for deliberately adding to an existing
+    position; it does not override the opposite-side case, which needs the old
+    position closed first.
+    """
+    symbol = pos.symbol
+    wanted = pos.side.value.upper()
+    current = held.get(symbol)
+
+    if current and current != wanted:
+        return {
+            "code": "opposite",
+            "text": f"跟随钱包持有反向 {symbol} {current}，下单会先平掉/反手，已跳过",
+            "short": "｜持有反向仓，跳过",
+        }
+    if current == wanted and not force:
+        return {
+            "code": "held",
+            "text": f"跟随钱包已持有 {symbol} {current}，跳过以免重复加仓",
+            "short": "｜已持有，跳过",
+        }
+
+    if not force:
+        window = settings.copy_rules.copy_duplicate_guard_minutes
+        hit = copy_ledger.recent(
+            symbol, wanted, window, simulated=settings.simulated_trading
+        )
+        if hit:
+            order = hit.get("order_id")
+            suffix = f"，订单 {order}" if order else ""
+            minutes = hit["age_minutes"]
+            when = "刚刚" if minutes < 1 else f"{minutes:.0f} 分钟前"
+            return {
+                "code": "recent",
+                "text": (
+                    f"{when}复制过 {symbol} {wanted}{suffix}"
+                    f"（{window} 分钟内不重复买）"
+                ),
+                "short": f"｜{when}复制过，跳过",
+            }
+    return None
 
 
 def configure_monitor_callbacks(wallet_monitor: WalletMonitor) -> None:

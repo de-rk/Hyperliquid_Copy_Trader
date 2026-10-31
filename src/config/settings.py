@@ -52,6 +52,24 @@ def _optional_limit(name: str, default: Optional[float]) -> Optional[float]:
     return value if value > 0 else None
 
 
+def _non_negative_int(name: str, default: int) -> int:
+    """Read a non-negative integer, raising on garbage.
+
+    Used by safety switches: a typo must fail at startup instead of silently
+    disabling the guard. ``0`` is a meaningful value (guard off).
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(float(raw.strip()))
+    except ValueError:
+        raise ValueError(f"{name} must be a number of minutes, got {raw!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {raw!r}")
+    return value
+
+
 class HyperliquidConfig(BaseModel):
     api_url: str = Field(default="https://api.hyperliquid.xyz")
     ws_url: str = Field(default="wss://api.hyperliquid.xyz/ws")
@@ -94,6 +112,9 @@ class CopyRulesConfig(BaseModel):
     # "loss" shows only the positions the target is currently losing on, so
     # the follower enters at a better price than the target's own entry.
     copy_open_pnl_filter: str = "loss"
+    # Refuse to copy the same symbol/side again within this many minutes.
+    # 0 disables the guard. /copyloss ... force bypasses it once.
+    copy_duplicate_guard_minutes: int = 30
     # Mirror target resting orders immediately and cancel the follower order
     # when the target order is cancelled/expired/rejected.
     mirror_pending_orders: bool = True
@@ -178,7 +199,14 @@ class Settings(BaseModel):
         copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'false').lower()
         settings.copy_rules.copy_open_positions = copy_open_pos in ('true', '1', 'yes')
         settings.copy_rules.copy_open_pnl_filter = normalize_pnl_filter(
-            os.getenv('COPY_OPEN_PNL_FILTER')
+            os.getenv('COPY_OPEN_PNL_FILTER'),
+            # Honour the model default (loss) when the variable is absent;
+            # normalize_pnl_filter's own default is "all" and used to override
+            # it, so an empty .env silently listed every position.
+            default=settings.copy_rules.copy_open_pnl_filter,
+        )
+        settings.copy_rules.copy_duplicate_guard_minutes = _non_negative_int(
+            'COPY_DUPLICATE_GUARD_MINUTES', default=30
         )
         
         copy_orders = os.getenv('COPY_EXISTING_ORDERS', 'true').lower()
