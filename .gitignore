@@ -53,3 +53,6 @@ Thumbs.db
 
 # Local test venv
 .venv/
+
+# Local agent workspace (memory, skills)
+.workbuddy/
