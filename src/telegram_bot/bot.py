@@ -449,15 +449,16 @@ class TelegramBot:
             logger.error(f"Error getting public wallet data: {e}")
             await update.message.reply_text(f"❌ 获取账户数据失败：{e}")
     
-    async def start(self):
-        """Start the Telegram bot"""
-        logger.info("Starting Telegram bot...")
-        
-        # Create application
-        self.app = Application.builder().token(self.bot_token).build()
+    @staticmethod
+    def _command_menu() -> list[BotCommand]:
+        """The command menu Telegram shows in the "/" picker.
 
-        # Populate Telegram's command picker for the authorized chat.
-        commands = [
+        Every user-facing CommandHandler registered in :meth:`start` must
+        appear here, otherwise the command works but is undiscoverable from
+        the client. Pure aliases such as ``/positions`` (a synonym for
+        ``/status``) are left out on purpose.
+        """
+        return [
             BotCommand("start", "启动机器人"),
             BotCommand("status", "查看运行状态和自己的持仓"),
             BotCommand("orders", "查看当前挂单"),
@@ -470,13 +471,60 @@ class TelegramBot:
             BotCommand("resume", "恢复暂停的跟单"),
             BotCommand("stop", "停止跟单，重启后恢复"),
         ]
-        try:
-            await self.app.bot.set_my_commands(
-                commands,
-                scope=BotCommandScopeChat(chat_id=self.allowed_chat_id),
-            )
-        except Exception as exc:
-            logger.warning(f"Failed to configure Telegram command menu: {exc}")
+
+    async def _publish_command_menu(self) -> None:
+        """Publish the command menu and read it back so the log proves it stuck.
+
+        Telegram stores the menu per scope. Publishing only to the authorized
+        chat leaves the default scope (what the client shows in any other chat
+        with the bot) on whatever BotFather had, which looks like "the command
+        is missing". Both scopes are written here; handlers still reject
+        unauthorized chats.
+        """
+        commands = self._command_menu()
+        targets = [
+            ("默认范围", None),
+            (f"聊天 {self.allowed_chat_id}", self.allowed_chat_id),
+        ]
+        for label, chat_id in targets:
+            scope = BotCommandScopeChat(chat_id=chat_id) if chat_id else None
+            try:
+                if scope is None:
+                    await self.app.bot.set_my_commands(commands)
+                else:
+                    await self.app.bot.set_my_commands(commands, scope=scope)
+            except Exception as exc:
+                # A silent menu failure looks exactly like "the command was
+                # never added", so this must not stay at WARNING.
+                logger.error(f"Failed to publish Telegram command menu ({label}): {exc}")
+                continue
+
+            try:
+                stored = (
+                    await self.app.bot.get_my_commands(scope=scope)
+                    if scope is not None
+                    else await self.app.bot.get_my_commands()
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Command menu published ({label}) but read-back failed: {exc}"
+                )
+                continue
+
+            names = [item.command for item in stored]
+            logger.success(f"Telegram command menu ({label}): {', '.join(names)}")
+            missing = [item.command for item in commands if item.command not in names]
+            if missing:
+                logger.error(
+                    f"Telegram command menu ({label}) is missing: {', '.join(missing)}"
+                )
+
+    async def start(self):
+        """Start the Telegram bot"""
+        logger.info("Starting Telegram bot...")
+        
+        # Create application
+        self.app = Application.builder().token(self.bot_token).build()
         
         # Add command handlers
         self.app.add_handler(CommandHandler("start", self._start_command))
@@ -497,6 +545,9 @@ class TelegramBot:
         
         # Start polling
         await self.app.initialize()
+        # After initialize() so a token/network problem surfaces here instead
+        # of being swallowed while the menu stays empty.
+        await self._publish_command_menu()
         await self.app.start()
         await self.app.updater.start_polling()
         
