@@ -37,7 +37,7 @@ CANCEL_MIRRORED_ORDERS=true
 MIRROR_ORDER_PRICE=true
 AUTO_ADJUST_SIZE=true
 LEVERAGE_ADJUSTMENT=0.5
-MAX_OPEN_TRADES=1
+MAX_OPEN_TRADES=x
 ```
 
 必须填写：
@@ -105,6 +105,33 @@ docker compose up -d copy-trader
 
 此命令产生两笔真实 ETH 市价单的手续费和极小滑点。若脚本在开仓后报错，先在 Hyperliquid 界面检查 ETH 仓位，确认平仓后再启动机器人。
 
+### 5. HIP-3（builder DEX）标的
+
+目标钱包在 `xyz`、`flx`、`vntl` 等 builder DEX 上的仓位现在也会被跟踪。这类标的在接口里始终是 `{dex}:{coin}` 形式（例如 `xyz:SKHX`），大小写敏感：`xyz:SKHX` 能查到 `availableToTrade`，写成 `XYZ:SKHX` 会被交易所返回 500 或 `null`。程序内部只在 DEX 段做小写归一化，不会改写 ticker。
+
+下单时不需要额外的 DEX 字段，builder DEX 由资产编号编码：
+
+```
+asset = 100000 + perp_dex_index × 10000 + index_in_meta
+```
+
+`perpDexs[0]` 是默认 Perp DEX，`xyz` 是 `perpDexs[1]`，所以 `xyz:SKHX` 的编号是 `100000 + 1 × 10000 + 22 = 110022`。
+
+先跑只读诊断，确认解析、DEX 状态、`availableToTrade` 和将要发送的订单体：
+
+```bash
+docker compose run --rm copy-trader python src/verify_hip3_order.py xyz:SKHX
+```
+
+需要真实下单验证时再传确认词，行为与 ETH 脚本一致（上限 `$12`，随后立即 `reduce-only` 平仓）：
+
+```bash
+docker compose run --rm -e LIVE_ORDER_TEST_CONFIRM=HIP3_12_USD copy-trader \
+  python src/verify_hip3_order.py xyz:SKHX
+```
+
+Unified 账户下额度取 `activeAssetData` 的方向额度，而不是某个 DEX 的 `accountValue`；`xyz` DEX 的抵押币种是 USDC，与现货共用同一份保证金。
+
 ## 配置说明
 
 ```properties
@@ -153,11 +180,17 @@ FILL_POLL_INTERVAL_SECONDS=15
 # 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
 LEVERAGE_ADJUSTMENT=0.5
 
-# 单个跟随仓位最大名义价值（美元）。启动补仓和新成交都受此限制。
-MAX_POSITION_SIZE=1000.0
+# 单个跟随仓位的名义价值上限。x 表示不限制（默认），此时只受交易所可用保证金约束；
+# 填数字则把单仓压到该美元额度。
+MAX_POSITION_SIZE=x
 
-# x 表示不限制。建议实盘先用 1。
-MAX_OPEN_TRADES=1
+# 全部仓位合计名义价值上限。x 表示不限制（默认）；真实风险上限由
+# MAX_MARGIN_USAGE_RATIO 对交易所可交易额度的约束决定。
+MAX_TOTAL_EXPOSURE=x
+
+# 同时跟随的仓位数上限。x 表示不限制（默认）：目标持几个仓就跟几个。
+# 填 1 会只保留第一个仓位，目标同时持 BTC 和 SKHX 时第二个会被直接跳过。
+MAX_OPEN_TRADES=x
 MAX_OPEN_ORDERS=x
 MAX_ACCOUNT_EQUITY=x
 

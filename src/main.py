@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 from loguru import logger
 from config.settings import settings
@@ -22,6 +22,30 @@ setup_logger(settings.log_file, settings.log_level)
 # Hyperliquid minimum order size requirement
 MIN_POSITION_SIZE_USD = 10.0
 
+
+def cap_position_value(requested_value: float, *hard_limits: Optional[float]) -> float:
+    """Cap a requested notional by the exchange limits and the position cap.
+
+    ``None`` means "no cap" (``MAX_POSITION_SIZE=x``), so it is dropped instead
+    of being treated as zero — the previous code compared against a float and
+    made every position vanish as soon as the cap was unset.
+    """
+    limits = [requested_value]
+    limits.extend(limit for limit in hard_limits if limit is not None)
+    return min(limits)
+
+
+def remaining_position_budget(existing_value: float = 0.0) -> Optional[float]:
+    """Return the leftover per-position budget, or ``None`` when uncapped."""
+    cap = settings.sizing.max_position_size
+    if cap is None:
+        return None
+    return max(0.0, cap - existing_value)
+
+
+def _format_limit(value: Optional[float]) -> str:
+    return "unlimited" if value is None else f"${value:,.2f}"
+
 # Initialize components
 monitor: WalletMonitor = None
 executor: TradeExecutor = None
@@ -34,6 +58,8 @@ target_switch_lock = asyncio.Lock()
 # State tracking
 is_paused = False
 is_stopped = False
+# When the pause started, so reports can say how long copying has been off.
+paused_since: Optional[datetime] = None
 trades_copied_count = 0
 bot_start_time = None
 
@@ -65,7 +91,30 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 def perp_dex_for_symbol(symbol: str) -> str:
     """Return the DEX that owns a perp symbol's collateral and positions."""
-    return symbol.split(":", 1)[0] if ":" in symbol else ""
+    if ":" in symbol:
+        return symbol.split(":", 1)[0].lower()
+    return ""
+
+
+def copying_status() -> str:
+    """Describe whether new target activity is being copied right now.
+
+    Reports are sent on a timer, so a paused bot used to look identical to a
+    running one. Keeping the label in one place means the hourly report and any
+    other surface cannot drift apart.
+    """
+    if is_stopped:
+        return "🔴 已停止（不再复制任何成交）"
+    if is_paused:
+        since = ""
+        if paused_since is not None:
+            since = (
+                "，自 "
+                + paused_since.astimezone(SHANGHAI_TZ).strftime("%m-%d %H:%M")
+                + " 起"
+            )
+        return f"⏸️ 暂停跟单{since}（持仓保留，不复制新成交与挂单）"
+    return "🟢 正在跟单"
 
 
 def calculate_scaled_close_size(
@@ -192,18 +241,26 @@ async def get_follower_order_notional_cap(
     return max(0.0, dex_state.available_balance) * max(1.0, leverage) * usage_ratio
 
 
-def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
+def calculate_adjusted_leverage(
+    target_leverage: float,
+    adjustment_ratio: float,
+    symbol: str,
+    max_leverage: float | None = None,
+) -> int:
     """
     Calculate adjusted leverage with proper rounding and max leverage limits.
     
     Hyperliquid only supports integer leverage (1x, 2x, 3x, etc.)
     Each asset has different max leverage limits.
-    
+
     Args:
         target_leverage: Target wallet's leverage
         adjustment_ratio: Multiplier (e.g., 0.5 = use 50% of target's leverage)
         symbol: Trading symbol (for max leverage lookup)
-    
+        max_leverage: Exchange-declared ceiling for this asset. HIP-3 builder
+            DEX assets often cap well below 10x, so the static table below is
+            only a fallback when the exchange metadata is unavailable.
+
     Returns:
         Integer leverage between 1 and the asset's max leverage
     """
@@ -242,8 +299,12 @@ def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float,
         'PUMP': 10,
     }
     
-    # Get max leverage for this asset (default to 10x if unknown)
-    max_leverage = MAX_LEVERAGE_LIMITS.get(symbol.upper(), 10)
+    # Exchange metadata wins: a HIP-3 asset can declare 3x while the static
+    # table would otherwise let the copier request 10x and get rejected.
+    if max_leverage is not None and max_leverage > 0:
+        asset_max_leverage = int(max_leverage)
+    else:
+        asset_max_leverage = MAX_LEVERAGE_LIMITS.get(symbol.upper(), 10)
     
     # Calculate desired leverage
     desired_leverage = target_leverage * adjustment_ratio
@@ -255,7 +316,7 @@ def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float,
     rounded_leverage = max(1, rounded_leverage)
     
     # Cap at asset's max leverage
-    final_leverage = min(rounded_leverage, max_leverage)
+    final_leverage = min(rounded_leverage, asset_max_leverage)
     
     return final_leverage
 
@@ -265,16 +326,24 @@ async def on_new_position(position_data: dict):
     Called when target wallet opens a new position
     This is where we copy the trade!
     """
-    global trades_copied_count, is_paused, simulated_balance, simulated_positions, simulated_pnl
+    global trades_copied_count, is_paused, paused_since, simulated_balance, simulated_positions, simulated_pnl
     
     # Check if paused
     if is_paused:
         logger.warning("⏸️ Bot is paused - skipping trade")
         return
     
-    # Check max open trades limit
+    # Check max open trades limit against the follower's own positions.
+    # This used to count the target's positions, so a target holding one
+    # position blocked every new copy — the opposite of a follower-side cap.
     if settings.copy_rules.max_open_trades is not None:
-        current_trades = len(monitor.current_state.positions) if monitor.current_state else 0
+        if settings.simulated_trading:
+            current_trades = len(simulated_positions)
+        else:
+            follower_state = await client.get_user_state(
+                settings.hyperliquid.wallet_address
+            )
+            current_trades = len(follower_state.positions) if follower_state else 0
         if current_trades >= settings.copy_rules.max_open_trades:
             logger.warning(f"⚠️ Max open trades limit reached ({current_trades}/{settings.copy_rules.max_open_trades}) - skipping trade")
             return
@@ -288,6 +357,7 @@ async def on_new_position(position_data: dict):
         if current_equity >= settings.copy_rules.max_account_equity:
             logger.warning(f"⚠️ Max account equity reached (${current_equity:,.2f}/${settings.copy_rules.max_account_equity:,.2f}) - stopping copy trading")
             is_paused = True
+            paused_since = datetime.now(timezone.utc)
             if notifier:
                 await notifier.send_error_notification(f"Max account equity reached: ${current_equity:,.2f}. Bot paused automatically.")
             return
@@ -773,11 +843,15 @@ async def _mirror_new_order(order_data: dict):
             our_size = target_size
 
         leverage = calculate_adjusted_leverage(
-            target_leverage, settings.leverage.adjustment_ratio, symbol
+            target_leverage,
+            settings.leverage.adjustment_ratio,
+            symbol,
+            await executor.get_max_leverage(symbol),
         )
         # Apply the same hard exposure and margin ceilings used by fill copies
         # before sending a live resting order.
-        max_size = settings.sizing.max_position_size / price
+        position_cap = settings.sizing.max_position_size
+        max_size = position_cap / price if position_cap is not None else float("inf")
         follower_dex_state = None
         if reduce_only:
             if settings.simulated_trading:
@@ -1175,7 +1249,8 @@ async def _legacy_on_order_fill(fill_data: dict):
         our_leverage = calculate_adjusted_leverage(
             target_leverage=target_leverage,
             adjustment_ratio=settings.leverage.adjustment_ratio,
-            symbol=symbol
+            symbol=symbol,
+            max_leverage=await executor.get_max_leverage(symbol),
         )
         
         logger.info(f"   Target Leverage: {target_leverage}x")
@@ -1417,6 +1492,19 @@ async def on_order_fill(fill_data: dict):
         if not symbol or target_size <= 0 or price <= 0:
             logger.warning(f"Skipping malformed fill: {fill_data}")
             return
+        # Spot events are not copyable: spot pairs are named "@<index>"
+        # (e.g. "@142" = UBTC/USDC) and the exchange also emits
+        # "Spot Dust Conversion" when it sweeps sub-dust balances. Both used to
+        # fall through to the "unknown fill direction" warning on every sweep.
+        if str(symbol).startswith("@") or "spot" in direction_lower or "dust" in direction_lower:
+            logger.info(
+                f"Ignoring spot event {symbol} ({direction}): only perps are mirrored"
+            )
+            # Dust conversions carry tid=0; remembering that would poison the
+            # dedupe set for every other zero-id fill.
+            if fill_id and fill_id != "0":
+                _remember_fill(fill_id)
+            return
         if ">" in direction:
             logger.warning(f"Skipping position flip until it can be reconciled safely: {direction}")
             return
@@ -1575,6 +1663,7 @@ async def on_order_fill(fill_data: dict):
                 target_leverage=target_leverage,
                 adjustment_ratio=settings.leverage.adjustment_ratio,
                 symbol=symbol,
+                max_leverage=await executor.get_max_leverage(symbol),
             )
             if settings.simulated_trading:
                 follower_position = simulated_positions.get(symbol)
@@ -1623,15 +1712,16 @@ async def on_order_fill(fill_data: dict):
 
             max_size_from_margin = max_order_notional / price
             existing_position_value = follower_position.notional_value if follower_position else 0.0
-            remaining_position_value = max(
-                0.0, settings.sizing.max_position_size - existing_position_value
+            remaining_position_value = remaining_position_budget(existing_position_value)
+            max_size_from_position_limit = (
+                remaining_position_value / price
+                if remaining_position_value is not None else float("inf")
             )
-            max_size_from_position_limit = remaining_position_value / price
             our_size = min(our_size, max_size_from_margin, max_size_from_position_limit)
             if our_size * price < MIN_POSITION_SIZE_USD:
                 logger.warning(
                     f"Skipping {symbol}: copied fill value ${our_size * price:.2f} is below "
-                    f"${MIN_POSITION_SIZE_USD:.2f} after margin/MAX_POSITION_SIZE limits"
+                    f"${MIN_POSITION_SIZE_USD:.2f} after margin/position-cap limits"
                 )
                 await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
                                            follower_size=our_size, price=price, category="低于最小订单金额",
@@ -1852,6 +1942,15 @@ def _wallet_label(address: str) -> str:
     return f"{address[:10]}...{address[-6:]}"
 
 
+def _wallet_full(address: Optional[str]) -> str:
+    """Return the complete address for surfaces used to verify what is running.
+
+    ``/pnl`` is where a user checks which wallets are actually involved, so a
+    truncated label is useless there — copy the full 42-character address.
+    """
+    return html.escape(address) if address else "未配置"
+
+
 async def get_pnl() -> str:
     """Get PnL for Telegram"""
     # Refresh independently of the monitor cache.  The monitor's snapshot is
@@ -1879,8 +1978,12 @@ async def get_pnl() -> str:
         await client.get_portfolio_performance(settings.hyperliquid.wallet_address)
         if client and not settings.simulated_trading and settings.hyperliquid.wallet_address else {}
     )
-    target_line = _wallet_label(settings.target_wallet)
-    follower_line = _wallet_label(settings.hyperliquid.wallet_address) if not settings.simulated_trading else "模拟账户"
+    target_line = _wallet_full(settings.target_wallet)
+    follower_line = (
+        _wallet_full(settings.hyperliquid.wallet_address)
+        if not settings.simulated_trading
+        else "模拟账户"
+    )
     target_equity = (
         await client.get_portfolio_account_value(settings.target_wallet)
         if client and target_state else None
@@ -1996,6 +2099,13 @@ async def get_wallet_report(address: str, fill_limit: int = 30) -> str:
     total_equity = await client.get_portfolio_account_value(address)
     performance = await client.get_portfolio_performance(address)
     fills = await client.get_user_fills(address, fill_limit)
+    # Spot fills are labeled "@<pair index>" by the exchange; resolve them to a
+    # readable pair name so a dust conversion is not reported as mystery text.
+    spot_labels = (
+        await client.get_spot_pair_labels()
+        if any(str(fill["symbol"]).startswith("@") for fill in fills)
+        else {}
+    )
     if state and total_equity is not None:
         account_summary = (
             f"• 账户总金额：${total_equity:,.2f}\n"
@@ -2034,8 +2144,10 @@ async def get_wallet_report(address: str, fill_limit: int = 30) -> str:
                 if fill["timestamp"] else "时间未知"
             )
             direction = fill["direction"] or fill["side"] or "未知方向"
+            symbol_label = spot_labels.get(str(fill["symbol"]))
+            display_symbol = f"{symbol_label} 现货" if symbol_label else fill["symbol"]
             lines.append(
-                f"<b>{index}. {html.escape(fill['symbol'])}</b> {html.escape(direction)}\n"
+                f"<b>{index}. {html.escape(display_symbol)}</b> {html.escape(direction)}\n"
                 f"   数量：{fill['size']:,.6f}｜价格：${fill['price']:,.4f}\n"
                 f"   时间：{timestamp}"
             )
@@ -2053,18 +2165,20 @@ async def get_wallet_report(address: str, fill_limit: int = 30) -> str:
 
 async def handle_pause():
     """Handle pause request from Telegram"""
-    global is_paused
+    global is_paused, paused_since
     is_paused = True
+    paused_since = datetime.now(timezone.utc)
     logger.warning("⏸️ Bot paused by Telegram command")
 
 
 async def handle_resume():
     """Handle resume request from Telegram"""
-    global is_paused
+    global is_paused, paused_since
     if is_stopped:
         logger.warning("Resume ignored because the bot was stopped; restart is required")
         return False
     is_paused = False
+    paused_since = None
     logger.info("▶️ Bot resumed by Telegram command")
     return True
 
@@ -2146,10 +2260,12 @@ async def handle_follow(address: str) -> str:
 
 async def handle_stop(close_positions: bool = False):
     """Handle stop request from Telegram"""
-    global is_paused, is_stopped
+    global is_paused, is_stopped, paused_since
     logger.warning(f"🛑 Stop requested from Telegram (close_positions={close_positions})")
     is_paused = True
     is_stopped = True
+    if paused_since is None:
+        paused_since = datetime.now(timezone.utc)
 
     # Do not let an order batch scheduled before /stop place a follower order
     # after monitoring has been shut down.
@@ -2220,7 +2336,8 @@ async def send_hourly_reports():
                     account_pnl_pct=(account_pnl / account_balance * 100) if account_balance > 0 else 0,
                     open_positions=open_positions,
                     open_orders=open_orders,
-                    target_wallet=settings.target_wallet
+                    target_wallet=settings.target_wallet,
+                    copy_status=copying_status(),
                 )
         except Exception as e:
             logger.error(f"Error sending hourly report: {e}")
@@ -2377,7 +2494,8 @@ async def main():
                 your_leverage = calculate_adjusted_leverage(
                     target_leverage=pos.leverage,
                     adjustment_ratio=settings.leverage.adjustment_ratio,
-                    symbol=pos.symbol
+                    symbol=pos.symbol,
+                    max_leverage=await executor.get_max_leverage(pos.symbol),
                 )
                 # Estimate startup capacity using the same account-mode-aware
                 # per-market limit used by live order paths.
@@ -2404,11 +2522,10 @@ async def main():
                 if margin_limited_value is None:
                     logger.error(f"   ❌ Cannot read available order capacity for {pos.symbol}")
                     continue
-                max_position_value = settings.sizing.max_position_size
-                capped_position_value = min(
+                capped_position_value = cap_position_value(
                     target_position_value * auto_ratio,
                     margin_limited_value,
-                    max_position_value,
+                    settings.sizing.max_position_size,
                 )
                 if capped_position_value < MIN_POSITION_SIZE_USD:
                     logger.warning(
@@ -2420,7 +2537,7 @@ async def main():
                     logger.warning(
                         f"⚠️  Capping {pos.symbol} startup copy from "
                         f"${target_position_value * auto_ratio:,.2f} to ${capped_position_value:,.2f} "
-                        f"(available-margin or MAX_POSITION_SIZE limit)"
+                        f"(available-margin or position-cap limit)"
                     )
                 your_position_value = capped_position_value
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
@@ -2447,7 +2564,8 @@ async def main():
     logger.info(f"🔧 Copy Trading Settings:")
     logger.info(f"   Sizing Mode: {settings.sizing.mode}")
     logger.info(f"   Leverage Adjustment: {settings.leverage.adjustment_ratio}x")
-    logger.info(f"   Max Position Size: ${settings.sizing.max_position_size:,.2f}")
+    logger.info(f"   Max Position Size: {_format_limit(settings.sizing.max_position_size)}")
+    logger.info(f"   Max Total Exposure: {_format_limit(settings.sizing.max_total_exposure)}")
     logger.info(f"   Follower Account Mode: {settings.hyperliquid.account_mode}")
     logger.info(
         f"   Max Margin Usage: {settings.copy_rules.max_margin_usage_ratio:.0%}"
@@ -2489,7 +2607,8 @@ async def main():
                 your_leverage = calculate_adjusted_leverage(
                     target_leverage=pos.leverage,
                     adjustment_ratio=settings.leverage.adjustment_ratio,
-                    symbol=pos.symbol
+                    symbol=pos.symbol,
+                    max_leverage=await executor.get_max_leverage(pos.symbol),
                 )
                 follower_dex_state = None
                 if not settings.simulated_trading:
@@ -2517,7 +2636,7 @@ async def main():
                     continue
 
                 requested_position_value = target_position_value * auto_ratio
-                capped_position_value = min(
+                capped_position_value = cap_position_value(
                     requested_position_value,
                     max_order_notional,
                     settings.sizing.max_position_size,
@@ -2532,7 +2651,7 @@ async def main():
                     logger.warning(
                         f"⚠️  Capping {pos.symbol} startup copy from "
                         f"${requested_position_value:,.2f} to ${capped_position_value:,.2f} "
-                        f"(available-margin or MAX_POSITION_SIZE limit)"
+                        f"(available-margin or position-cap limit)"
                     )
                 your_position_value = capped_position_value
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0

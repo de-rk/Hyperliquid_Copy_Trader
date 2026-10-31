@@ -7,6 +7,26 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+_UNLIMITED_TOKENS = {'x', 'none', 'unlimited', 'off', 'false'}
+
+
+def _optional_limit(name: str, default: Optional[float]) -> Optional[float]:
+    """Read an optional dollar cap from the environment.
+
+    ``x`` / ``none`` / ``unlimited`` / ``off`` and any non-positive number all
+    mean "no cap" and return ``None``. An omitted variable keeps the default so
+    existing deployments are unaffected.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    token = raw.strip().lower()
+    if token in _UNLIMITED_TOKENS:
+        return None
+    value = float(token)
+    return value if value > 0 else None
+
+
 class HyperliquidConfig(BaseModel):
     api_url: str = Field(default="https://api.hyperliquid.xyz")
     ws_url: str = Field(default="wss://api.hyperliquid.xyz/ws")
@@ -24,8 +44,13 @@ class SizingConfig(BaseModel):
     mode: str = "proportional"  # "fixed" or "proportional"
     fixed_size: float = 100.0
     portfolio_ratio: float = 0.01  # 1:100 ratio
-    max_position_size: float = 1000.0
-    max_total_exposure: float = 5000.0
+    # Per-position notional cap. None = uncapped: the only bound is the
+    # exchange's own available margin, so the copied size keeps the target's
+    # risk profile instead of being flattened to a fixed dollar amount.
+    max_position_size: Optional[float] = None
+    # Aggregate notional cap across all positions. None = uncapped; the real
+    # risk bound is MAX_MARGIN_USAGE_RATIO against the exchange's own margin.
+    max_total_exposure: Optional[float] = None
 
 class LeverageConfig(BaseModel):
     adjustment_ratio: float = 0.5
@@ -156,9 +181,12 @@ class Settings(BaseModel):
         leverage_adj = os.getenv('LEVERAGE_ADJUSTMENT', '0.5')
         settings.leverage.adjustment_ratio = float(leverage_adj)
 
-        max_position_size = os.getenv('MAX_POSITION_SIZE')
-        if max_position_size:
-            settings.sizing.max_position_size = float(max_position_size)
+        settings.sizing.max_position_size = _optional_limit(
+            'MAX_POSITION_SIZE', settings.sizing.max_position_size
+        )
+        settings.sizing.max_total_exposure = _optional_limit(
+            'MAX_TOTAL_EXPOSURE', settings.sizing.max_total_exposure
+        )
         
         max_trades = os.getenv('MAX_OPEN_TRADES', 'x')
         settings.copy_rules.max_open_trades = None if max_trades.lower() == 'x' else int(max_trades)

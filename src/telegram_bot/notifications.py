@@ -182,11 +182,13 @@ class NotificationService:
         account_pnl_pct: float,
         open_positions: int,
         open_orders: int,
-        target_wallet: str
+        target_wallet: str,
+        copy_status: str = ""
     ):
         """Send hourly trading report"""
         
         pnl_emoji = "📈" if account_pnl_usd > 0 else "📉"
+        status_line = f"🤖 <b>跟单状态：</b>{copy_status}\n" if copy_status else ""
         
         message = f"""
 📊 <b>每小时跟单报告</b>
@@ -194,7 +196,7 @@ class NotificationService:
 <b>目标：</b><code>{target_wallet[:10]}...{target_wallet[-6:]}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 <b>已复制成交：</b>{trades_copied}
+{status_line}📈 <b>已复制成交：</b>{trades_copied}
 💰 <b>账户未实现盈亏：</b>{pnl_emoji} ${account_pnl_usd:,.2f} ({account_pnl_pct:+.2f}%)
 📍 <b>持仓数：</b>{open_positions}
 📝 <b>挂单数：</b>{open_orders}

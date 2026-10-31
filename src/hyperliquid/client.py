@@ -32,6 +32,8 @@ class HyperliquidClient:
         self._portfolio_cache: Dict[str, tuple[float, Any]] = {}
         self._portfolio_locks: Dict[str, asyncio.Lock] = {}
         self._portfolio_cache_ttl_seconds = 5.0
+        # Spot pair ids ("@142") are opaque; labels are resolved once per process.
+        self._spot_pair_labels: Optional[Dict[str, str]] = None
         
         
     async def __aenter__(self):
@@ -132,7 +134,9 @@ class HyperliquidClient:
                 ]
                 self.dexs = dexes
             else:
-                dexes = [dex]
+                # Builder DEX names are lowercase on the exchange; a string
+                # comparison against the wrong case silently returns no state.
+                dexes = [dex.lower() if dex else dex]
             # merge all dex responses to get complete user state across all dexs
             all_responses = None
             margin_totals = {
@@ -410,6 +414,39 @@ class HyperliquidClient:
         fills.sort(key=lambda fill: fill["timestamp"], reverse=True)
         return fills[:max(1, min(limit, 30))]
 
+    async def get_spot_pair_labels(self) -> Dict[str, str]:
+        """Map spot pair ids ("@142") to readable labels ("UBTC/USDC").
+
+        The exchange names spot pairs by index, so raw fills are unreadable.
+        Names never change, so the map is cached for the process lifetime.
+        """
+        if self._spot_pair_labels is not None:
+            return self._spot_pair_labels
+
+        labels: Dict[str, str] = {}
+        try:
+            meta = await self._post(self.info_url, {"type": "spotMeta"})
+            if isinstance(meta, dict):
+                tokens = {
+                    int(token["index"]): token.get("name", "?")
+                    for token in meta.get("tokens", [])
+                    if isinstance(token, dict) and token.get("index") is not None
+                }
+                for pair in meta.get("universe", []):
+                    if not isinstance(pair, dict) or pair.get("index") is None:
+                        continue
+                    parts = [
+                        tokens.get(int(token_index), "?")
+                        for token_index in pair.get("tokens", [])
+                    ]
+                    if len(parts) == 2:
+                        labels[f"@{pair['index']}"] = f"{parts[0]}/{parts[1]}"
+        except Exception as exc:
+            logger.warning(f"Failed to load spot pair labels: {exc}")
+
+        self._spot_pair_labels = labels
+        return labels
+
     @staticmethod
     def _leaderboard_rows(response: Any) -> List[Dict[str, Any]]:
         """Accept the known leaderboard response wrappers without inventing data."""
@@ -485,16 +522,38 @@ class HyperliquidClient:
         return normalized[:max(1, min(limit, 200))]
     
     async def get_all_assets(self) -> List[Dict[str, Any]]:
-        """Get list of all available trading assets"""
+        """Return every perp asset with its owning DEX and exchange asset id.
+
+        ``allPerpMetas`` covers the default Perp DEX and every HIP-3 builder
+        DEX. The DEX segment matters: dropping it makes a builder asset look
+        like a default-DEX index and sends orders to the wrong market.
+        """
         try:
-            data = {"type": "allPerpMetas"} # This endpoint returns metadata for all perpetual markets, including the different dex asset universe
+            data = {"type": "allPerpMetas"}
             response = await self._post(self.info_url, data)
             all_assets = []
-            for market in response:
-                universe = market.get("universe", [])
-                for asset in universe:
+            for perp_dex_index, market in enumerate(response or []):
+                if not isinstance(market, dict):
+                    continue
+                if perp_dex_index == 0:
+                    offset = 0
+                else:
+                    offset = 100000 + perp_dex_index * 10000
+                for index, asset in enumerate(market.get("universe", [])):
+                    if not isinstance(asset, dict) or not asset.get("name"):
+                        continue
+                    symbol = asset["name"]
+                    dex = symbol.split(":", 1)[0] if ":" in symbol else ""
                     all_assets.append({
-                        "symbol": asset
+                        "symbol": symbol,
+                        "dex": dex,
+                        "asset_index": offset + index,
+                        "sz_decimals": int(asset.get("szDecimals", 8)),
+                        "max_leverage": int(asset.get("maxLeverage") or 1),
+                        "only_isolated": bool(
+                            asset.get("onlyIsolated")
+                            or str(asset.get("marginMode", "")).lower() == "nocross"
+                        ),
                     })
             return all_assets
         except Exception as e:
@@ -528,10 +587,21 @@ class HyperliquidClient:
         """
         side_index = 0 if str(side).lower() in {"buy", "long", "b"} else 1
         try:
-            response = await self._post(
-                self.info_url,
-                {"type": "activeAssetData", "user": address, "coin": symbol},
-            )
+            # A wrong-cased coin is answered with an HTTP 500, not an empty
+            # result, so each spelling needs its own error boundary.
+            response = None
+            for candidate in self._symbol_candidates(symbol):
+                try:
+                    attempt = await self._post(
+                        self.info_url,
+                        {"type": "activeAssetData", "user": address, "coin": candidate},
+                    )
+                except Exception as exc:
+                    logger.debug(f"activeAssetData rejected {candidate}: {exc}")
+                    continue
+                if isinstance(attempt, dict) and attempt.get("availableToTrade"):
+                    response = attempt
+                    break
             values = response.get("availableToTrade") if isinstance(response, dict) else None
             if not isinstance(values, (list, tuple)) or len(values) <= side_index:
                 logger.error(
@@ -564,34 +634,54 @@ class HyperliquidClient:
         """Return mode-independent total account equity from portfolio history."""
         return await self.get_portfolio_account_value(address)
     
+    @staticmethod
+    def _symbol_candidates(symbol: str) -> List[str]:
+        """Yield the spellings worth trying against a case-sensitive endpoint.
+
+        Hyperliquid matches the full ``{dex}:{coin}`` string exactly: a
+        lowercase DEX prefix is required, and an endpoint that receives
+        ``XYZ:SKHX`` answers with ``null`` rather than an error.
+        """
+        raw = str(symbol or "").strip()
+        if not raw:
+            return []
+        candidates = [raw]
+        if ":" in raw:
+            dex, coin = raw.split(":", 1)
+            for value in (f"{dex.lower()}:{coin}", f"{dex.lower()}:{coin.upper()}"):
+                if value not in candidates:
+                    candidates.append(value)
+        else:
+            if raw.upper() not in candidates:
+                candidates.append(raw.upper())
+        return candidates
+
     async def get_market_price(self, symbol: str) -> Optional[float]:
-        """Get current market price for a symbol"""
+        """Return the mid price for a symbol from the DEX that lists it.
+
+        Builder DEX symbols are ``{dex}:{coin}``, so one ``allMids`` request
+        scoped to that DEX replaces the previous scan across every DEX — the
+        scan cost roughly one round trip per DEX on every copied position.
+        """
         try:
-            if ":" in symbol and self.dexs == [""]:
-                perp_dexes = await self._post(self.info_url, {"type": "perpDexs"})
-                self.dexs = [""] + [
-                    dex["name"] for dex in (perp_dexes or [])[1:]
-                    if dex and dex.get("name")
-                ]
-            # The "allMids" endpoint returns the mid price for all symbols across all dexs, so we can just query it once and extract the price for the symbol we want
-            find_symbol = False
-            for dex in self.dexs:
-                data = {
-                    "type": "allMids",
-                    "dex": dex
-                }
-                response = await self._post(self.info_url, data)
-                if not response:
-                    continue
-                # Response is a dict with symbol: price
-                if isinstance(response, dict) and symbol in response:
-                    find_symbol = True
-                    return float(response[symbol])
-        
-            if not find_symbol:
-                logger.error(f"Market price for {symbol} not found")
-                return None
-            
+            dex = symbol.split(":", 1)[0].lower() if ":" in symbol else ""
+            response = await self._post(
+                self.info_url, {"type": "allMids", "dex": dex}
+            )
+            if isinstance(response, dict):
+                for candidate in self._symbol_candidates(symbol):
+                    value = response.get(candidate)
+                    if value is not None:
+                        return float(value)
+                lowered = str(symbol).lower()
+                match = next(
+                    (px for name, px in response.items() if name.lower() == lowered),
+                    None,
+                )
+                if match is not None:
+                    return float(match)
+            logger.error(f"Market price for {symbol} not found on dex '{dex or 'default'}'")
+            return None
         except Exception as e:
             logger.error(f"Failed to get market price for {symbol}: {e}")
             return None

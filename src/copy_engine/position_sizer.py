@@ -13,8 +13,8 @@ class PositionSizer:
         mode: str = "proportional",
         fixed_size: float = 100.0,
         portfolio_ratio: float = 0.01,
-        max_position_size: float = 1000.0,
-        max_total_exposure: float = 5000.0
+        max_position_size: Optional[float] = None,
+        max_total_exposure: Optional[float] = None
     ):
         """
         Initialize position sizer
@@ -23,8 +23,8 @@ class PositionSizer:
             mode: "proportional" or "fixed"
             fixed_size: Fixed position size in USD for fixed mode
             portfolio_ratio: Ratio for proportional mode (e.g., 0.01 = 1:100)
-            max_position_size: Maximum size for a single position
-            max_total_exposure: Maximum total exposure across all positions
+            max_position_size: Maximum size for a single position (None = uncapped)
+            max_total_exposure: Maximum total exposure across all positions (None = uncapped)
         """
         self.mode = mode
         self.fixed_size = fixed_size
@@ -62,13 +62,21 @@ class PositionSizer:
         else:  # fixed mode
             size = self._calculate_fixed_size(target_position)
         
-        # Apply maximum position size limit
-        if size and size > self.max_position_size:
+        # Apply maximum position size limit (None = uncapped)
+        if (
+            self.max_position_size is not None
+            and size
+            and size > self.max_position_size
+        ):
             logger.warning(f"Position size ${size:.2f} exceeds max ${self.max_position_size:.2f}, capping")
             size = self.max_position_size
-        
-        # Check total exposure limit
-        if size and (your_current_exposure + size) > self.max_total_exposure:
+
+        # Check total exposure limit (None = uncapped)
+        if (
+            self.max_total_exposure is not None
+            and size
+            and (your_current_exposure + size) > self.max_total_exposure
+        ):
             logger.error(f"Would exceed max exposure: ${your_current_exposure + size:.2f} > ${self.max_total_exposure:.2f}")
             return None
         

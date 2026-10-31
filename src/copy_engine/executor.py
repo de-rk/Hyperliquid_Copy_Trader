@@ -1,7 +1,9 @@
 """Trade execution engine for Hyperliquid"""
 import asyncio
+import os
 import time
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from eth_account import Account
 import aiohttp
@@ -9,6 +11,41 @@ import aiohttp
 from utils.logger import logger
 from hyperliquid.models import OrderType, OrderSide
 from copy_engine.hl_signing import float_to_wire, get_timestamp_ms, sign_l1_action
+
+
+# HIP-3 builder DEX assets occupy ``100000 + perp_dex_index * 10000 + index``.
+# The default Perp DEX keeps the plain index, so its segment offset is 0 and the
+# first builder DEX in ``perpDexs`` (index 1) starts at 110000.
+HIP3_SEGMENT_BASE = 100000
+HIP3_SEGMENT_WIDTH = 10000
+
+
+@dataclass(frozen=True)
+class PerpAsset:
+    """A resolved Hyperliquid perp asset, HIP-3 builder DEXs included."""
+
+    symbol: str
+    dex: str
+    asset_index: int
+    sz_decimals: int
+    max_leverage: int
+    only_isolated: bool
+
+
+def canonical_symbol(symbol: str) -> str:
+    """Normalize a perp symbol without losing its builder DEX qualifier.
+
+    Builder DEX symbols are ``{dex}:{coin}`` with a lowercase DEX prefix. Only
+    the DEX part is normalized here; the ticker keeps its exchange casing so a
+    mixed-case listing is never mangled.
+    """
+    raw = str(symbol or "").strip()
+    if not raw:
+        return raw
+    if ":" in raw:
+        dex, coin = raw.split(":", 1)
+        return f"{dex.lower()}:{coin}"
+    return raw
 
 
 class TradeExecutor:
@@ -29,9 +66,22 @@ class TradeExecutor:
         self.exchange_url = exchange_url
         self.dry_run = dry_run
         self.max_slippage_pct = max(0.01, float(max_slippage_pct))
-        self._coin_index_cache: Dict[str, int] = {}
-        self._coin_size_decimals: Dict[str, int] = {}
-        self._metadata_loaded = False
+        # Asset registry covers the default Perp DEX and every HIP-3 builder
+        # DEX. ``_assets`` keeps exact exchange symbols; ``_assets_ci`` allows a
+        # lookup when an upstream caller has changed the case of a coin.
+        self._assets: Dict[str, PerpAsset] = {}
+        self._assets_ci: Dict[str, PerpAsset] = {}
+        # Negative cache: symbol -> monotonic timestamp of the last failed
+        # resolution, so an unsupported coin does not refresh the whole
+        # universe on every fill it produces.
+        self._unknown_assets: Dict[str, float] = {}
+        self._metadata_loaded_at = 0.0
+        # A newly listed HIP-3 asset must become resolvable without a restart:
+        # unknown symbols trigger a forced refresh, and this TTL also bounds how
+        # long a failed lookup is remembered.
+        self._metadata_ttl_seconds = max(
+            30, int(os.getenv("ASSET_METADATA_TTL_SECONDS", "300"))
+        )
         self.last_error: Optional[str] = None
         # Hyperliquid leverage is symbol-level state. Repeating the same
         # update before every mirrored order burns exchange-action capacity.
@@ -58,13 +108,21 @@ class TradeExecutor:
         else:
             logger.warning("⚠️ Running in DRY RUN mode - no real trades will be executed")
 
-    async def _load_asset_metadata(self) -> None:
-        """Load the official default and HIP-3 asset universes.
+    async def _load_asset_metadata(self, force: bool = False) -> None:
+        """Load the default and every HIP-3 builder DEX asset universe.
 
-        Builder DEX assets use the SDK-defined offsets (110000, 120000, ...),
-        not the zero-based index from the default ``meta`` response.
+        Asset ids follow ``100000 + perp_dex_index * 10000 + index_in_meta``.
+        ``perpDexs[0]`` is the default Perp DEX, so builder DEX ``k`` in
+        ``perpDexs`` maps to the segment starting at
+        ``HIP3_SEGMENT_BASE + k * HIP3_SEGMENT_WIDTH``. The universe is cached
+        and refreshed on demand (unknown symbol) because a builder DEX can list
+        assets without restarting this process.
         """
-        if self._metadata_loaded:
+        if (
+            not force
+            and self._assets
+            and time.monotonic() - self._metadata_loaded_at < self._metadata_ttl_seconds
+        ):
             return
 
         async with aiohttp.ClientSession() as session:
@@ -78,37 +136,104 @@ class TradeExecutor:
                     return await response.json()
 
             perp_dexes = await info({"type": "perpDexs"})
-            dex_names = [""]
-            dex_offsets = {"": 0}
-            for index, dex in enumerate((perp_dexes or [])[1:]):
+            dex_offsets: Dict[str, int] = {"": 0}
+            for index, dex in enumerate((perp_dexes or [])[1:], start=1):
                 if dex and dex.get("name"):
-                    name = dex["name"]
-                    dex_names.append(name)
-                    dex_offsets[name] = 110000 + index * 10000
+                    dex_offsets[dex["name"]] = HIP3_SEGMENT_BASE + index * HIP3_SEGMENT_WIDTH
 
-            for dex in dex_names:
-                metadata = await info({"type": "meta", "dex": dex})
-                offset = dex_offsets[dex]
-                for index, coin in enumerate(metadata.get("universe", [])):
+            assets: Dict[str, PerpAsset] = {}
+            metas = await asyncio.gather(
+                *(info({"type": "meta", "dex": dex}) for dex in dex_offsets)
+            )
+            for (dex, offset), metadata in zip(dex_offsets.items(), metas):
+                for index, coin in enumerate((metadata or {}).get("universe", [])):
                     name = coin.get("name")
                     if not name:
                         continue
-                    self._coin_index_cache[name] = offset + index
-                    self._coin_size_decimals[name] = int(coin.get("szDecimals", 8))
+                    assets[name] = PerpAsset(
+                        symbol=name,
+                        dex=dex,
+                        asset_index=offset + index,
+                        sz_decimals=int(coin.get("szDecimals", 8)),
+                        max_leverage=int(coin.get("maxLeverage") or 1),
+                        only_isolated=bool(
+                            coin.get("onlyIsolated")
+                            or str(coin.get("marginMode", "")).lower() == "nocross"
+                        ),
+                    )
 
-        self._metadata_loaded = True
+        self._assets = assets
+        self._assets_ci = {symbol.lower(): asset for symbol, asset in assets.items()}
+        self._metadata_loaded_at = time.monotonic()
 
-    async def _get_asset_info(self, symbol: str) -> tuple[int, int]:
-        await self._load_asset_metadata()
-        if symbol not in self._coin_index_cache:
-            raise ValueError(f"Unknown asset symbol: {symbol}")
-        return self._coin_index_cache[symbol], self._coin_size_decimals[symbol]
+    def _lookup_asset(self, symbol: str) -> Optional[PerpAsset]:
+        """Resolve a symbol exactly, then with a normalized DEX prefix."""
+        raw = str(symbol or "").strip()
+        if not raw:
+            return None
+        asset = self._assets.get(raw)
+        if asset is not None:
+            return asset
+        asset = self._assets.get(canonical_symbol(raw))
+        if asset is not None:
+            return asset
+        return self._assets_ci.get(raw.lower())
+
+    async def _resolve_asset(self, symbol: str) -> PerpAsset:
+        """Return the asset, refreshing the universe only when needed."""
+        # The hot path must not re-read the universe on a TTL: a known symbol
+        # has to resolve from memory, or every refresh stalls an order.
+        if not self._assets:
+            await self._load_asset_metadata()
+        asset = self._lookup_asset(symbol)
+        if asset is None:
+            # Covers a cold cache and a HIP-3 listing published after startup.
+            # Negative-cache the miss so an unsupported coin cannot trigger a
+            # full universe refresh on every fill it produces.
+            key = str(symbol or "").strip().lower()
+            missed_at = self._unknown_assets.get(key)
+            if missed_at is not None and time.monotonic() - missed_at < self._metadata_ttl_seconds:
+                raise ValueError(f"Unknown asset symbol: {symbol}")
+            await self._load_asset_metadata(force=True)
+            asset = self._lookup_asset(symbol)
+            if asset is None:
+                self._unknown_assets[key] = time.monotonic()
+                raise ValueError(f"Unknown asset symbol: {symbol}")
+            self._unknown_assets.pop(key, None)
+        return asset
+
+    async def _get_asset_info(self, symbol: str) -> Tuple[int, int]:
+        asset = await self._resolve_asset(symbol)
+        return asset.asset_index, asset.sz_decimals
 
     async def _get_asset_index(self, symbol: str) -> int:
-        return (await self._get_asset_info(symbol))[0]
+        return (await self._resolve_asset(symbol)).asset_index
+
+    async def get_asset(self, symbol: str) -> Optional[PerpAsset]:
+        """Public, non-raising asset lookup for diagnostics and preflight."""
+        try:
+            return await self._resolve_asset(symbol)
+        except ValueError:
+            return None
+        except Exception as exc:
+            logger.error(f"Asset metadata unavailable for {symbol}: {exc}")
+            return None
+
+    async def get_max_leverage(self, symbol: str) -> Optional[int]:
+        """Exchange-declared max leverage for a symbol, HIP-3 dexes included."""
+        asset = await self.get_asset(symbol)
+        return asset.max_leverage if asset else None
+
+    async def get_dex(self, symbol: str) -> str:
+        """Collateral DEX that owns the symbol, e.g. ``xyz`` or ``""``."""
+        asset = await self.get_asset(symbol)
+        if asset is not None:
+            return asset.dex
+        return symbol.split(":", 1)[0] if ":" in symbol else ""
 
     async def _get_mid_price(self, symbol: str) -> float:
-        dex = symbol.split(":", 1)[0] if ":" in symbol else ""
+        asset = await self.get_asset(symbol)
+        dex = asset.dex if asset else (symbol.split(":", 1)[0] if ":" in symbol else "")
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 self.info_url,
@@ -117,9 +242,14 @@ class TradeExecutor:
             ) as response:
                 response.raise_for_status()
                 mids = await response.json()
+        key = asset.symbol if asset is not None else symbol
+        value = mids.get(key) if isinstance(mids, dict) else None
+        if value is None and isinstance(mids, dict):
+            lowered = str(key).lower()
+            value = next((px for name, px in mids.items() if name.lower() == lowered), None)
         try:
-            return float(mids[symbol])
-        except (KeyError, TypeError, ValueError) as exc:
+            return float(value)
+        except (TypeError, ValueError) as exc:
             raise ValueError(f"No mid price returned for {symbol}") from exc
 
     @staticmethod
@@ -210,7 +340,25 @@ class TradeExecutor:
         is_cross: bool = True
     ) -> bool:
         try:
-            asset_index = await self._get_asset_index(symbol)
+            asset = await self._resolve_asset(symbol)
+            # HIP-3 assets declare their own leverage ceiling, and some are
+            # isolated-only. Sending a higher value or a cross request to an
+            # isolated-only market is rejected and would block every order.
+            requested = max(1, int(leverage))
+            if requested > asset.max_leverage:
+                logger.warning(
+                    f"Leverage {requested}x exceeds {asset.symbol} max "
+                    f"{asset.max_leverage}x; clamping"
+                )
+                requested = asset.max_leverage
+            if asset.only_isolated and is_cross:
+                logger.info(
+                    f"{asset.symbol} is isolated-only on {asset.dex or 'default'} DEX; "
+                    "using isolated margin"
+                )
+                is_cross = False
+            leverage = requested
+            asset_index = asset.asset_index
             action = {
                 "type": "updateLeverage",
                 "asset": asset_index,
@@ -270,6 +418,44 @@ class TradeExecutor:
                 return False
             self._configured_leverages[symbol] = leverage
             return True
+
+    async def preview_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        size: Decimal,
+        price: Optional[Decimal] = None,
+        reduce_only: bool = False,
+        post_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Build the exact exchange payload without signing or sending it.
+
+        HIP-3 orders carry no DEX field: the builder DEX is encoded in the
+        asset id, so a resolved ``xyz:SKHX`` order is structurally identical to
+        a default-DEX order.
+        """
+        asset = await self._resolve_asset(symbol)
+        if price is None:
+            mid_price = await self._get_mid_price(symbol)
+            slippage = self.max_slippage_pct / 100.0
+            aggressive = mid_price * (1 + slippage if side == OrderSide.BUY else 1 - slippage)
+            wire_price = self._wire_price(Decimal(str(aggressive)), asset.sz_decimals)
+            tif = "Ioc"
+        else:
+            wire_price = self._wire_limit_price(price, asset.sz_decimals, side)
+            tif = "Alo" if post_only else "Gtc"
+        return {
+            "type": "order",
+            "orders": [{
+                "a": asset.asset_index,
+                "b": side == OrderSide.BUY,
+                "p": wire_price,
+                "s": self._wire_size(size, asset.sz_decimals),
+                "r": reduce_only,
+                "t": {"limit": {"tif": tif}},
+            }],
+            "grouping": "na",
+        }
 
     async def execute_market_order(
         self,

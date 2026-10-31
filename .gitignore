@@ -50,3 +50,6 @@ config/config.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Local test venv
+.venv/
