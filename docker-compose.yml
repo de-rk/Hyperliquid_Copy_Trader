@@ -13,4 +13,5 @@ services:
       - ./.env:/app/.env
     environment:
       - TZ=Asia/Shanghai
-      - FILL_POLLING_ENABLED=false
+      # 不要在这里硬编码业务开关：compose 的 environment 优先级高于 .env，
+      # 写死一个值会让 .env 里同名的配置静默失效（曾出现 FILL_POLLING_ENABLED）。

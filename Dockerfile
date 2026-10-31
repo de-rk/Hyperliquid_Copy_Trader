@@ -25,9 +25,19 @@ ENV BUILD_ID=$BUILD_ID
 
 # Copy application code
 COPY src/ ./src/
+COPY .env.example ./.env.example
+
+# Fail the build when a variable is read but not declared, or when
+# .env.example was edited by hand instead of being regenerated from
+# src/config/env_schema.py.  Both drift silently at runtime otherwise.
+RUN python src/config/env_sync.py --audit \
+ && python src/config/env_sync.py --check-example
 
 # Create necessary directories
 RUN mkdir -p data logs
 
-# Run the bot
-CMD ["python", "src/main.py"]
+# Align the mounted .env with the code before the bot reads it:
+# new options are appended with their code defaults, options that no longer
+# exist are removed.  Existing values are never touched.  A failure here must
+# not stop the bot, hence ';' rather than '&&'.
+CMD ["sh", "-c", "python src/config/env_sync.py --apply --quiet; exec python src/main.py"]

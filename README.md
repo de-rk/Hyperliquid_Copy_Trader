@@ -83,6 +83,31 @@ TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 
 目标地址可以是 Standard 或 Unified；跟单比例使用账户级 `portfolio` 净值。目标持仓状态和目标账户净值分开读取。
 
+#### 1.1 `.env` 会自动与代码对齐
+
+`.env` 和 `.env.example` 不再靠手工维护：所有环境变量在 `src/config/env_schema.py` 里声明一次，`.env.example` 由它生成，`.env` 在每次构建/启动时自动对齐。
+
+| 情况 | 处理 |
+|---|---|
+| 代码新增、`.env` 里没有 | 追加到文件末尾，值取**代码默认值**（等于没配，行为不变） |
+| `.env` 里有、代码已不再读取 | 删除该行（改动前整份备份到 `data/env_backups/`） |
+| 两边都有 | **完全不动**，即使值为空或与默认值不同 |
+| 同一个键出现多次 | 保留第一次出现的值，删掉后面的 |
+| 被注释掉的键（`#FOO=1`） | 视为未设置，会被追加成真实键 |
+| `COMPOSE_*`、`DOCKER_*`、`TZ` 等外围变量 | 原样保留，既不删也不加 |
+
+同步发生在两个位置，任选其一都会生效：`linux/start.sh`、`windows/start.bat` 在构建前跑一次；容器 CMD 在 `python src/main.py` 之前再跑一次（`.env` 是挂载进去的，容器能直接改宿主机上的文件）。手动执行：
+
+```bash
+python src/config/env_sync.py            # 只看差异，不写文件
+python src/config/env_sync.py --apply    # 修复 .env
+python src/config/env_sync.py --example  # 由 schema 重新生成 .env.example
+```
+
+加一个新配置的正确顺序：在 `env_schema.py` 里加一条 → `--example` 重新生成 `.env.example` → 一起提交。即使漏了中间那步也不会静默出错：`docker build` 里有 `--audit` 和 `--check-example` 两道门禁，代码读了没声明的变量、或样例与 schema 不一致，构建直接失败。这道门禁是必要的——否则新变量会被同步逻辑当成"失效配置"从用户的 `.env` 里删掉。
+
+另外，`docker-compose.yml` 的 `environment:` 不再硬编码业务开关。compose 的 `environment` 优先级高于 `.env`，之前写死的 `FILL_POLLING_ENABLED=false` 会让 `.env` 里同名的配置静默失效。
+
 ### 2. 启动 Docker 服务
 
 ```bash
