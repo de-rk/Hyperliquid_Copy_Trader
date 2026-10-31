@@ -18,6 +18,11 @@ RUN if [ "$INSTALL_TELEGRAM" = "true" ]; then \
       pip install --no-cache-dir -r requirements-telegram.txt; \
     fi
 
+# The image is built from a snapshot of src/ and ships no .git, so the commit
+# has to be injected here; src/version.py reports it in /start and /status.
+ARG BUILD_ID=unknown
+ENV BUILD_ID=$BUILD_ID
+
 # Copy application code
 COPY src/ ./src/
 

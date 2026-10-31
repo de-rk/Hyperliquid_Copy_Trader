@@ -4,6 +4,7 @@ services:
       context: .
       args:
         INSTALL_TELEGRAM: ${INSTALL_TELEGRAM:-true}
+        BUILD_ID: ${BUILD_ID:-local}
     container_name: hyperliquid-copy-trader
     restart: unless-stopped
     volumes:

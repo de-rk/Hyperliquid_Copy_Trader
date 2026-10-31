@@ -15,6 +15,7 @@ from hyperliquid.client import HyperliquidClient
 from hyperliquid.websocket import HyperliquidWebSocket
 from hyperliquid.models import WebSocketUpdate, PositionSide, OrderSide
 from copy_engine import WalletMonitor, TradeExecutor, PositionSizer
+from version import build_stamp
 
 # Setup logging
 setup_logger(settings.log_file, settings.log_level)
@@ -2162,6 +2163,7 @@ async def get_status() -> str:
 <b>仓位模式：</b>{settings.sizing.mode.title()}
 <b>杠杆：</b>目标杠杆的 {settings.leverage.adjustment_ratio} 倍
 <b>追入旧仓位：</b>{existing_position_policy_text()}
+<b>版本：</b>{build_stamp()}
     """.strip()
 
 
@@ -2689,6 +2691,7 @@ async def main():
     
     target_address = settings.target_wallet
     logger.info(f"📍 Target Address: {target_address}")
+    logger.info(f"🧩 Build: {build_stamp()}")
     
     # Initialize components
     client = HyperliquidClient(

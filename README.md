@@ -80,7 +80,9 @@ docker compose logs -f --tail=100 copy-trader
 docker compose down
 ```
 
-代码更新后必须使用 `up -d --build` 重新构建；仅执行 `restart` 不会更新镜像内的代码。
+代码更新后必须使用 `up -d --build` 重新构建；仅执行 `restart` 不会更新镜像内的代码。`linux/start.sh` 与 `windows/start.bat` 已带 `--build`，并把当前 commit 作为 `BUILD_ID` 注入镜像。
+
+判断线上到底跑的是哪一版：在 Telegram 发 `/start`，最后一行是 `版本：v1.1.0 +<commit>`。**没有这一行，就说明容器里还是旧镜像**——旧版本的帮助文本里也没有 `/copyloss`，这正是"命令加了但看不到"的典型症状。
 
 ### 3. 切换到实盘前的检查
 
@@ -331,6 +333,18 @@ docker compose up -d --build
 ```
 
 如果仍出现该错误，检查 `HYPERLIQUID_WALLET_ADDRESS` 是否确实由 `HYPERLIQUID_PRIVATE_KEY` 推导而来。
+
+### 新加的命令在 Telegram 里看不到
+
+先发 `/start`，看最后一行有没有 `版本：`。**没有就是旧镜像在跑**：`/start` 的文本由进程内存里的代码生成，旧代码里既没有这一行，也没有 `/copyloss`，所以"命令没生效"和"没重启"看起来一模一样。
+
+```bash
+git pull
+docker compose down
+docker compose up -d --build     # 或直接 ./linux/start.sh
+```
+
+`docker compose restart` 只是重启容器，镜像里那份 `src/` 不会变，这也是最常踩的坑。重建后 `/start` 的版本行会显示新的 commit 短哈希；命令菜单还要等 Telegram 客户端刷新（重开聊天或等十几秒）。
 
 ### 只收到小时报告，没有跟单
 

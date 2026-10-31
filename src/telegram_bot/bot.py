@@ -17,6 +17,8 @@ from telegram.ext import (
 )
 from loguru import logger
 
+from version import build_stamp
+
 
 class TelegramBot:
     """
@@ -67,7 +69,7 @@ class TelegramBot:
             await update.message.reply_text("⛔ 未授权的聊天")
             return
         
-        message = """
+        message = f"""
 🤖 <b>Hyperliquid 跟单机器人</b>
 
 <b>可用命令：</b>
@@ -84,6 +86,7 @@ class TelegramBot:
 /stop - 停止机器人，可选择是否平仓
 
 <b>状态：</b>🟢 运行中
+<b>版本：</b>{build_stamp()}
         """
         await update.message.reply_text(message.strip(), parse_mode="HTML")
     
