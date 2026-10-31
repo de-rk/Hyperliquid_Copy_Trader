@@ -85,11 +85,15 @@ class LeverageConfig(BaseModel):
 class CopyRulesConfig(BaseModel):
     copy_existing_positions: bool = True
     copy_existing_orders: bool = True
-    copy_open_positions: bool = True
-    # Existing-position PnL scope: "all" | "loss" | "profit".
-    # "loss" copies only the positions the target is currently losing on, so
+    # Automatic catch-up of the target's already-open positions at startup.
+    # Off by default: it fires real market orders before anyone can look at
+    # them, and the manual equivalent (/copyloss) lets the user pick which
+    # positions to take and returns a fill receipt.
+    copy_open_positions: bool = False
+    # Scope /copyloss lists by default: "all" | "loss" | "profit".
+    # "loss" shows only the positions the target is currently losing on, so
     # the follower enters at a better price than the target's own entry.
-    copy_open_pnl_filter: str = "all"
+    copy_open_pnl_filter: str = "loss"
     # Mirror target resting orders immediately and cancel the follower order
     # when the target order is cancelled/expired/rejected.
     mirror_pending_orders: bool = True
@@ -171,7 +175,7 @@ class Settings(BaseModel):
         settings.simulated_account_balance = float(sim_balance)
         
         # Copy trading settings
-        copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'true').lower()
+        copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'false').lower()
         settings.copy_rules.copy_open_positions = copy_open_pos in ('true', '1', 'yes')
         settings.copy_rules.copy_open_pnl_filter = normalize_pnl_filter(
             os.getenv('COPY_OPEN_PNL_FILTER')

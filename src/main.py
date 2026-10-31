@@ -179,19 +179,15 @@ def copying_status() -> str:
 
 
 def existing_position_policy_text() -> str:
-    """Describe how startup copies treat the target's already-open positions.
+    """Describe how the target's already-open positions are handled.
 
-    Lives next to the code that applies the rule so the log, /status and the
-    startup notification cannot describe three different policies.
+    Nothing is mirrored at startup any more — that path placed real orders
+    without asking. The text therefore always reports "manual"; the PnL filter
+    only decides which scope /copyloss lists by default.
     """
-    if not settings.copy_rules.copy_open_positions:
-        return "不追入（只跟启动后的新成交）"
     rule = settings.copy_rules.copy_open_pnl_filter
-    if rule == "loss":
-        return "只追浮亏仓位（你在更好的价位进场）"
-    if rule == "profit":
-        return "只追浮盈仓位（等于追高）"
-    return "全部已有仓位"
+    scope = {"loss": "浮亏", "profit": "浮盈"}.get(rule, "全部")
+    return f"手动：/copyloss 选择{scope}仓位（启动不自动追入）"
 
 
 def calculate_scaled_close_size(
@@ -211,21 +207,38 @@ async def copy_existing_position_snapshot(
     auto_ratio: float,
     index: int,
     total: int,
-) -> tuple[bool, str]:
+) -> dict[str, Any]:
     """Copy one currently-open target position at the live market price.
 
-    Shared by the startup catch-up and the /copyloss command so sizing,
-    leverage clamping, margin caps and the simulated book can never drift
-    between the two paths. Returns ``(success, failure_reason)``.
+    Returns a receipt record instead of a bare bool: the Telegram receipt has
+    to report the size, leverage and order id that actually went out, and
+    "failed" alone leaves the user with nothing to check against the exchange.
     """
     target_position_value = abs(pos.size) * pos.entry_price
     requested_position_value = target_position_value * auto_ratio
+    record: dict[str, Any] = {
+        "symbol": pos.symbol,
+        "side": pos.side.value.upper(),
+        "ok": False,
+        "reason": "",
+        "size": 0.0,
+        "notional": requested_position_value,
+        "requested_notional": requested_position_value,
+        "leverage": 0,
+        "order_id": None,
+        "target_value": target_position_value,
+        "target_pnl": position_unrealized_pnl(pos),
+        "fill_price": None,
+        "fill_size": None,
+    }
+
     your_leverage = calculate_adjusted_leverage(
         target_leverage=pos.leverage,
         adjustment_ratio=settings.leverage.adjustment_ratio,
         symbol=pos.symbol,
         max_leverage=await executor.get_max_leverage(pos.symbol),
     )
+    record["leverage"] = your_leverage
 
     follower_dex_state = None
     if not settings.simulated_trading:
@@ -235,7 +248,8 @@ async def copy_existing_position_snapshot(
         )
         if current_follower_state is None:
             logger.error(f"   ❌ Cannot read follower wallet before copying {pos.symbol}")
-            return False, "无法读取跟随钱包状态"
+            record["reason"] = "无法读取跟随钱包状态"
+            return record
         follower_dex_state = current_follower_state
 
     order_side = OrderSide.BUY if pos.side == PositionSide.LONG else OrderSide.SELL
@@ -248,22 +262,25 @@ async def copy_existing_position_snapshot(
     )
     if max_order_notional is None:
         logger.error(f"   ❌ Cannot read available order capacity for {pos.symbol}")
-        return False, "无法读取可交易额度"
+        record["reason"] = "无法读取可交易额度"
+        return record
 
     capped_position_value = cap_position_value(
         requested_position_value,
         max_order_notional,
         settings.sizing.max_position_size,
     )
+    record["notional"] = capped_position_value
     if capped_position_value < MIN_POSITION_SIZE_USD:
         logger.warning(
             f"⚠️  Skipping Position {index}/{total}: {pos.symbol}; "
             f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
         )
-        return False, (
+        record["reason"] = (
             f"可下单金额 ${capped_position_value:.2f} 低于交易所最低 "
             f"${MIN_POSITION_SIZE_USD:.2f}"
         )
+        return record
     if capped_position_value < requested_position_value:
         logger.warning(
             f"⚠️  Capping {pos.symbol} copy from "
@@ -291,8 +308,15 @@ async def copy_existing_position_snapshot(
         leverage=your_leverage,
     )
     if not result:
-        logger.error("   ❌ Failed to copy position")
-        return False, "下单失败（见容器日志）"
+        detail = (getattr(executor, "last_error", "") or "").strip()
+        logger.error(f"   ❌ Failed to copy position: {detail or 'no detail'}")
+        record["reason"] = f"下单失败：{detail}" if detail else "下单失败（见容器日志）"
+        return record
+
+    record["ok"] = True
+    record["size"] = float(your_size)
+    record["notional"] = your_position_value
+    record["order_id"] = str(result)
 
     if settings.simulated_trading:
         simulated_positions[pos.symbol] = {
@@ -305,16 +329,80 @@ async def copy_existing_position_snapshot(
         }
 
     logger.success("   ✅ Position copied successfully!")
-    return True, ""
+    return record
 
 
-async def handle_copy_existing(mode: str = "loss", confirm: bool = False) -> str:
-    """One-shot copy of the target's currently open positions via Telegram.
+def _copy_receipt_text(
+    records: list[dict[str, Any]],
+    scope_name: str,
+    simulated: bool,
+) -> str:
+    """Render the per-position receipt for a manual copy run."""
+    stamp = datetime.now(SHANGHAI_TZ).strftime("%m-%d %H:%M:%S")
+    filled = [record for record in records if record["ok"]]
+    total_notional = sum(record["notional"] for record in filled)
+    lines = [
+        f"🧾 <b>一键复制回执</b>｜{scope_name}｜{'模拟' if simulated else '实盘'}｜{stamp}",
+        "",
+    ]
+    for index, record in enumerate(records, 1):
+        symbol = html.escape(str(record["symbol"]))
+        side = record["side"]
+        if not record["ok"]:
+            reason = html.escape(str(record["reason"] or "未知原因"))
+            lines.append(f"{index}. ❌ <b>{symbol} {side}</b>")
+            lines.append(f"   未成交：{reason}")
+            continue
+        size = record["fill_size"] or record["size"]
+        price = record["fill_price"]
+        if price:
+            price_text = f"@ ${price:,.4f}"
+        elif simulated:
+            price_text = "（模拟，按当时市价）"
+        else:
+            price_text = "（未取到成交价，以交易所为准）"
+        lines.append(
+            f"{index}. ✅ <b>{symbol} {side}</b>｜{record['leverage']}x"
+        )
+        lines.append(
+            f"   成交 {size:.6g} {price_text}｜名义 ${record['notional']:,.2f}"
+        )
+        if record["order_id"]:
+            lines.append(f"   订单 <code>{html.escape(str(record['order_id']))}</code>")
+    lines.append("")
+    lines.append(
+        f"合计：成功 {len(filled)}/{len(records)}｜成交名义 ${total_notional:,.2f}"
+    )
+    return "\n".join(lines)
 
-    Defaults to the losing book: the follower always fills at the live price,
-    so a target that is underwater gives the follower the better entry. Runs
-    in two steps (preview, then ``confirm``) because it places real orders in
-    live mode.
+
+async def _recent_fills_by_symbol(started_at_ms: int) -> dict[str, dict]:
+    """Follower fills created after ``started_at_ms``, keyed by symbol."""
+    if settings.simulated_trading:
+        return {}
+    wallet = settings.hyperliquid.wallet_address
+    if not wallet:
+        return {}
+    fills: dict[str, dict] = {}
+    for fill in await client.get_user_fills(wallet, limit=20):
+        if fill["timestamp"] < started_at_ms:
+            continue
+        fills.setdefault(fill["symbol"], fill)
+        fills.setdefault(fill["symbol"].lower(), fill)
+    return fills
+
+
+async def handle_copy_existing(
+    mode: Optional[str] = None,
+    confirm: bool = False,
+    selection: Optional[list[int]] = None,
+) -> str:
+    """Copy the target's currently open positions on demand, via Telegram.
+
+    Manual by design: nothing is mirrored at startup any more. The preview
+    numbers every candidate, ``selection`` (1-based) takes a subset, and every
+    run ends with a per-position receipt, because the previous auto-copy path
+    placed real orders that the user only noticed on the exchange.
     """
     if is_stopped:
         return "🔴 机器人已停止，无法执行。请重启容器后再使用。"
@@ -322,12 +410,14 @@ async def handle_copy_existing(mode: str = "loss", confirm: bool = False) -> str
         return "❌ 机器人尚未就绪，请稍后再试。"
 
     try:
-        rule = normalize_pnl_filter(mode)
+        rule = normalize_pnl_filter(
+            mode or settings.copy_rules.copy_open_pnl_filter
+        )
     except ValueError:
         return (
             "❌ 无效的范围参数。\n\n"
-            "用法：<code>/copyloss [loss|all|profit] [confirm]</code>\n"
-            "默认 <code>loss</code>：按现价买入目标当前浮亏的仓位。"
+            "用法：<code>/copyloss [loss|all|profit] [序号...] [confirm]</code>\n"
+            "默认 <code>loss</code>：只列出目标当前浮亏的仓位。"
         )
 
     state = await monitor.get_current_state()
@@ -347,76 +437,173 @@ async def handle_copy_existing(mode: str = "loss", confirm: bool = False) -> str
 
     auto_ratio = follower_equity / target_equity
     candidates = select_existing_positions(state.positions, rule)
-    held_symbols = await _follower_position_symbols()
-    fresh = [p for p in candidates if p.symbol not in held_symbols]
-    skipped_held = [p.symbol for p in candidates if p.symbol in held_symbols]
-
+    scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "全部"}[rule]
     if not candidates:
-        scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "可复制"}[rule]
         return (
             f"ℹ️ 目标当前没有{scope_name}仓位"
             f"（共 {len(state.positions)} 个持仓），无需操作。"
         )
 
-    scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "全部"}[rule]
+    held_symbols = await _follower_position_symbols()
+    # Number the whole candidate list, including symbols the follower already
+    # holds: numbering only the copyable subset shifted every index after the
+    # first copy, so re-sending a number silently hit a different position.
+    copyable = [pos for pos in candidates if pos.symbol not in held_symbols]
+    if not copyable:
+        return (
+            f"ℹ️ 目标当前的{scope_name}仓位（{len(candidates)} 个）跟随钱包都已持有，"
+            "无需重复复制。"
+        )
+
+    chosen = copyable
+    if selection:
+        wanted: list[int] = []
+        for number in selection:
+            if number not in wanted:
+                wanted.append(number)
+        invalid = [number for number in wanted if not 1 <= number <= len(candidates)]
+        if invalid:
+            listed = "、".join(str(number) for number in invalid)
+            return (
+                f"❌ 序号超出范围：{listed}\n"
+                f"当前可选 1-{len(candidates)}。发送 <code>/copyloss {rule}</code> 查看列表。"
+            )
+        chosen = [candidates[number - 1] for number in wanted]
+
     ratio_text = f"1:{int(1 / auto_ratio)}" if auto_ratio > 0 else "0"
     lines = [
-        f"🎯 <b>一键复制目标{scope_name}仓位{'（预览）' if not confirm else ''}</b>",
+        f"🎯 <b>目标{scope_name}仓位{'（预览）' if not confirm else ''}</b>",
         "",
         f"目标净值 ${target_equity:,.2f}｜跟随净值 ${follower_equity:,.2f}"
         f"（比例 {ratio_text}）",
+        "",
     ]
     total_your_value = 0.0
-    for pos in fresh:
+    selected_numbers = {id(pos) for pos in chosen}
+    for index, pos in enumerate(candidates, 1):
         target_value = abs(pos.size) * pos.entry_price
         your_value = target_value * auto_ratio
         total_your_value += your_value
         pnl = position_unrealized_pnl(pos)
-        marker = "⚠️ 低于交易所 $10 最低，将被跳过" if your_value < MIN_POSITION_SIZE_USD else ""
-        line = (
-            f"• {html.escape(pos.symbol)} {pos.side.value.upper()}｜"
-            f"目标 ${target_value:,.0f}｜你 ≈ ${your_value:,.0f}｜"
-            f"PnL ${pnl:+,.0f}｜{pos.leverage}x"
+        picked = " ✅" if id(pos) in selected_numbers and selection else ""
+        held_note = (
+            "｜跟随钱包已持有，会跳过" if pos.symbol in held_symbols else ""
         )
-        lines.append(f"{line}{('｜' + marker) if marker else ''}")
-    for symbol in skipped_held:
-        lines.append(f"• {html.escape(symbol)}：跟随钱包已持有，跳过（避免重复买入）")
-    lines.append(f"\n将按<b>当前市价</b>下单，合计 ≈ ${total_your_value:,.2f}。")
+        below_min = (
+            f"｜⚠️ 低于 ${MIN_POSITION_SIZE_USD:.0f} 最低，将被跳过"
+            if your_value < MIN_POSITION_SIZE_USD and not held_note
+            else ""
+        )
+        lines.append(
+            f"{index}. {html.escape(pos.symbol)} {pos.side.value.upper()}｜"
+            f"目标 ${target_value:,.0f}｜你 ≈ ${your_value:,.0f}｜"
+            f"PnL ${pnl:+,.0f}｜{pos.leverage}x{picked}{below_min}{held_note}"
+        )
+    lines.append("")
+    lines.append(f"全部复制合计 ≈ ${total_your_value:,.2f}。")
 
     if not confirm:
-        lines.append(
-            f"确认无误请发送 <code>/copyloss {rule} confirm</code> 执行。"
-            if not settings.simulated_trading
-            else f"模拟模式：发送 <code>/copyloss {rule} confirm</code> 执行演练。"
+        selected_total = sum(
+            abs(pos.size) * pos.entry_price * auto_ratio
+            for pos in chosen
+            if pos.symbol not in held_symbols
         )
+        if selection:
+            numbers = " ".join(
+                str(next(i for i, row in enumerate(candidates, 1) if row is pos))
+                for pos in chosen
+            )
+            held_chosen = [
+                pos.symbol for pos in chosen if pos.symbol in held_symbols
+            ]
+            lines.append(
+                f"已选 {len(chosen) - len(held_chosen)} 笔，"
+                f"合计 ≈ ${selected_total:,.2f}。"
+            )
+            if held_chosen:
+                lines.append(
+                    "其中跟随钱包已持有、会跳过："
+                    + "、".join(html.escape(symbol) for symbol in held_chosen)
+                )
+            lines.append(
+                f"发送 <code>/copyloss {rule} {numbers} confirm</code> 执行。"
+            )
+        else:
+            sample = " ".join(
+                str(i) for i in range(1, min(len(candidates), 2) + 1)
+            )
+            lines.append(
+                f"按序号复制：<code>/copyloss {rule} {sample} confirm</code>"
+                f"（只买这几笔）；全部执行：<code>/copyloss {rule} confirm</code>。"
+            )
+        lines.append("下单前不会发送任何订单。")
         return "\n".join(lines)
 
     if copy_existing_lock.locked():
         return "⏳ 上一次一键复制仍在执行，请稍后再试。"
 
+    started_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - 5000
     async with copy_existing_lock:
-        copied = 0
-        failures: list[str] = []
-        for i, pos in enumerate(fresh, 1):
+        records: list[dict[str, Any]] = []
+        for index, pos in enumerate(chosen, 1):
+            if pos.symbol in held_symbols:
+                records.append({
+                    "symbol": pos.symbol,
+                    "side": pos.side.value.upper(),
+                    "ok": False,
+                    "reason": "跟随钱包已持有，跳过（避免重复买入）",
+                    "size": 0.0,
+                    "notional": 0.0,
+                    "requested_notional": 0.0,
+                    "leverage": 0,
+                    "order_id": None,
+                    "fill_price": None,
+                    "fill_size": None,
+                })
+                continue
             try:
-                success, reason = await copy_existing_position_snapshot(
-                    pos, auto_ratio, i, len(fresh)
+                records.append(
+                    await copy_existing_position_snapshot(
+                        pos, auto_ratio, index, len(chosen)
+                    )
                 )
-                if success:
-                    copied += 1
-                else:
-                    failures.append(f"{html.escape(pos.symbol)}（{reason}）")
             except Exception as exc:
-                logger.error(f"/copyloss failed for {pos.symbol}: {exc}")
-                failures.append(f"{html.escape(pos.symbol)}（异常：{exc}）")
+                logger.exception(f"/copyloss failed for {pos.symbol}: {exc}")
+                records.append({
+                    "symbol": pos.symbol,
+                    "side": pos.side.value.upper(),
+                    "ok": False,
+                    "reason": f"异常：{exc}",
+                    "size": 0.0,
+                    "notional": 0.0,
+                    "requested_notional": 0.0,
+                    "leverage": 0,
+                    "order_id": None,
+                    "fill_price": None,
+                    "fill_size": None,
+                })
 
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"✅ 执行完成：成功 {copied}/{len(fresh)}")
-    if failures:
-        lines.append("失败：" + "；".join(failures))
+    fills = await _recent_fills_by_symbol(started_at_ms)
+    for record in records:
+        if not record["ok"]:
+            continue
+        fill = fills.get(record["symbol"]) or fills.get(record["symbol"].lower())
+        if fill:
+            record["fill_price"] = fill["price"]
+            record["fill_size"] = fill["size"]
+
+    receipt = _copy_receipt_text(records, scope_name, settings.simulated_trading)
+    notes: list[str] = []
     if is_paused:
-        lines.append("⚠️ 机器人处于暂停状态：本次是手动下单，自动跟单仍未恢复。")
-    return "\n".join(lines)
+        notes.append("⚠️ 机器人处于暂停状态：本次是手动下单，自动跟单仍未恢复。")
+    rejected = [
+        record
+        for record in records
+        if not record["ok"] and "已持有" not in str(record["reason"])
+    ]
+    if rejected:
+        notes.append("失败项的原因见上；下单被拒时交易所原文在容器日志里。")
+    return receipt + ("\n\n" + "\n".join(notes) if notes else "")
 
 
 async def _follower_position_symbols() -> set[str]:
@@ -2903,7 +3090,7 @@ async def main():
         f"{settings.copy_rules.pending_order_merge_window_seconds:g}s"
     )
     logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
-    logger.info(f"   Copy Existing Positions: {settings.copy_rules.copy_open_positions}")
+    logger.info("   Copy Existing Positions: manual — /copyloss only (startup never orders)")
     logger.info(
         f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
     )
@@ -2918,44 +3105,21 @@ async def main():
     
     configure_monitor_callbacks(monitor)
     
-    # Copy existing positions if enabled
-    if settings.copy_rules.copy_open_positions and startup_positions:
-        logger.info("=" * 60)
-        logger.success("🔄 COPYING EXISTING POSITIONS ON STARTUP")
-        if settings.copy_rules.copy_open_pnl_filter != "all":
-            logger.warning(
-                f"   PnL filter: {settings.copy_rules.copy_open_pnl_filter} "
-                f"({len(startup_positions)}/{len(state.positions)} positions)"
-            )
-        logger.info("=" * 60)
-        
-        copied_count = 0
-        for i, pos in enumerate(startup_positions, 1):
-            try:
-                ok, _ = await copy_existing_position_snapshot(
-                    pos, auto_ratio, i, len(startup_positions)
-                )
-                if ok:
-                    copied_count += 1
-            except Exception as e:
-                logger.error(f"   ❌ Error copying position {pos.symbol}: {e}")
-        
-        # Show final account state
-        if settings.simulated_trading:
-            total_margin_used = sum(p['margin_used'] for p in simulated_positions.values())
-            logger.info("")
-            logger.info("=" * 60)
-            logger.success("✅ EXISTING POSITIONS COPIED!")
-            logger.info("=" * 60)
-            logger.success(f"💰 Simulated Account Update:")
-            logger.success(f"   Total Positions Copied: {copied_count}/{len(startup_positions)}")
-            logger.success(f"   Total Margin Used: ${total_margin_used:,.2f}")
-            logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
-            logger.success(f"   Available Balance: ${simulated_balance - total_margin_used:,.2f}")
-            logger.info("=" * 60)
-        
-        # Update global counter
-        trades_copied_count += copied_count
+    # The target's existing book is never mirrored automatically. This block
+    # used to place real market orders before the user could see them (and
+    # without a notification), which is exactly what /copyloss now does on
+    # demand: numbered list, explicit selection, per-position receipt.
+    if settings.copy_rules.copy_open_positions:
+        logger.warning(
+            "⚠️  COPY_OPEN_POSITIONS is deprecated and no longer places orders "
+            "at startup. Use /copyloss in Telegram to pick positions."
+        )
+    if startup_positions:
+        logger.info("")
+        logger.info(
+            f"🖐  {len(startup_positions)} existing position(s) will NOT be copied "
+            f"automatically — send /copyloss in Telegram to choose."
+        )
     
     # Initialize Telegram bot if configured
     if settings.telegram.bot_token and settings.telegram.chat_id:
@@ -3058,7 +3222,7 @@ async def main():
         logger.info("")
         logger.info(f"🔌 Starting monitoring...")
         logger.info("✅ Bot is now LIVE and monitoring for trades!")
-        logger.info(f"   Copy Open Positions: {settings.copy_rules.copy_open_positions}")
+        logger.info("   Copy Existing Positions: manual — /copyloss only (startup never orders)")
         logger.info(
             f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
         )

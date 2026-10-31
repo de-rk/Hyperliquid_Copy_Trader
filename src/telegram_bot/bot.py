@@ -80,7 +80,7 @@ class TelegramBot:
 /leaderboard - 查看公开收益排行榜
 /wallet 地址 [数量] - 查询公开账户收益和最近成交
 /follow 地址 - 更换跟单目标钱包
-/copyloss [loss|all|profit] [confirm] - 按现价一键复制目标现有仓位（默认只复制浮亏的；先预览，加 confirm 执行）
+/copyloss [loss|all|profit] [序号...] [confirm] - 手动复制目标现有仓位：先列清单，可只买指定序号，执行后回执
 /pause - 暂停复制新成交，保留仓位
 /resume - 恢复复制
 /stop - 停止机器人，可选择是否平仓
@@ -127,10 +127,11 @@ class TelegramBot:
             await update.message.reply_text(f"❌ 更换跟单地址失败：{exc}")
     
     async def _copyloss_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /copyloss - one-shot copy of the target's open positions.
+        """Handle /copyloss - copy the target's open positions, on demand.
 
-        Two-step on purpose: without ``confirm`` it only previews what would be
-        bought, because in live mode this places real market orders.
+        Two steps on purpose: without ``confirm`` it only lists what would be
+        bought, because in live mode this places real market orders. Numbers in
+        the arguments pick a subset of that list, e.g. ``/copyloss 1 3 confirm``.
         """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
@@ -140,17 +141,26 @@ class TelegramBot:
             return
 
         args = [arg.strip().lower() for arg in (context.args or [])]
-        mode = "loss"
+        # None means "use the configured default", resolved in main so the
+        # command and the /status policy line cannot disagree.
+        mode = None
         confirm = False
+        selection: list[int] = []
         for arg in args:
             if arg in ("confirm", "go", "yes", "执行"):
                 confirm = True
-            else:
-                mode = arg
+                continue
+            numbers = [part for part in re.split(r"[,，、\s]+", arg) if part]
+            if numbers and all(part.isdigit() for part in numbers):
+                selection.extend(int(part) for part in numbers)
+                continue
+            mode = arg
 
         try:
             await update.message.reply_text("⏳ 正在读取目标持仓...", parse_mode="HTML")
-            result = await self.on_copy_existing_requested(mode, confirm)
+            result = await self.on_copy_existing_requested(
+                mode, confirm, selection or None
+            )
             await update.message.reply_text(result, parse_mode="HTML")
         except Exception as exc:
             logger.error(f"Error in one-shot copy: {exc}")
@@ -468,7 +478,7 @@ class TelegramBot:
             BotCommand("pnl", "查看收益摘要"),
             BotCommand("wallet", "查询公开账户"),
             BotCommand("follow", "更换跟单目标钱包"),
-            BotCommand("copyloss", "一键按现价复制目标现有仓位"),
+            BotCommand("copyloss", "手动复制目标现有仓位（可选序号，带回执）"),
             BotCommand("leaderboard", "查看收益排行榜"),
             BotCommand("pause", "暂停成交跟单"),
             BotCommand("resume", "恢复暂停的跟单"),

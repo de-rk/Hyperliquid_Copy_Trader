@@ -8,8 +8,8 @@
 
 - 默认镜像机器人启动后的目标**限价挂单**：目标挂单后立即按同一价格创建跟随挂单；目标取消、过期或被拒时，撤销仍未成交的跟随挂单。
 - 目标挂单成交时不会再次创建跟随订单；跟随挂单自身的成交负责改变跟随仓位。若目标订单部分成交，跟随挂单保留剩余数量。
-- `COPY_OPEN_POSITIONS=false` 时，不会在启动时追入目标已有仓位。
-- `COPY_OPEN_POSITIONS=true` 时可按盈亏筛选要追的旧仓位：`COPY_OPEN_PNL_FILTER=loss` 只追目标**当前浮亏**的仓位（你在更好的价位进场），`profit` 只追浮盈的，`all` 全追（旧行为，默认）。筛选按交易所返回的 `unrealizedPnl` 判断，恰好持平的仓位不计入 `loss`。
+- **启动时绝不复制目标已有仓位**，一次下单都不会发。已有仓位只能在 Telegram 用 `/copyloss` 手动处理：先列编号清单，可用序号只挑其中几笔，执行后回执每笔的成交价、数量、名义额和订单号。`COPY_OPEN_POSITIONS` 仅为兼容保留，置 `true` 也不会下单，只会多打一条提示。
+- `/copyloss` 默认列出目标**当前浮亏**的仓位（`COPY_OPEN_PNL_FILTER=loss`，你在更好的价位进场）；`/copyloss all` 列全部、`/copyloss profit` 只列浮盈。筛选按交易所返回的 `unrealizedPnl` 判断，恰好持平的不算浮亏。
 - 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
 - 平仓按目标本次减仓占其平仓前仓位的比例执行；仅在跟随钱包存在同方向仓位时使用 `reduce-only`，不会反手开仓。
 - 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
@@ -22,11 +22,16 @@
 - 每小时报告的统计块首行是跟单状态（`🟢 正在跟单` / `⏸️ 暂停跟单，自 MM-DD HH:MM 起` / `🔴 已停止`）。暂停期间仍按时发报，但报告会明确标出已暂停多久。
 - 容器日志和 Telegram 通知使用中国标准时间（UTC+8）。
 
-如果机器人启动前目标已经开仓，且需要主动复制该已有仓位，必须由使用者明确设置 `COPY_OPEN_POSITIONS=true` 并重启服务。该设置会产生真实订单；默认 `false` 不会追入已有仓位。
+目标在机器人启动前就持有的仓位，启动时**不会**被追入。原因是这条路径曾经在后台直接下真实市价单，既没有预览也没有通知，只能事后在交易所账本里发现。现在它被 `/copyloss` 取代：
 
-只想接目标的**浮亏**仓位时，同时设置 `COPY_OPEN_PNL_FILTER=loss`（见[配置项](#2-编辑-env)）。`COPY_OPEN_POSITIONS=false` 时该筛选不生效——两个开关是与关系，不是一个开关的两个取值。
+```text
+/copyloss                 # 列出目标当前浮亏的仓位（带编号），不下单
+/copyloss 1 3             # 预览只买第 1、3 笔
+/copyloss 1 3 confirm     # 真正下单，随后返回逐笔回执
+/copyloss confirm         # 清单里的浮亏仓位全部买
+```
 
-不想重启进程、想立刻接目标当前的水下仓时，用 Telegram 的 `/copyloss`：它复用启动追入的同一套代码（比例计算、杠杆截断、额度上限、模拟账本），区别只在于按**下单那一刻**的净值和市价重新计算，且每次执行前先看预览、再加 `confirm` 下单。
+比例、杠杆截断、额度上限都按**下单那一刻**的双端净值和市价现算；跟随钱包已持有的币种会标出来并跳过，重复发送不会翻倍买入。
 
 ## 快速开始
 
@@ -168,12 +173,12 @@ TARGET_WALLET_ADDRESS=
 SIMULATED_TRADING=true
 SIMULATED_ACCOUNT_BALANCE=1000.0
 
-# 启动时是否复制目标已有仓位。建议保持 false。
+# 启动时不复制已有仓位，此项仅为兼容保留（置 true 也不会下单）。
 COPY_OPEN_POSITIONS=false
-# 追入已有仓位时的盈亏范围（仅在 COPY_OPEN_POSITIONS=true 时生效）：
-#   loss   只追目标当前浮亏的仓位：你在比目标更好的价位进场，等于“接目标的水下仓”
-#   profit 只追目标当前浮盈的仓位：等于追高，慎用
-#   all    全部追入（旧行为，默认）
+# /copyloss 不带参数时列出的范围：
+#   loss   目标当前浮亏的仓位：你在比目标更好的价位进场，等于“接目标的水下仓”
+#   profit 目标当前浮盈的仓位：等于追高，慎用
+#   all    全部持仓
 COPY_OPEN_PNL_FILTER=loss
 
 # 启动时是否复制目标已有挂单。建议保持 false。
@@ -258,9 +263,9 @@ LOG_FILE=./logs/trading.log
 
 反过来，如果只想拿小额试水，显式写 `MAX_POSITION_SIZE=200` 比下调 `MAX_MARGIN_USAGE_RATIO` 更合适：前者只压单仓，不影响多仓位同时跟进。
 
-启动日志中的 `Your Copy` 是“若复制目标当前全部旧仓位”的预估，不代表已下单。只有 `COPY_OPEN_POSITIONS=true` 才会在启动时执行该操作。
+启动日志中的 `Your Copy` 是“若复制目标当前符合筛选的旧仓位”的预估，**不代表已下单**，启动时也不会下这些单。要执行必须到 Telegram 发 `/copyloss`。
 
-启动时的旧仓位复制受 `COPY_OPEN_PNL_FILTER` 控制：日志会打印 `PnL Filter: loss -> copying 2/7 position(s)`，预览段和实际下单段都只处理这 2 个仓位，`Your Copy` 合计也按这 2 个仓位统计。如果目标当前所有仓位都不符合筛选（例如 `loss` 但全部浮盈），启动复制段整段跳过，不会下任何单。
+日志里的 `PnL Filter: loss -> copying 2/7 position(s)` 只决定 `/copyloss` 默认列出的范围；清单按这个范围编号，可以只挑其中几笔，实际下单时仍会按当时的净值和市价重算数量。
 
 追浮亏仓位的经济含义：跟随钱包永远按**当前市价**成交，不吃目标的历史成本。目标浮亏时，它的入场价位于市价不利的一侧，你在更有利的一侧接同样的方向；反之 `profit` 意味着你比目标买得更贵。这也是为什么 `loss` 是更常见的默认值。
 
@@ -274,7 +279,7 @@ LOG_FILE=./logs/trading.log
 - `/pnl` 查看收益摘要，含目标钱包与跟随钱包的完整地址
 - `/leaderboard` 查看 Hyperliquid 公开排行榜，可按 24H、7D、30D 的收益额或收益率筛选；最多读取 200 名，每页 10 名
 - `/wallet 0x地址 [1-20]` 查询任意公开地址的账户状态、24H/7D/30D 净值变化和最近成交；默认显示 10 笔
-- `/copyloss [loss|all|profit] [confirm]` 按现价一键复制目标现有仓位：默认 `loss` 只复制目标当前**浮亏**的仓位；不带 `confirm` 只发预览（买什么、大约花多少），加 `confirm` 才真正下单。跟随钱包已持有的币种会自动跳过，防止重复买入；确认一步在实盘和模拟模式下都必需。
+- `/copyloss [loss|all|profit] [序号...] [confirm]` 手动复制目标现有仓位（启动时永不自动复制）：不带参数先列出编号清单和每笔大约要花的钱；`/copyloss 1 3` 只选第 1、3 笔；加 `confirm` 才真正下单，随后返回逐笔回执（成交价、数量、名义额、订单号，失败项带原因）。跟随钱包已持有的币种会标出来并跳过，防止重复买入。
 - `/pause` 暂停复制新成交，保留已有仓位
 - `/resume` 恢复复制
 - `/stop` 停止机器人，可选择是否平仓
@@ -293,13 +298,12 @@ LOG_FILE=./logs/trading.log
 
 暂停后仍会每小时发报（用于确认进程还活着），所以状态行是区分“在跑”和“被我停了”的唯一依据。`🔴 已停止` 只在进程即将退出时出现，正常停机由单独的关机通知负责。
 
-启动通知和 `/status` 末尾都会显示当前的旧仓位追入策略，取值来自同一处逻辑：
+启动通知和 `/status` 末尾都会说明旧仓位的处理方式，文案来自同一处逻辑，只反映 `/copyloss` 的默认范围：
 
 ```text
-• 追入旧仓位：不追入（只跟启动后的新成交）        COPY_OPEN_POSITIONS=false
-• 追入旧仓位：只追浮亏仓位（你在更好的价位进场）   COPY_OPEN_POSITIONS=true, COPY_OPEN_PNL_FILTER=loss
-• 追入旧仓位：只追浮盈仓位（等于追高）             COPY_OPEN_POSITIONS=true, COPY_OPEN_PNL_FILTER=profit
-• 追入旧仓位：全部已有仓位                         COPY_OPEN_POSITIONS=true, COPY_OPEN_PNL_FILTER=all
+• 追入旧仓位：手动：/copyloss 选择浮亏仓位（启动不自动追入）   COPY_OPEN_PNL_FILTER=loss
+• 追入旧仓位：手动：/copyloss 选择浮盈仓位（启动不自动追入）   COPY_OPEN_PNL_FILTER=profit
+• 追入旧仓位：手动：/copyloss 选择全部仓位（启动不自动追入）   COPY_OPEN_PNL_FILTER=all
 ```
 
 ### 排行榜与地址查询
