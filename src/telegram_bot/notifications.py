@@ -98,12 +98,22 @@ class NotificationService:
         target_size: float,
         status: str = "PENDING",
         target_leverage: float | None = None,
+        target_oid: str = "",
+        follower_oid: str = "",
     ) -> bool:
         """Notify about a mirrored target order before it is filled."""
         leverage_text = f"{leverage:g}x"
         target_leverage_text = (
             f"{target_leverage:g}x" if target_leverage is not None else leverage_text
         )
+        # Target orders often cluster: a cancel-and-replace at a new price or a
+        # second add looks almost identical to the previous notification. The
+        # order ids are the only fields that prove which target order this is.
+        oid_lines = ""
+        if target_oid:
+            oid_lines += f"\n<b>目标订单号：</b><code>{target_oid}</code>"
+        if follower_oid:
+            oid_lines += f"\n<b>跟随订单号：</b><code>{follower_oid}</code>"
         message = f"""
 🧪 <b>检测到新镜像订单</b> [{status}]
 
@@ -114,6 +124,7 @@ class NotificationService:
 <b>目标杠杆：</b>{target_leverage_text}
 <b>跟随杠杆：</b>{leverage_text}
 <b>名义价值：</b>${size * entry_price:,.2f}
+{oid_lines}
 
 ━━━━━━━━━━━━━━━━━━
 <b>目标数量：</b>{target_size:.4f}

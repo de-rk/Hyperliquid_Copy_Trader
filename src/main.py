@@ -1596,6 +1596,7 @@ async def _mirror_new_order(order_data: dict):
                 symbol=symbol, side=notification_side, size=our_size,
                 entry_price=price, leverage=leverage, target_size=target_size,
                 status="已镜像", target_leverage=target_leverage,
+                target_oid=target_oid, follower_oid=str(result),
             )
     except Exception as e:
         logger.error(f"Error notifying new target order: {e}")
