@@ -42,10 +42,10 @@ class TelegramBot:
         self.app: Optional[Application] = None
         
         # Callbacks that main app can set
+        self.on_start_requested: Optional[Callable] = None
         self.on_stop_requested: Optional[Callable] = None
+        self.on_close_positions_requested: Optional[Callable] = None
         self.on_follow_requested: Optional[Callable] = None
-        self.on_pause_requested: Optional[Callable] = None
-        self.on_resume_requested: Optional[Callable] = None
         self.on_copy_existing_requested: Optional[Callable] = None
         self.get_status_callback: Optional[Callable] = None
         self.get_orders_callback: Optional[Callable] = None
@@ -64,16 +64,29 @@ class TelegramBot:
         return True
     
     async def _start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+        """Handle /start: resume/start copying and show the command reference.
+
+        Merged from the old /start (help only) and /resume: this is now the
+        single "make it run again" command, for both a paused and a stopped bot.
+        """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
             return
-        
+
+        state_line = "🟢 运行中"
+        if self.on_start_requested:
+            try:
+                state_line = await self.on_start_requested()
+            except Exception as e:
+                logger.error(f"Error starting bot: {e}")
+                state_line = f"❌ 启动失败：{e}"
+
         message = f"""
 🤖 <b>Hyperliquid 跟单机器人</b>
 
 <b>可用命令：</b>
 
+/start - 启动或恢复跟单（暂停/停止后都用它）
 /status - 查看运行状态
 /orders - 查看当前挂单
 /pnl - 查看收益摘要
@@ -81,11 +94,10 @@ class TelegramBot:
 /wallet 地址 [数量] - 查询公开账户收益和最近成交
 /follow 地址 - 更换跟单目标钱包
 /copyloss [loss|all|profit] [序号...] [confirm] [force] - 手动复制目标现有仓位：先列清单，可只买指定序号，执行后回执；已持有或刚复制过的会自动拦下，确需叠加再加 force
-/pause - 暂停复制新成交，保留仓位
-/resume - 恢复复制
-/stop - 停止机器人，可选择是否平仓
+/close [序号|币种|all] [confirm] - 平掉自己的仓位：先列清单，可选币种或序号，执行后回执
+/stop - 停止跟单：撤掉挂单，保留仓位（发 /start 恢复）
 
-<b>状态：</b>🟢 运行中
+<b>状态：</b>{state_line}
 <b>版本：</b>{build_stamp()}
         """
         await update.message.reply_text(message.strip(), parse_mode="HTML")
@@ -214,74 +226,74 @@ class TelegramBot:
         else:
             await update.message.reply_text("📋 挂单查询尚未配置")
     
-    async def _pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /pause command"""
+    async def _close_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /close - close the follower's own positions, on demand.
+
+        Two steps on purpose: without ``confirm`` it only lists what would be
+        closed, because in live mode every item is a real reduce-only market
+        order. Items can be picked by 1-based number or by (partial) symbol,
+        e.g. ``/close 1 3 confirm`` or ``/close BTC confirm``; ``all`` closes
+        everything. Works while the bot is paused or stopped — that is the
+        point, since /stop no longer closes anything.
+        """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
             return
-        
-        if self.on_pause_requested:
-            try:
-                await self.on_pause_requested()
-                await update.message.reply_text(
-                    "⏸️ <b>机器人已暂停</b>\n\n不会再复制新成交。\n已有仓位保持不变。",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Error pausing: {e}")
-                await update.message.reply_text(f"❌ 暂停失败：{e}")
-        else:
-            await update.message.reply_text("暂停功能尚未配置")
-    
-    async def _resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /resume command"""
-        if not self._check_authorized(update):
-            await update.message.reply_text("⛔ 未授权的聊天")
+        if not self.on_close_positions_requested:
+            await update.message.reply_text("平仓功能尚未配置")
             return
-        
-        if self.on_resume_requested:
-            try:
-                resumed = await self.on_resume_requested()
-                if resumed is False:
-                    await update.message.reply_text(
-                        "🔴 <b>机器人已停止</b>\n\n停止后不会被 /resume 唤醒；请手动重启机器人后再恢复跟单。",
-                        parse_mode="HTML"
-                    )
-                    return
-                await update.message.reply_text(
-                    "▶️ <b>机器人已恢复</b>\n\n正在继续复制新成交。",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Error resuming: {e}")
-                await update.message.reply_text(f"❌ 恢复失败：{e}")
-        else:
-            await update.message.reply_text("恢复功能尚未配置")
-    
+
+        args = [arg.strip() for arg in (context.args or [])]
+        confirm = False
+        selection: list[str] = []
+        for arg in args:
+            if arg.lower() in ("confirm", "go", "yes", "执行"):
+                confirm = True
+                continue
+            for part in re.split(r"[,，、\s]+", arg):
+                if part:
+                    selection.append(part)
+
+        if not confirm and not selection:
+            # Bare /close or /close confirm with nothing else: still useful as
+            # the list view, so fall through with an empty selection.
+            selection = None
+        try:
+            await update.message.reply_text("⏳ 正在读取跟随账户持仓...", parse_mode="HTML")
+            result = await self.on_close_positions_requested(selection, confirm)
+            await update.message.reply_text(result, parse_mode="HTML")
+        except Exception as exc:
+            logger.error(f"Error closing positions: {exc}")
+            await update.message.reply_text(f"❌ 平仓失败：{exc}")
+
     async def _stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stop command - show confirmation"""
+        """Handle /stop: stop copying immediately, keep positions.
+
+        Merged from the old /stop (which asked whether to close everything via
+        buttons) and /pause: stopping now never touches positions, and closing
+        has its own command in /close, so there is no confirmation step.
+        """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
             return
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("平掉全部仓位", callback_data="stop_close"),
-                InlineKeyboardButton("保留现有仓位", callback_data="stop_keep")
-            ],
-            [InlineKeyboardButton("❌ 取消", callback_data="stop_cancel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "⚠️ <b>停止跟单</b>\n\n"
-            "将会：\n"
-            "✅ 停止复制新成交\n"
-            "✅ 取消全部挂单\n\n"
-            "是否同时平掉全部仓位？",
-            reply_markup=reply_markup,
-            parse_mode="HTML"
-        )
+
+        if not self.on_stop_requested:
+            await update.message.reply_text("停止功能尚未配置")
+            return
+
+        try:
+            await self.on_stop_requested()
+            await update.message.reply_text(
+                "🛑 <b>机器人已停止</b>\n\n"
+                "• 已停止复制新成交\n"
+                "• 全部挂单已取消\n"
+                "• 仓位全部保留（要平仓请用 /close）\n\n"
+                "发 <code>/start</code> 恢复跟单。",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Error stopping bot: {e}")
+            await update.message.reply_text(f"❌ 停止失败：{e}")
 
     @staticmethod
     def _leaderboard_keyboard(
@@ -369,54 +381,11 @@ class TelegramBot:
                 await query.edit_message_text(f"❌ 获取排行榜失败：{e}")
             return
         
-        if query.data == "stop_close":
+        if query.data == "stop_close" or query.data == "stop_keep" or query.data == "stop_cancel":
+            # Legacy buttons from the old /stop dialog. /stop no longer shows
+            # buttons, but an old message may still be sitting in the chat.
             await query.edit_message_text(
-                "🛑 <b>正在停止机器人...</b>\n\n"
-                "• 正在取消全部挂单\n"
-                "• 正在平掉全部仓位\n"
-                "• 跟单将保持停止\n\n"
-                "请稍候...",
-                parse_mode="HTML"
-            )
-            if self.on_stop_requested:
-                try:
-                    await self.on_stop_requested(close_positions=True)
-                    await query.edit_message_text(
-                        "✅ <b>机器人已停止</b>\n\n"
-                        "全部挂单已取消。\n"
-                        "全部仓位已平。\n"
-                        "状态：🔴 已停止",
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    await query.edit_message_text(f"❌ 停止失败：{e}")
-        
-        elif query.data == "stop_keep":
-            await query.edit_message_text(
-                "🛑 <b>正在停止机器人...</b>\n\n"
-                "• 正在取消全部挂单\n"
-                "• 保留现有仓位\n"
-                "• 跟单将保持停止\n\n"
-                "请稍候...",
-                parse_mode="HTML"
-            )
-            if self.on_stop_requested:
-                try:
-                    await self.on_stop_requested(close_positions=False)
-                    await query.edit_message_text(
-                        "✅ <b>机器人已停止</b>\n\n"
-                        "全部挂单已取消。\n"
-                        "仓位已保留。\n"
-                        "状态：🔴 已停止",
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    await query.edit_message_text(f"❌ 停止失败：{e}")
-        
-        elif query.data == "stop_cancel":
-            await query.edit_message_text(
-                "✅ 已取消停止操作，机器人仍在运行。",
-                parse_mode="HTML"
+                "ℹ️ 停止命令已更新：/stop 直接停止并保留仓位，平仓请用 /close。"
             )
     
     async def _pnl_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,17 +448,16 @@ class TelegramBot:
         ``/status``) are left out on purpose.
         """
         return [
-            BotCommand("start", "启动机器人"),
+            BotCommand("start", "启动或恢复跟单"),
             BotCommand("status", "查看运行状态和自己的持仓"),
             BotCommand("orders", "查看当前挂单"),
             BotCommand("pnl", "查看收益摘要"),
             BotCommand("wallet", "查询公开账户"),
             BotCommand("follow", "更换跟单目标钱包"),
             BotCommand("copyloss", "手动复制目标现有仓位（可选序号，带回执）"),
+            BotCommand("close", "平掉自己的仓位（可选币种/序号，带回执）"),
             BotCommand("leaderboard", "查看收益排行榜"),
-            BotCommand("pause", "暂停成交跟单"),
-            BotCommand("resume", "恢复暂停的跟单"),
-            BotCommand("stop", "停止跟单，重启后恢复"),
+            BotCommand("stop", "停止跟单，保留仓位"),
         ]
 
     async def _publish_command_menu(self) -> None:
@@ -553,8 +521,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("copyloss", self._copyloss_command))
         self.app.add_handler(CommandHandler("positions", self._positions_command))
         self.app.add_handler(CommandHandler("orders", self._orders_command))
-        self.app.add_handler(CommandHandler("pause", self._pause_command))
-        self.app.add_handler(CommandHandler("resume", self._resume_command))
+        self.app.add_handler(CommandHandler("close", self._close_command))
         self.app.add_handler(CommandHandler("stop", self._stop_command))
         self.app.add_handler(CommandHandler("pnl", self._pnl_command))
         self.app.add_handler(CommandHandler("leaderboard", self._leaderboard_command))

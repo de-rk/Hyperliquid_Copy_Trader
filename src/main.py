@@ -62,6 +62,9 @@ is_paused = False
 is_stopped = False
 # When the pause started, so reports can say how long copying has been off.
 paused_since: Optional[datetime] = None
+# Set by /start to wake run_target_monitor out of its post-/stop wait, so a
+# stopped bot can resume copying without restarting the container.
+restart_requested = asyncio.Event()
 trades_copied_count = 0
 bot_start_time = None
 
@@ -90,6 +93,9 @@ pending_target_fills: dict[str, list[dict]] = {}
 trade_execution_lock = asyncio.Lock()
 # Serializes the /copyloss command; a double tap must not double the position.
 copy_existing_lock = asyncio.Lock()
+# Serializes the /close command so a double tap cannot send duplicate
+# reduce-only orders while the first batch is still filling.
+close_positions_lock = asyncio.Lock()
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -2445,7 +2451,7 @@ async def get_status() -> str:
         pnl = follower_state.unrealized_pnl if follower_state else 0
     
     status_emoji = "🔴" if is_stopped else ("🟢" if not is_paused else "⏸️")
-    status_text = "已停止" if is_stopped else ("运行中" if not is_paused else "已暂停")
+    status_text = "已停止（发 /start 恢复）" if is_stopped else ("运行中" if not is_paused else "已暂停（发 /start 恢复）")
     mode = "模拟" if settings.simulated_trading else "实盘"
     if settings.simulated_trading:
         position_lines = [
@@ -2781,24 +2787,325 @@ async def get_wallet_report(address: str, fill_limit: int = 30) -> str:
     return "\n".join(lines)
 
 
-async def handle_pause():
-    """Handle pause request from Telegram"""
-    global is_paused, paused_since
-    is_paused = True
-    paused_since = datetime.now(timezone.utc)
-    logger.warning("⏸️ Bot paused by Telegram command")
+async def handle_start() -> str:
+    """/start: start or resume copying.
 
+    Merged from the old /start (help text only) and /resume: a paused bot is
+    unpaused, a stopped bot gets a fresh monitor and the monitor loop is woken
+    up, so a stop no longer requires a container restart to undo.
+    """
+    global is_paused, is_stopped, paused_since, monitor
 
-async def handle_resume():
-    """Handle resume request from Telegram"""
-    global is_paused, paused_since
+    if not client or not executor:
+        return "❌ 机器人尚未就绪，请稍后再试。"
+
     if is_stopped:
-        logger.warning("Resume ignored because the bot was stopped; restart is required")
-        return False
-    is_paused = False
-    paused_since = None
-    logger.info("▶️ Bot resumed by Telegram command")
-    return True
+        # A fresh monitor gives a clean event baseline, exactly like a target
+        # switch: no historical fills are replayed after the gap.
+        new_monitor = WalletMonitor(
+            settings.target_wallet,
+            settings.hyperliquid.api_url,
+            settings.hyperliquid.ws_url,
+            fill_polling_enabled=settings.copy_rules.fill_polling_enabled,
+            fill_poll_interval_seconds=settings.copy_rules.fill_poll_interval_seconds,
+        )
+        configure_monitor_callbacks(new_monitor)
+        monitor = new_monitor
+        is_stopped = False
+        is_paused = False
+        paused_since = None
+        restart_requested.set()
+        logger.warning("▶️ Bot resumed by /start after being stopped")
+        return "▶️ 已恢复跟单：已重新连接目标监控，继续复制新成交（仓位保持不变）。"
+
+    if is_paused:
+        is_paused = False
+        paused_since = None
+        logger.info("▶️ Bot resumed by /start")
+        return "▶️ 已恢复复制新成交（此前为暂停状态）。"
+
+    return "ℹ️ 机器人本来就在运行中，无需启动。"
+
+
+async def handle_close(
+    selection: Optional[list[str]] = None,
+    confirm: bool = False,
+) -> str:
+    """/close: close the follower's own positions, chosen by number or symbol.
+
+    Manual by design and deliberately independent of the copy state: /stop
+    keeps positions on purpose, so closing must work while the bot is paused
+    or stopped. Without ``confirm`` it only lists what would be closed, because
+    in live mode every item is a real reduce-only market order.
+    """
+    if not client or not executor:
+        return "❌ 机器人尚未就绪，请稍后再试。"
+
+    # Read the follower's own book, never the target's cached positions.
+    if settings.simulated_trading:
+        book: list[dict] = []
+        for symbol, data in simulated_positions.items():
+            size = float(data.get("size", 0.0) or 0.0)
+            if size == 0:
+                continue
+            side = str(data.get("side") or ("LONG" if size > 0 else "SHORT")).upper()
+            entry = float(data.get("entry_price", 0.0) or 0.0)
+            book.append({
+                "symbol": symbol,
+                "side": side,
+                "size": abs(size),
+                "entry_price": entry,
+                "unrealized_pnl": 0.0,
+            })
+    else:
+        follower_state = await _get_follower_state()
+        if follower_state is None:
+            return (
+                "❌ 无法读取跟随钱包当前持仓，已取消。\n"
+                "请稍后重试；若持续失败，检查 API 连接或钱包地址配置。"
+            )
+        book = [
+            {
+                "symbol": position.symbol,
+                "side": position.side.value.upper(),
+                "size": abs(float(position.size)),
+                "entry_price": float(position.entry_price),
+                "unrealized_pnl": float(position.unrealized_pnl or 0.0),
+            }
+            for position in follower_state.positions
+            if abs(float(position.size)) > 0
+        ]
+
+    if not book:
+        return "ℹ️ 跟随账户当前没有任何持仓，无需平仓。"
+
+    # Selection: 1-based numbers into this list, or symbol substrings
+    # (case-insensitive, so "btc" matches "BTC" and "skhx" matches "xyz:SKHX").
+    chosen: list[dict] = []
+    unknown: list[str] = []
+    if selection:
+        wanted: list[dict] = []
+        for token in selection:
+            token = token.strip()
+            if not token:
+                continue
+            if token.lower() in ("all", "全部"):
+                wanted = list(book)
+                break
+            if token.isdigit():
+                number = int(token)
+                if 1 <= number <= len(book):
+                    if book[number - 1] not in wanted:
+                        wanted.append(book[number - 1])
+                else:
+                    unknown.append(token)
+                continue
+            matches = [
+                row for row in book
+                if token.lower() in row["symbol"].lower()
+            ]
+            if matches:
+                for row in matches:
+                    if row not in wanted:
+                        wanted.append(row)
+            else:
+                unknown.append(token)
+        if unknown:
+            listed = "、".join(html.escape(str(item)) for item in unknown)
+            return (
+                f"❌ 无法识别的序号或币种：{listed}\n"
+                f"当前可选 1-{len(book)}。发送 <code>/close</code> 查看列表。"
+            )
+        chosen = wanted
+    else:
+        chosen = list(book)
+
+    lines = [
+        f"🔻 <b>平仓{'（预览）' if not confirm else ''}</b>｜"
+        f"{'模拟' if settings.simulated_trading else '实盘'}",
+        "",
+    ]
+    selected_ids = {id(row) for row in chosen}
+    total_value = 0.0
+    for index, row in enumerate(book, 1):
+        current_price = await _close_reference_price(row["symbol"], row["entry_price"])
+        value = row["size"] * current_price
+        picked = " ✅" if id(row) in selected_ids else ""
+        total_value += value
+        lines.append(
+            f"{index}. {html.escape(row['symbol'])} {row['side']}｜"
+            f"数量 {row['size']:.6g}｜≈ ${value:,.0f}｜"
+            f"PnL ${row['unrealized_pnl']:+,.0f}{picked}"
+        )
+    if selection and chosen:
+        names = " ".join(
+            str(next(i for i, row in enumerate(book, 1) if row is item))
+            for item in chosen
+        )
+        lines.append("")
+        lines.append(f"已选 {len(chosen)} 笔，合计 ≈ ${total_value:,.2f}。")
+        if not confirm:
+            lines.append(f"发送 <code>/close {names} confirm</code> 执行平仓。")
+    elif not confirm:
+        lines.append("")
+        lines.append(
+            f"全部 {len(book)} 笔合计 ≈ ${total_value:,.2f}。"
+            f"全部平仓：<code>/close all confirm</code>；"
+            f"只平部分：按序号 <code>/close 1 3 confirm</code> 或按币种 "
+            f"<code>/close BTC confirm</code>。"
+        )
+    if not confirm:
+        lines.append("未加 confirm 之前不会发送任何订单。")
+        return "\n".join(lines)
+
+    if close_positions_lock.locked():
+        return "⏳ 上一次平仓仍在执行，请稍后再试。"
+
+    started_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - 5000
+    records: list[dict[str, Any]] = []
+    async with close_positions_lock:
+        for index, row in enumerate(chosen, 1):
+            symbol = row["symbol"]
+            close_side = OrderSide.SELL if row["side"] == "LONG" else OrderSide.BUY
+            try:
+                # The reduce-only size and side come from the same read that
+                # built the list, but the order itself only goes out under the
+                # trade lock, after /stop's cancel path has drained.
+                async with trade_execution_lock:
+                    order_id = await executor.close_position(
+                        symbol,
+                        size=Decimal(str(row["size"])),
+                        side=close_side,
+                    )
+            except Exception as exc:
+                logger.exception(f"/close failed for {symbol}: {exc}")
+                order_id = None
+                reason = f"异常：{exc}"
+            else:
+                reason = (
+                    (getattr(executor, "last_error", "") or "").strip()
+                    or "交易所未返回订单号"
+                ) if not order_id else ""
+
+            record = {
+                "symbol": symbol,
+                "side": close_side.value.upper(),
+                "ok": bool(order_id),
+                "size": row["size"],
+                "notional": 0.0,
+                "order_id": str(order_id) if order_id else None,
+                "fill_price": None,
+                "fill_size": None,
+                "closed_pnl": None,
+                "reason": reason,
+            }
+            current_price = await _close_reference_price(symbol, row["entry_price"])
+            record["notional"] = row["size"] * current_price
+            records.append(record)
+            if not record["ok"]:
+                logger.error(f"/close failed for {symbol}: {record['reason']}")
+
+    fills = await _recent_fills_by_symbol(started_at_ms)
+    for record in records:
+        if not record["ok"]:
+            continue
+        fill = fills.get(record["symbol"]) or fills.get(record["symbol"].lower())
+        if fill:
+            record["fill_price"] = fill.get("price")
+            record["fill_size"] = fill.get("size")
+            record["closed_pnl"] = fill.get("closed_pnl")
+
+    if settings.simulated_trading:
+        for record in records:
+            if not record["ok"]:
+                continue
+            row = next((item for item in chosen if item["symbol"] == record["symbol"]), None)
+            if row is None:
+                continue
+            _apply_simulated_close(row, record["fill_price"] or record["notional"] / max(row["size"], 1e-12))
+
+    return _close_receipt_text(records)
+
+
+def _apply_simulated_close(row: dict, exit_price: float) -> None:
+    """Mirror on_position_close's simulator accounting for a manual close."""
+    global simulated_balance, simulated_pnl
+    symbol = row["symbol"]
+    position = simulated_positions.get(symbol)
+    if position is None:
+        return
+    quantity = abs(float(position.get("size", 0.0) or 0.0))
+    entry = float(position.get("entry_price", 0.0) or 0.0)
+    side = str(position.get("side") or ("LONG" if float(position.get("size", 0.0)) > 0 else "SHORT")).upper()
+    if side == "LONG":
+        pnl = quantity * (exit_price - entry)
+    else:
+        pnl = quantity * (entry - exit_price)
+    value = float(position.get("value", quantity * entry) or 0.0)
+    leverage = float(position.get("leverage", 1) or 1)
+    margin_used = value / leverage if leverage > 0 else 0.0
+    simulated_balance += margin_used + pnl
+    simulated_pnl += pnl
+    # /close always closes the whole position, so the book entry goes away.
+    del simulated_positions[symbol]
+    logger.success(
+        f"💰 SIMULATED MANUAL CLOSE: {symbol} exit=${exit_price:,.2f} "
+        f"pnl=${pnl:,.2f} balance=${simulated_balance:,.2f}"
+    )
+
+
+async def _close_reference_price(symbol: str, fallback: float) -> float:
+    """Best-effort market price for a close preview/receipt."""
+    try:
+        price = await client.get_market_price(symbol)
+        if price and price > 0:
+            return float(price)
+    except Exception:
+        pass
+    return float(fallback or 0.0)
+
+
+def _close_receipt_text(records: list[dict[str, Any]]) -> str:
+    """Render the per-position receipt for a manual close run."""
+    stamp = datetime.now(SHANGHAI_TZ).strftime("%m-%d %H:%M:%S")
+    filled = [record for record in records if record["ok"]]
+    total_notional = sum(record["notional"] for record in filled)
+    lines = [
+        f"🧾 <b>平仓回执</b>｜{'模拟' if settings.simulated_trading else '实盘'}｜{stamp}",
+        "",
+    ]
+    for index, record in enumerate(records, 1):
+        symbol = html.escape(str(record["symbol"]))
+        side = record["side"]
+        if not record["ok"]:
+            reason = html.escape(str(record["reason"] or "未知原因"))
+            lines.append(f"{index}. ❌ <b>{symbol} {side}</b>")
+            lines.append(f"   未平仓：{reason}")
+            continue
+        size = record["fill_size"] or record["size"]
+        price = record["fill_price"]
+        if price:
+            price_text = f"@ ${price:,.4f}"
+        elif settings.simulated_trading:
+            price_text = "（模拟，按当时市价）"
+        else:
+            price_text = "（未取到成交价，以交易所为准）"
+        lines.append(f"{index}. ✅ <b>{symbol} {side}</b>｜reduce-only")
+        lines.append(
+            f"   平掉 {float(size):.6g} {price_text}｜名义 ${record['notional']:,.2f}"
+        )
+        if record.get("closed_pnl") is not None:
+            lines.append(f"   已实现盈亏 ${record['closed_pnl']:+,.2f}")
+        if record["order_id"]:
+            lines.append(f"   订单 <code>{html.escape(str(record['order_id']))}</code>")
+    lines.append("")
+    lines.append(
+        f"合计：成功 {len(filled)}/{len(records)}｜平仓名义 ${total_notional:,.2f}"
+    )
+    remaining = len(simulated_positions) if settings.simulated_trading else None
+    if remaining is not None:
+        lines.append(f"模拟账户剩余持仓：{remaining} 个。")
+    return "\n".join(lines)
 
 
 async def handle_follow(address: str) -> str:
@@ -2876,10 +3183,15 @@ async def handle_follow(address: str) -> str:
     )
 
 
-async def handle_stop(close_positions: bool = False):
-    """Handle stop request from Telegram"""
+async def handle_stop():
+    """Handle stop request from Telegram: stop copying, keep positions.
+
+    The old /stop asked whether to close everything; that choice now lives in
+    /close, which can also pick single symbols. Positions are deliberately
+    kept here — stopping should never liquidate the account as a side effect.
+    """
     global is_paused, is_stopped, paused_since
-    logger.warning(f"🛑 Stop requested from Telegram (close_positions={close_positions})")
+    logger.warning("🛑 Stop requested from Telegram (positions are kept)")
     is_paused = True
     is_stopped = True
     if paused_since is None:
@@ -2894,35 +3206,19 @@ async def handle_stop(close_positions: bool = False):
     pending_order_batches.clear()
     pending_target_order_ids.clear()
     pending_target_fills.clear()
-    
+
     # Wait for an already-started copy action before cancelling orders. Once
     # this lock is held, no earlier mirror coroutine can submit after /stop.
     async with trade_execution_lock:
         if executor:
             await executor.cancel_all_orders()
 
-        # Close follower positions, never the target wallet's cached positions.
-        if close_positions:
-            follower_state = await _get_follower_state() if not settings.simulated_trading else None
-            positions = (
-                follower_state.positions if follower_state else []
-            ) if not settings.simulated_trading else []
-            for pos in positions:
-                logger.info(f"Closing position: {pos.symbol}")
-                close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
-                await executor.close_position(
-                    pos.symbol,
-                    size=Decimal(str(pos.size)),
-                    side=close_side,
-                )
-    
     # Stop monitoring
     if monitor:
         await monitor.stop_monitoring()
 
-    # Keep Telegram alive to report the stopped status. Exiting here would be
-    # restarted by Docker's `restart: unless-stopped` policy and resume copying.
-    logger.warning("🛑 Bot stopped. Restart the container explicitly to enable copying again.")
+    # Keep Telegram alive to report the stopped status and to accept /start.
+    logger.warning("🛑 Bot stopped. Send /start to resume copying.")
 
 
 async def send_hourly_reports():
@@ -2969,8 +3265,11 @@ async def run_target_monitor():
         await current_monitor.start_monitoring()
         if is_stopped:
             # /stop deliberately keeps Telegram alive, but this task must not
-            # reconnect or consume new target events afterward.
-            await asyncio.Event().wait()
+            # reconnect or consume new target events afterward. /start sets
+            # restart_requested to resume with a fresh monitor, so no container
+            # restart is needed to undo a stop.
+            await restart_requested.wait()
+            restart_requested.clear()
         if monitor is current_monitor:
             logger.warning("Target monitor stopped unexpectedly; reconnecting")
             await asyncio.sleep(1)
@@ -3279,9 +3578,9 @@ async def main():
         telegram_bot.get_pnl_callback = get_pnl
         telegram_bot.get_leaderboard_callback = get_leaderboard
         telegram_bot.get_wallet_callback = get_wallet_report
-        telegram_bot.on_pause_requested = handle_pause
-        telegram_bot.on_resume_requested = handle_resume
+        telegram_bot.on_start_requested = handle_start
         telegram_bot.on_stop_requested = handle_stop
+        telegram_bot.on_close_positions_requested = handle_close
         telegram_bot.on_follow_requested = handle_follow
         telegram_bot.on_copy_existing_requested = handle_copy_existing
         
