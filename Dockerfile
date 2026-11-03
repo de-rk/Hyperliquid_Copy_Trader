@@ -23,6 +23,10 @@ RUN if [ "$INSTALL_TELEGRAM" = "true" ]; then \
 ARG BUILD_ID=unknown
 ENV BUILD_ID=$BUILD_ID
 
+# Distinguishes images built without a commit stamp: two "+local" builds get
+# different times, so "did the rebuild actually happen" is answerable from /start.
+RUN date -u +"%Y%m%d-%H%M" > /app/.build_time
+
 # Copy application code
 COPY src/ ./src/
 COPY .env.example ./.env.example

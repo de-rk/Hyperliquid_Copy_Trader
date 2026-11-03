@@ -40,8 +40,23 @@ def _git_short_sha() -> str:
     return result.stdout.strip()
 
 
+def _build_time() -> str:
+    """UTC build time baked by the Dockerfile, or "" outside an image."""
+    try:
+        return (_REPO_ROOT / ".build_time").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 @lru_cache(maxsize=1)
 def build_stamp() -> str:
-    """Short, chat-safe build label such as ``v1.1.0 +6957695``."""
+    """Short, chat-safe build label such as ``v1.1.0 +6957695``.
+
+    A build that went through anything other than the start scripts has no
+    commit available; appending the image build time keeps two such images
+    distinguishable instead of both reading ``+local``.
+    """
     stamp = os.getenv("BUILD_ID", "").strip() or _git_short_sha()
-    return f"v{APP_VERSION} +{stamp}" if stamp else f"v{APP_VERSION}"
+    if not stamp or stamp == "local":
+        stamp = f"local@{_build_time()}" if _build_time() else "local"
+    return f"v{APP_VERSION} +{stamp}"

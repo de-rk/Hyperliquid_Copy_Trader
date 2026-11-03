@@ -56,3 +56,6 @@ Thumbs.db
 
 # Local agent workspace (memory, skills)
 .workbuddy/
+
+# Baked by the Dockerfile at image build time
+.build_time

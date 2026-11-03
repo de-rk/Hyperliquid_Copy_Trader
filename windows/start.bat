@@ -1,5 +1,13 @@
 @echo off
 echo Starting Hyperliquid Copy Trader with Docker...
+
+rem Stamp the image with the current commit so /start shows the live build.
+rem The image ships no .git (.dockerignore excludes it), so the commit can
+rem only reach it through this variable; compose reads it as ${BUILD_ID:-local}.
+set "BUILD_ID=local"
+for /f "delims=" %%i in ('git rev-parse --short HEAD 2^>nul') do set "BUILD_ID=%%i"
+echo Build stamp: %BUILD_ID%
+
 rem .env must be a real file: compose mounts ./.env into the container, and if
 rem it is missing docker creates a directory instead, so every setting silently
 rem falls back to its default.
