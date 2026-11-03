@@ -7,7 +7,11 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
+    BotCommandScope,
     BotCommandScopeChat,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
 )
 from telegram.ext import (
     Application,
@@ -460,6 +464,20 @@ class TelegramBot:
             BotCommand("stop", "停止跟单，保留仓位"),
         ]
 
+    @staticmethod
+    def _stale_scopes() -> list[BotCommandScope]:
+        """Scopes that older builds may have written to and we never publish.
+
+        A stale command list in one of these scopes survives every rewrite of
+        the default scope, so it has to be deleted explicitly or the old
+        /pause and /resume entries keep showing up somewhere.
+        """
+        return [
+            BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(),
+            BotCommandScopeAllChatAdministrators(),
+        ]
+
     async def _publish_command_menu(self) -> None:
         """Publish the command menu and read it back so the log proves it stuck.
 
@@ -506,6 +524,20 @@ class TelegramBot:
                 logger.error(
                     f"Telegram command menu ({label}) is missing: {', '.join(missing)}"
                 )
+            stale = [name for name in names if name not in {c.command for c in commands}]
+            if stale:
+                logger.error(
+                    f"Telegram command menu ({label}) still contains removed commands: "
+                    f"{', '.join(stale)}"
+                )
+
+        for scope in self._stale_scopes():
+            label = type(scope).__name__
+            try:
+                await self.app.bot.delete_my_commands(scope=scope)
+                logger.success(f"Cleared stale Telegram command menu ({label})")
+            except Exception as exc:
+                logger.warning(f"Could not clear command menu ({label}): {exc}")
 
     async def start(self):
         """Start the Telegram bot"""
