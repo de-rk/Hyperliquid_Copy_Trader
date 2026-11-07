@@ -52,6 +52,20 @@ def _optional_limit(name: str, default: Optional[float]) -> Optional[float]:
     return value if value > 0 else None
 
 
+def _non_negative_float(name: str, default: float) -> float:
+    """Read a non-negative float, raising on garbage (fail at startup)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {raw!r}")
+    return value
+
+
 def _non_negative_int(name: str, default: int) -> int:
     """Read a non-negative integer, raising on garbage.
 
@@ -142,6 +156,28 @@ class RiskManagementConfig(BaseModel):
     enable_custom_stops: bool = False
     stop_loss_pct: float = 5.0
 
+
+class TargetEquityFlowConfig(BaseModel):
+    """Watch the followed wallet for deposits/withdrawals.
+
+    The follower's copy ratio is derived from the target's account value, so
+    an unnoticed withdrawal or deposit silently resizes every future copy.
+    Detection compares account equity between two polls, removes the change
+    caused by unrealized PnL, and only alerts if positions stayed put.
+    """
+
+    enabled: bool = True
+    poll_seconds: int = 60
+    # Both thresholds must be met: an absolute floor avoids noise on small
+    # accounts, a percentage floor keeps large accounts from missing a
+    # proportionally small but meaningful transfer.
+    min_usd: float = 100.0
+    min_pct: float = 1.0
+    # Max tolerated change in position sizes (percent of gross signed size).
+    max_position_change_pct: float = 5.0
+    cooldown_seconds: int = 300
+
+
 class Settings(BaseModel):
     # Target address to copy (wallet or vault - the bot treats them the same)
     target_wallet: str = "0x0ba5de43fa2419a25c2e680f84aff3a8f57fce22"
@@ -157,6 +193,7 @@ class Settings(BaseModel):
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
     copy_rules: CopyRulesConfig = Field(default_factory=CopyRulesConfig)
     risk_management: RiskManagementConfig = Field(default_factory=RiskManagementConfig)
+    target_equity_flow: TargetEquityFlowConfig = Field(default_factory=TargetEquityFlowConfig)
     
     # Paths
     log_level: str = "INFO"
@@ -261,6 +298,32 @@ class Settings(BaseModel):
         max_equity = os.getenv('MAX_ACCOUNT_EQUITY', 'x')
         settings.copy_rules.max_account_equity = None if max_equity.lower() == 'x' else float(max_equity)
         
+        # Target wallet fund-flow monitoring (deposit / withdrawal alerts).
+        flow = settings.target_equity_flow
+        flow.enabled = os.getenv(
+            'TARGET_EQUITY_FLOW_ENABLED', 'true'
+        ).strip().lower() in ('true', '1', 'yes', 'on')
+        # Never poll faster than the portfolio cache TTL allows changes to show.
+        flow.poll_seconds = max(15, _non_negative_int(
+            'TARGET_EQUITY_FLOW_POLL_SECONDS', flow.poll_seconds
+        ))
+        flow.min_usd = _non_negative_float(
+            'TARGET_EQUITY_FLOW_MIN_USD', flow.min_usd
+        )
+        flow.min_pct = _non_negative_float(
+            'TARGET_EQUITY_FLOW_MIN_PCT', flow.min_pct
+        )
+        flow.max_position_change_pct = min(
+            100.0,
+            _non_negative_float(
+                'TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT',
+                flow.max_position_change_pct,
+            ),
+        )
+        flow.cooldown_seconds = _non_negative_int(
+            'TARGET_EQUITY_FLOW_COOLDOWN_SECONDS', flow.cooldown_seconds
+        )
+
         # Blocked assets
         blocked = os.getenv('BLOCKED_ASSETS', '')
         settings.copy_rules.blocked_assets = [

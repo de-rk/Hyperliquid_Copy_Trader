@@ -381,6 +381,28 @@ class HyperliquidClient:
             logger.error(f"Failed to get portfolio PnL for {address}: {e}")
             return None
 
+    async def get_non_funding_ledger_updates(
+        self, address: str, start_ms: int, end_ms: int
+    ) -> List[Dict[str, Any]]:
+        """Return public deposit/withdraw/transfer events in a time window.
+
+        Unlike the other read helpers this one raises on failure: an empty
+        window and a failed lookup mean opposite things when explaining an
+        equity jump, so the caller must be able to tell them apart.
+        """
+        response = await self._post(
+            self.info_url,
+            {
+                "type": "userNonFundingLedgerUpdates",
+                "user": address,
+                "startTime": int(start_ms),
+                "endTime": int(end_ms),
+            },
+        )
+        if not isinstance(response, list):
+            raise RuntimeError("userNonFundingLedgerUpdates did not return a list")
+        return [item for item in response if isinstance(item, dict)]
+
     async def get_raw_user_fills(self, address: str) -> List[Dict[str, Any]]:
         """Return raw public fills for internal monitoring and formatting."""
         try:

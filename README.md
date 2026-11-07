@@ -266,6 +266,14 @@ MAX_ACCOUNT_EQUITY=x
 # 不跟随的币种，使用英文逗号分隔
 BLOCKED_ASSETS=
 
+# 目标地址出入金监控：仓位没大变但总资金大变时 Telegram 提醒
+TARGET_EQUITY_FLOW_ENABLED=true
+TARGET_EQUITY_FLOW_POLL_SECONDS=60
+TARGET_EQUITY_FLOW_MIN_USD=100
+TARGET_EQUITY_FLOW_MIN_PCT=1.0
+TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT=5
+TARGET_EQUITY_FLOW_COOLDOWN_SECONDS=300
+
 # Telegram 为可选功能
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -335,7 +343,7 @@ LOG_FILE=./logs/trading.log
 🤖 跟单状态：🔴 已停止（不再复制任何成交）
 ```
 
-暂停后仍会每小时发报（用于确认进程还活着），所以状态行是区分“在跑”和“被我停了”的唯一依据。`🔴 已停止` 只在进程即将退出时出现，正常停机由单独的关机通知负责。
+暂停后仍会每小时发报（用于确认进程还活着），所以状态行是区分“在跑”和“被我停了”的唯一依据。`🔴 已停止` 表示收到过 `/stop`，此时跟单已停但进程仍在（Telegram 可用），发 `/start` 即可恢复，不需要重启容器；进程真正退出时另有单独的关机通知。
 
 启动通知和 `/status` 末尾都会说明旧仓位的处理方式，文案来自同一处逻辑，只反映 `/copyloss` 的默认范围：
 
@@ -344,6 +352,40 @@ LOG_FILE=./logs/trading.log
 • 追入旧仓位：手动：/copyloss 选择浮盈仓位（启动不自动追入）   COPY_OPEN_PNL_FILTER=profit
 • 追入旧仓位：手动：/copyloss 选择全部仓位（启动不自动追入）   COPY_OPEN_PNL_FILTER=all
 ```
+
+### 目标地址出入金提醒
+
+按账户净值比例跟单时，目标钱包一次入金或出金会直接放大／缩小你后续每一笔单，而交易所不会推送「有人充值了」这种事件。机器人每 `TARGET_EQUITY_FLOW_POLL_SECONDS`（默认 60 秒）读一次目标账户的净值、未实现盈亏和带方向的持仓数量，同时满足下面三条才发 Telegram 通知：
+
+1. **仓位基本没变**：各币种带方向数量的变化 ≤ `TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT`（默认 5%），排除「目标交易了」；
+2. **总资金确实大变**：扣除浮动盈亏变化后的净值残差 ≥ `TARGET_EQUITY_FLOW_MIN_USD`（默认 $100）**且** ≥ `TARGET_EQUITY_FLOW_MIN_PCT`（默认 1%），排除「行情涨了导致浮盈增加」；
+3. 距上次提醒超过 `TARGET_EQUITY_FLOW_COOLDOWN_SECONDS`（默认 300 秒），避免分批转账刷屏。
+
+判断公式：
+
+```text
+推断净流转 = (本次净值 − 上次净值) − (本次未实现盈亏 − 上次未实现盈亏)
+```
+
+仓位不变意味着期间没有成交，残差就是进出资金；浮盈口径差异、资金费和手续费会带来少量误差。因此通知里会**同时**列出交易所 `userNonFundingLedgerUpdates` 的真实充值／提现／内部划转流水，两者对照即可确认方向与金额：
+
+```text
+📥 目标地址资金异动 · 转入 / 入金
+👤 目标：0x62f8abcd...12ef34
+💼 账户净值：$10,000.00 → $11,000.00（+1,000.00）
+📈 浮动盈亏变化：+20.00
+🧮 推断净转入：$980.00（+9.80%）
+📍 仓位变化：0.00%（判定：基本未变）
+━━━━━━━━━━━━━━━━━━
+🔗 交易所流水：充值 +$1,000.00 × 1 笔
+```
+
+几个边界：
+
+- 首次采样只建立基线，不告警；`/follow` 切换目标后自动重建基线。
+- 净值读取失败或读到 0 会跳过本轮且**不更新基线**——部分 DEX 聚合失败看起来就像一笔巨额出金，不能被当成资金异动。
+- 进程重启后基线丢失，停机期间的出入金不追溯。
+- 监控是只读的，`/stop` 之后仍然运行；`/status` 末尾显示最近一次采样时间和目标净值。
 
 ### 排行榜与地址查询
 

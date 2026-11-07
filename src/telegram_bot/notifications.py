@@ -162,6 +162,65 @@ class NotificationService:
 """
         return await self.send_message(message.strip())
     
+    async def send_target_fund_flow_notification(
+        self,
+        *,
+        wallet: str,
+        direction: str,
+        net_flow: float,
+        equity_before: float,
+        equity_after: float,
+        equity_delta: float,
+        unrealized_pnl_delta: float,
+        flow_pct: float,
+        position_change_pct: float,
+        ledger_text: str,
+        chain_net: float | None = None,
+        chain_matched: bool = False,
+        portfolio_equity: float | None = None,
+    ) -> bool:
+        """Alert that the followed wallet deposited or withdrew funds.
+
+        The headline amount is inferred from equity after removing the
+        unrealized-PnL change; the exchange ledger breakdown below it is the
+        exact cash movement. They are shown side by side so a data glitch can
+        never be mistaken for a confirmed deposit.
+        """
+        inflow = direction == "in"
+        emoji = "📥" if inflow else "📤"
+        label = "转入 / 入金" if inflow else "转出 / 出金"
+        short_wallet = (
+            f"{wallet[:10]}...{wallet[-6:]}" if len(wallet) > 20 else wallet
+        )
+        chain_line = ""
+        if chain_net is not None and chain_matched:
+            gap = net_flow - chain_net
+            chain_line = (
+                f"\n<b>链上充提净额：</b>{chain_net:+,.2f}"
+                f"\n<b>与推断差额：</b>${gap:+,.2f}（浮盈、资金费或内部划转）"
+            )
+        portfolio_line = (
+            f"\n<b>全账户净值：</b>${portfolio_equity:,.2f}（portfolio 口径，含现货）"
+            if portfolio_equity is not None
+            else ""
+        )
+        message = f"""
+{emoji} <b>目标地址资金异动 · {label}</b>
+
+👤 <b>目标：</b><code>{short_wallet}</code>
+💼 <b>账户净值：</b>${equity_before:,.2f} → ${equity_after:,.2f}（{equity_delta:+,.2f}）{portfolio_line}
+📈 <b>浮动盈亏变化：</b>{unrealized_pnl_delta:+,.2f}
+🧮 <b>推断净{'转入' if inflow else '转出'}：</b><b>${abs(net_flow):,.2f}</b>（{flow_pct:+.2f}%）
+📍 <b>仓位变化：</b>{position_change_pct:.2f}%（判定：基本未变）{chain_line}
+
+━━━━━━━━━━━━━━━━━━
+🔗 <b>交易所流水：</b>{ledger_text}
+
+⚠️ 跟单金额按目标账户净值比例计算，会随这次变动自动放大或缩小。
+🕐 <b>时间：</b>{_now_shanghai().strftime('%Y-%m-%d %H:%M:%S UTC+8')}
+"""
+        return await self.send_message(message.strip())
+
     async def send_position_close_notification(
         self,
         symbol: str,

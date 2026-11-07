@@ -2,6 +2,7 @@ import asyncio
 import html
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,12 @@ from loguru import logger
 from config.settings import normalize_pnl_filter, settings
 from utils.logger import setup_logger
 from utils import copy_ledger
+from utils.equity_flow import (
+    EquitySnapshot,
+    analyze_equity_flow,
+    ledger_lines,
+    summarize_ledger_updates,
+)
 from hyperliquid.client import HyperliquidClient
 from hyperliquid.websocket import HyperliquidWebSocket
 from hyperliquid.models import WebSocketUpdate, PositionSide, OrderSide
@@ -97,6 +104,14 @@ copy_existing_lock = asyncio.Lock()
 # reduce-only orders while the first batch is still filling.
 close_positions_lock = asyncio.Lock()
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+# Target fund-flow monitoring: the last account snapshot and alert throttling.
+# Kept in memory on purpose - after a restart there is no trustworthy baseline
+# for what happened while the process was down, so the first poll only seeds it.
+last_target_equity_snapshot: Optional[EquitySnapshot] = None
+target_flow_next_alert_at: float = 0.0
+target_flow_last_check_at: Optional[datetime] = None
+target_flow_last_equity: Optional[float] = None
 
 
 def perp_dex_for_symbol(symbol: str) -> str:
@@ -2467,7 +2482,23 @@ async def get_status() -> str:
             for position in (follower_state.positions if follower_state else [])
         ]
     position_details = "\n".join(position_lines) if position_lines else "暂无持仓"
-    
+
+    flow_cfg = settings.target_equity_flow
+    if not flow_cfg.enabled:
+        flow_status = "已关闭"
+    elif target_flow_last_equity is None:
+        flow_status = f"等待首次采样（每 {flow_cfg.poll_seconds}s）"
+    else:
+        checked = (
+            target_flow_last_check_at.strftime("%H:%M:%S")
+            if target_flow_last_check_at
+            else "?"
+        )
+        flow_status = (
+            f"目标净值 ${target_flow_last_equity:,.2f}｜采样 {checked}"
+            f"｜每 {flow_cfg.poll_seconds}s"
+        )
+
     return f"""
 📊 <b>跟单运行状态</b>
 
@@ -2486,6 +2517,7 @@ async def get_status() -> str:
 <b>仓位模式：</b>{settings.sizing.mode.title()}
 <b>杠杆：</b>目标杠杆的 {settings.leverage.adjustment_ratio} 倍
 <b>追入旧仓位：</b>{existing_position_policy_text()}
+<b>目标资金监控：</b>{flow_status}
 <b>版本：</b>{build_stamp()}
     """.strip()
 
@@ -3222,6 +3254,157 @@ async def handle_stop():
     logger.warning("🛑 Bot stopped. Send /start to resume copying.")
 
 
+def _target_equity_snapshot(wallet: str, state, captured_at_ms: int) -> EquitySnapshot:
+    """Turn one target read into a comparable snapshot.
+
+    Equity, unrealized PnL and sizes all come from the same ``get_user_state``
+    response. Mixing a cached portfolio value with a fresh position read would
+    create a phantom "deposit" whenever the two were sampled at different
+    prices.
+    """
+    signed_positions = tuple(
+        (
+            position.symbol,
+            float(position.size)
+            if str(position.side.value).lower() == "long"
+            else -float(position.size),
+        )
+        for position in state.positions
+    )
+    return EquitySnapshot(
+        wallet=wallet,
+        equity=float(state.balance),
+        unrealized_pnl=float(state.unrealized_pnl),
+        positions=signed_positions,
+        captured_at_ms=captured_at_ms,
+    )
+
+
+async def check_target_fund_flow_once() -> None:
+    """One poll of the target wallet: build/compare a snapshot, alert if needed.
+
+    Split out of the loop so the whole decision path can be exercised with a
+    stub client. A bad read always returns without touching the baseline,
+    because a partial DEX aggregate looks exactly like a large withdrawal.
+    """
+    global last_target_equity_snapshot, target_flow_next_alert_at
+    global target_flow_last_check_at, target_flow_last_equity
+
+    cfg = settings.target_equity_flow
+    if not client:
+        return
+    wallet = settings.target_wallet
+    state = await client.get_user_state(wallet)
+    if state is None or state.balance <= 0:
+        logger.warning("💰 Target fund-flow poll skipped: account state unavailable")
+        return
+
+    now_ms = int(time.time() * 1000)
+    snapshot = _target_equity_snapshot(wallet, state, now_ms)
+    target_flow_last_check_at = datetime.now(SHANGHAI_TZ)
+    target_flow_last_equity = snapshot.equity
+    previous = last_target_equity_snapshot
+    if previous is None or previous.wallet.lower() != wallet.lower():
+        last_target_equity_snapshot = snapshot
+        logger.info(
+            f"💰 Target fund-flow baseline: {snapshot.wallet[:10]}... "
+            f"equity=${snapshot.equity:,.2f} positions={len(snapshot.positions)}"
+        )
+        return
+
+    flow = analyze_equity_flow(
+        previous,
+        snapshot,
+        min_usd=cfg.min_usd,
+        min_pct=cfg.min_pct,
+        max_position_change_pct=cfg.max_position_change_pct,
+    )
+    # Always advance the baseline, alert or not: the same transfer must never
+    # be reported twice.
+    last_target_equity_snapshot = snapshot
+    if flow is None:
+        return
+    if time.time() < target_flow_next_alert_at:
+        logger.info(
+            f"💰 Target fund-flow alert suppressed (cooldown): "
+            f"{flow.direction} ${flow.amount:,.2f}"
+        )
+        return
+
+    # A little slack on both ends: the ledger index can lag a fresh transfer,
+    # and the previous poll's wall clock is only an estimate of when it happened.
+    window_start = previous.captured_at_ms - 60_000
+    window_end = now_ms + 60_000
+    try:
+        updates = await client.get_non_funding_ledger_updates(
+            wallet, window_start, window_end
+        )
+        ledger = summarize_ledger_updates(
+            updates, wallet, start_ms=window_start, end_ms=window_end
+        )
+    except Exception as exc:
+        logger.warning(f"Target ledger lookup failed: {exc}")
+        ledger = summarize_ledger_updates(
+            [],
+            wallet,
+            start_ms=window_start,
+            end_ms=window_end,
+            ok=False,
+            error=str(exc)[:200],
+        )
+
+    portfolio_equity = await client.get_portfolio_account_value(wallet)
+    logger.warning(
+        f"💰 Target fund flow detected: {wallet} {flow.direction} "
+        f"${flow.amount:,.2f} equity ${flow.equity_before:,.2f} -> "
+        f"${flow.equity_after:,.2f}, positions changed "
+        f"{flow.position_change_pct:.2f}%, ledger={ledger_lines(ledger)}"
+    )
+    if notifier:
+        await notifier.send_target_fund_flow_notification(
+            wallet=wallet,
+            direction=flow.direction,
+            net_flow=flow.net_flow,
+            equity_before=flow.equity_before,
+            equity_after=flow.equity_after,
+            equity_delta=flow.equity_delta,
+            unrealized_pnl_delta=flow.unrealized_pnl_delta,
+            flow_pct=flow.flow_pct,
+            position_change_pct=flow.position_change_pct,
+            ledger_text=ledger_lines(ledger),
+            chain_net=ledger.chain_net if ledger.matched else None,
+            chain_matched=ledger.matched,
+            portfolio_equity=portfolio_equity,
+        )
+    target_flow_next_alert_at = time.time() + cfg.cooldown_seconds
+
+
+async def poll_target_fund_flow():
+    """Watch the target wallet for deposits/withdrawals and alert on Telegram.
+
+    Runs independently of the copy loop: it is read-only, so it keeps reporting
+    even after /stop, and a /follow switch simply resets the comparison basis
+    on the next poll instead of requiring explicit coordination.
+    """
+    cfg = settings.target_equity_flow
+    if not cfg.enabled:
+        logger.info("💰 Target fund-flow monitoring is disabled")
+        return
+    logger.info(
+        f"💰 Target fund-flow monitor started: every {cfg.poll_seconds}s, "
+        f"alert above ${cfg.min_usd:,.0f} / {cfg.min_pct:g}% with positions "
+        f"changing under {cfg.max_position_change_pct:g}%"
+    )
+    while True:
+        await asyncio.sleep(cfg.poll_seconds)
+        try:
+            await check_target_fund_flow_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"Target fund-flow poll failed: {exc}")
+
+
 async def send_hourly_reports():
     """Send hourly reports via Telegram"""
     while True:
@@ -3594,7 +3777,11 @@ async def main():
         logger.info("✅ Telegram bot ready!")
     else:
         logger.warning("⚠️ Telegram bot not configured (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to .env)")
-    
+
+    # Read-only monitoring, deliberately started even without Telegram and even
+    # after /stop: a target withdrawal matters regardless of the copy state.
+    asyncio.create_task(poll_target_fund_flow())
+
     try:
         # Get initial state
         logger.info("")
