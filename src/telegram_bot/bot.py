@@ -56,9 +56,23 @@ class TelegramBot:
         self.get_pnl_callback: Optional[Callable] = None
         self.get_leaderboard_callback: Optional[Callable] = None
         self.get_wallet_callback: Optional[Callable] = None
+        # Returns a refusal message (HTML) when the account cannot be used,
+        # e.g. a live wallet that started with $0, else None. Applied only to
+        # /orders, /copyloss and /close; read-only commands stay available.
+        self.blocked_commands_callback: Optional[Callable] = None
         
         logger.info(f"Telegram bot initialized for chat {allowed_chat_id}")
     
+    async def _blocked_reason(self) -> Optional[str]:
+        """Refusal text for account commands, or None when they are allowed."""
+        if not self.blocked_commands_callback:
+            return None
+        try:
+            return await self.blocked_commands_callback()
+        except Exception as exc:
+            logger.error(f"Error checking command availability: {exc}")
+            return None
+
     def _check_authorized(self, update: Update) -> bool:
         """Check if user is authorized"""
         user_chat_id = str(update.effective_chat.id)
@@ -100,6 +114,8 @@ class TelegramBot:
 /copyloss [loss|all|profit] [序号...] [confirm] [force] - 手动复制目标现有仓位：先列清单，可只买指定序号，执行后回执；已持有或刚复制过的会自动拦下，确需叠加再加 force
 /close [序号|币种|all] [confirm] - 平掉自己的仓位：先列清单，可选币种或序号，执行后回执
 /stop - 停止跟单：撤掉挂单，保留仓位（发 /start 恢复）
+
+<i>跟随钱包净值为 $0 时跟单自动停止，/orders、/copyloss、/close 不可用；入金后发 /start 恢复。</i>
 
 <b>状态：</b>{state_line}
 <b>版本：</b>{build_stamp()}
@@ -155,6 +171,10 @@ class TelegramBot:
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
             return
+        blocked = await self._blocked_reason()
+        if blocked:
+            await update.message.reply_text(blocked, parse_mode="HTML")
+            return
         if not self.on_copy_existing_requested:
             await update.message.reply_text("一键复制功能尚未配置")
             return
@@ -199,6 +219,10 @@ class TelegramBot:
             await update.message.reply_text("⛔ 未授权的聊天")
             return
         
+        blocked = await self._blocked_reason()
+        if blocked:
+            await update.message.reply_text(blocked, parse_mode="HTML")
+            return
         if self.get_orders_callback:
             try:
                 orders = await self.get_orders_callback()
@@ -242,6 +266,10 @@ class TelegramBot:
         """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
+            return
+        blocked = await self._blocked_reason()
+        if blocked:
+            await update.message.reply_text(blocked, parse_mode="HTML")
             return
         if not self.on_close_positions_requested:
             await update.message.reply_text("平仓功能尚未配置")

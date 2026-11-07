@@ -294,12 +294,20 @@ class NotificationService:
         ratio: str,
         leverage_adjustment: float,
         existing_position_policy: str = "",
+        funding_warning: str = "",
     ):
         """Send bot startup notification"""
         policy_line = (
             f"• 追入旧仓位：{existing_position_policy}\n"
             if existing_position_policy
             else ""
+        )
+        status_line = (
+            "💸 <b>跟单已停止（钱包无资金）</b>\n\n"
+            f"{funding_warning}\n\n"
+            "/orders、/copyloss、/close 已禁用；入金后发 /start 恢复。"
+            if funding_warning
+            else "• 状态：<b>运行中</b> 🟢\n\n正在监听目标钱包的新挂单、撤单和成交。"
         )
         message = f"""
 🚀 <b>跟单机器人已启动</b>
@@ -311,9 +319,7 @@ class NotificationService:
 • 仓位模式：{sizing_mode.title()}
 • 资金比例：{ratio}
 • 杠杆：目标杠杆的 {leverage_adjustment} 倍
-{policy_line}• 状态：<b>运行中</b> 🟢
-
-正在监听目标钱包的新挂单、撤单和成交。
+{policy_line}{status_line}
 """
         await self.send_message(message.strip())
     

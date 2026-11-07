@@ -67,6 +67,9 @@ target_switch_lock = asyncio.Lock()
 # State tracking
 is_paused = False
 is_stopped = False
+# Live mode started with a zero-equity follower wallet: copying is stopped and
+# the account-touching commands are refused until /start sees real money.
+wallet_unfunded = False
 # When the pause started, so reports can say how long copying has been off.
 paused_since: Optional[datetime] = None
 # Set by /start to wake run_target_monitor out of its post-/stop wait, so a
@@ -210,6 +213,26 @@ def existing_position_policy_text() -> str:
     rule = settings.copy_rules.copy_open_pnl_filter
     scope = {"loss": "浮亏", "profit": "浮盈"}.get(rule, "全部")
     return f"手动：/copyloss 选择{scope}仓位（启动不自动追入）"
+
+
+def unfunded_block_text() -> Optional[str]:
+    """Why account-facing commands are refused, or ``None`` when funded.
+
+    A live wallet with $0 cannot place or close anything, so /orders,
+    /copyloss and /close are all refused while ``wallet_unfunded`` is set.
+    Everything read-only (/status, /pnl, /wallet, /follow, ...) keeps working:
+    the operator needs those to see what is going on.
+    """
+    if not wallet_unfunded:
+        return None
+    address = settings.hyperliquid.wallet_address or "(未配置)"
+    return (
+        "💸 <b>跟随钱包没有资金，跟单已停止</b>\n\n"
+        f"钱包：<code>{address}</code>\n"
+        "净值：<b>$0.00</b>\n\n"
+        "该状态下 /orders、/copyloss、/close 均不可用（没有资金既开不了仓也平不了仓）。\n"
+        "入金后发 /start 重新检查，资金到账即恢复跟单。"
+    )
 
 
 def calculate_scaled_close_size(
@@ -470,6 +493,9 @@ async def handle_copy_existing(
     """
     if is_stopped:
         return "🔴 机器人已停止，无法执行。请重启容器后再使用。"
+    blocked = unfunded_block_text()
+    if blocked:
+        return blocked
     if not client or not executor or not monitor:
         return "❌ 机器人尚未就绪，请稍后再试。"
 
@@ -2468,6 +2494,9 @@ async def get_status() -> str:
     
     status_emoji = "🔴" if is_stopped else ("🟢" if not is_paused else "⏸️")
     status_text = "已停止（发 /start 恢复）" if is_stopped else ("运行中" if not is_paused else "已暂停（发 /start 恢复）")
+    if wallet_unfunded:
+        status_emoji = "💸"
+        status_text = "跟单已停止（钱包无资金，入金后发 /start）"
     mode = "模拟" if settings.simulated_trading else "实盘"
     if settings.simulated_trading:
         position_lines = [
@@ -2499,6 +2528,12 @@ async def get_status() -> str:
             f"｜每 {flow_cfg.poll_seconds}s"
         )
 
+    funding_note = (
+        "钱包净值 $0，/orders /copyloss /close 已禁用；入金后发 /start"
+        if wallet_unfunded
+        else "正常"
+    )
+
     return f"""
 📊 <b>跟单运行状态</b>
 
@@ -2518,6 +2553,7 @@ async def get_status() -> str:
 <b>杠杆：</b>目标杠杆的 {settings.leverage.adjustment_ratio} 倍
 <b>追入旧仓位：</b>{existing_position_policy_text()}
 <b>目标资金监控：</b>{flow_status}
+<b>资金限制：</b>{funding_note}
 <b>版本：</b>{build_stamp()}
     """.strip()
 
@@ -2820,6 +2856,50 @@ async def get_wallet_report(address: str, fill_limit: int = 30) -> str:
     return "\n".join(lines)
 
 
+async def blocked_command_text() -> Optional[str]:
+    """Async wrapper for the Telegram bot's command gate."""
+    return unfunded_block_text()
+
+
+async def refresh_funding_state() -> tuple[bool, str]:
+    """Re-read the live wallet's equity and clear the unfunded flag if funded.
+
+    Returns ``(funded, text)`` where ``text`` is the message to show the
+    operator: the reason it is still blocked, or a confirmation of the balance
+    that was just picked up.
+    """
+    global wallet_unfunded, simulated_balance
+
+    if settings.simulated_trading or not wallet_unfunded:
+        return True, ""
+
+    address = settings.hyperliquid.wallet_address
+    if not client or not address:
+        return False, "❌ 机器人尚未就绪或未配置跟随钱包，稍后再试。"
+
+    equity = await client.get_portfolio_account_value(address)
+    if equity is None:
+        return False, "❌ 读取跟随钱包净值失败（网络或接口问题），跟单仍处于停止状态。"
+    if equity <= 0:
+        return False, (
+            "💸 <b>跟随钱包净值仍为 $0.00</b>\n\n"
+            f"钱包：<code>{address}</code>\n"
+            "跟单保持停止；入金后重新发 /start 即可恢复。"
+        )
+
+    simulated_balance = equity
+    target_equity = await client.get_portfolio_account_value(settings.target_wallet)
+    if target_equity and target_equity > 0:
+        # Ratio was 0 while unfunded; recompute from the money that actually
+        # arrived so the first copied order is not sized against a stale $0.
+        settings.sizing.portfolio_ratio = equity / target_equity
+    wallet_unfunded = False
+    logger.success(
+        f"💰 Follower wallet funded: ${equity:,.2f} — copying enabled again"
+    )
+    return True, f"💰 检测到跟随钱包资金 <b>${equity:,.2f}</b>\n"
+
+
 async def handle_start() -> str:
     """/start: start or resume copying.
 
@@ -2831,6 +2911,19 @@ async def handle_start() -> str:
 
     if not client or not executor:
         return "❌ 机器人尚未就绪，请稍后再试。"
+
+    # A wallet that started at $0 keeps copying stopped until money shows up;
+    # /start is the only place that re-checks, so no polling loop is needed.
+    funded_note = ""
+    if wallet_unfunded:
+        funded, funded_note = await refresh_funding_state()
+        if not funded:
+            return funded_note
+        if not is_stopped:
+            is_paused = False
+            paused_since = None
+            logger.warning("▶️ Copying re-enabled after the wallet was funded")
+            return funded_note + "已恢复跟单（此前因钱包无资金而停止）。"
 
     if is_stopped:
         # A fresh monitor gives a clean event baseline, exactly like a target
@@ -2849,7 +2942,7 @@ async def handle_start() -> str:
         paused_since = None
         restart_requested.set()
         logger.warning("▶️ Bot resumed by /start after being stopped")
-        return "▶️ 已恢复跟单：已重新连接目标监控，继续复制新成交（仓位保持不变）。"
+        return funded_note + "▶️ 已恢复跟单：已重新连接目标监控，继续复制新成交（仓位保持不变）。"
 
     if is_paused:
         is_paused = False
@@ -2873,6 +2966,9 @@ async def handle_close(
     """
     if not client or not executor:
         return "❌ 机器人尚未就绪，请稍后再试。"
+    blocked = unfunded_block_text()
+    if blocked:
+        return blocked
 
     # Read the follower's own book, never the target's cached positions.
     if settings.simulated_trading:
@@ -3464,10 +3560,14 @@ async def main():
     """
     global monitor, executor, position_sizer, client, telegram_bot, notifier, bot_start_time
     global simulated_balance, trades_copied_count, counted_mirror_order_ids, is_stopped
+    global is_paused, paused_since, wallet_unfunded
     
     bot_start_time = datetime.now(SHANGHAI_TZ)
     trades_copied_count = 0
     is_stopped = False
+    wallet_unfunded = False
+    is_paused = False
+    paused_since = None
     counted_mirror_order_ids.clear()
     pending_order_batches.clear()
     pending_order_tasks.clear()
@@ -3554,41 +3654,22 @@ async def main():
             simulated_balance = follower_total_equity
 
             if simulated_balance <= 0:
-                # Do not raise here. The container runs under Docker's
-                # `restart: unless-stopped`, so exiting produces a restart every
-                # few seconds: a log storm, no Telegram, and no /status. Zero
-                # equity means nothing can be copied anyway, so wait for a
-                # deposit and carry on with the normal startup once it lands;
-                # the ratio is recalculated from the fresh balance.
-                follower_address = settings.hyperliquid.wallet_address
+                # Zero equity in live mode: stop copying instead of exiting.
+                # Exiting is worse in every way under `restart: unless-stopped`
+                # (a restart every few seconds, and Telegram has not started
+                # yet, so the reason never reaches the phone). The bot stays
+                # up, reports why, and refuses the three commands that would
+                # need money; /start re-checks the balance.
+                wallet_unfunded = True
+                is_paused = True
+                paused_since = datetime.now(timezone.utc)
                 logger.error(
-                    f"💸 Follower wallet {follower_address} has "
-                    f"${simulated_balance:,.2f} total equity — live copying is on "
-                    "hold until it is funded."
+                    f"💸 Follower wallet {settings.hyperliquid.wallet_address} has "
+                    f"${simulated_balance:,.2f} total equity — copying is STOPPED."
                 )
                 logger.error(
-                    "   入金到上面这个地址，或把 SIMULATED_TRADING 设为 true 先跑模拟盘；"
-                    "要换钱包就改 HYPERLIQUID_WALLET_ADDRESS 后重启。"
-                )
-                waited_seconds = 0
-                while simulated_balance <= 0:
-                    await asyncio.sleep(30)
-                    waited_seconds += 30
-                    equity = await client.get_portfolio_account_value(
-                        follower_address
-                    )
-                    if equity is None:
-                        continue  # read failed; keep the previous value
-                    simulated_balance = equity
-                    if simulated_balance <= 0 and waited_seconds % 1800 == 0:
-                        logger.error(
-                            f"💸 Still waiting for funds: {follower_address} "
-                            f"= ${simulated_balance:,.2f} (waited "
-                            f"{waited_seconds // 60} min)"
-                        )
-                logger.success(
-                    f"💰 Follower wallet funded: ${simulated_balance:,.2f} — "
-                    "continuing startup"
+                    "   /orders /copyloss /close are disabled until funded; "
+                    "send /start after depositing. Other commands keep working."
                 )
 
         if target_balance <= 0:
@@ -3799,6 +3880,7 @@ async def main():
         telegram_bot.on_close_positions_requested = handle_close
         telegram_bot.on_follow_requested = handle_follow
         telegram_bot.on_copy_existing_requested = handle_copy_existing
+        telegram_bot.blocked_commands_callback = blocked_command_text
         
         # Start Telegram bot
         await telegram_bot.start()
@@ -3892,9 +3974,21 @@ async def main():
             await notifier.send_startup_notification(
                 target_wallet=settings.target_wallet,
                 sizing_mode=settings.sizing.mode,
-                ratio=f"1:{int(1/settings.sizing.portfolio_ratio)}",
+                # A zero ratio is legitimate now (unfunded wallet), and
+                # 1/0 here used to crash the whole startup.
+                ratio=(
+                    f"1:{int(1 / settings.sizing.portfolio_ratio)}"
+                    if settings.sizing.portfolio_ratio > 0
+                    else "0（钱包无资金）"
+                ),
                 leverage_adjustment=settings.leverage.adjustment_ratio,
                 existing_position_policy=existing_position_policy_text(),
+                funding_warning=(
+                    f"跟随钱包 <code>{settings.hyperliquid.wallet_address}</code> "
+                    "净值 $0.00，不会复制任何成交。"
+                    if wallet_unfunded
+                    else ""
+                ),
             )
         
         # Start monitoring

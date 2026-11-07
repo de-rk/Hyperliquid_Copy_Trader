@@ -139,7 +139,7 @@ Fill copied: xyz:SKHX buy size=... target_size=... reduce_only=False
 SIMULATED_TRADING=false
 ```
 
-注意：实盘模式下如果 `HYPERLIQUID_WALLET_ADDRESS` 的账户净值为 0，程序**不会退出**，而是打一条 `💸 Follower wallet ... has $0.00 total equity` 并每 30 秒重试一次，入金后自动继续启动（按新余额重算跟单比例）。以前这里直接抛异常，碰上 `restart: unless-stopped` 就变成每几秒重启一次的日志风暴，而且 Telegram 还没起来，看不到任何提示。
+注意：实盘模式下如果 `HYPERLIQUID_WALLET_ADDRESS` 的账户净值为 0，程序**不退出**，而是直接把跟单停掉：进程继续跑、Telegram 照常在线，`/status` 显示 `💸 跟单已停止（钱包无资金，入金后发 /start）`，并且只禁用 `/orders`、`/copyloss`、`/close` 三个需要资金的命令，`/status`、`/pnl`、`/wallet`、`/follow`、`/leaderboard`、`/stop` 都不受影响。入金后发一次 `/start`，程序会重新读取净值、按到账金额重算跟单比例，然后自动恢复复制。以前这里直接抛异常，碰上 `restart: unless-stopped` 就变成每几秒重启一次的日志风暴，而且 Telegram 还没起来，看不到任何提示。
 
 再重新创建容器：
 
@@ -333,6 +333,8 @@ LOG_FILE=./logs/trading.log
 - `/start` 启动或恢复跟单：暂停后用它恢复；停止后也用它恢复，无需重启容器（恢复时重新连接目标监控，不会补跟停止期间的历史成交）
 - `/stop` 停止跟单：取消全部挂单、停止复制，**保留所有仓位**；不再询问是否平仓，平仓交给 `/close`
 
+实盘启动时跟随钱包净值为 `$0`，跟单会自动停止，只有 `/orders`、`/copyloss`、`/close` 三个需要资金的命令被拒绝（其余命令照常可用）。入金后发 `/start` 会重新读取净值、重算跟单比例并恢复复制。
+
 同一个 Telegram Token 只能由一个实例轮询。出现 `terminated by other getUpdates request` 时，关闭使用同一 Token 的其他机器人实例。
 
 `/pnl` 会打印目标钱包与跟随钱包的完整 42 位地址，方便直接核对、复制到区块浏览器，而不是 `0x62f8…e7ac` 这类截断形式。实盘模式下，24H、7D、30D 使用账户净值历史计算；充值或提现也会影响净值变化。模拟模式没有跟随钱包的链上历史，因此这些周期显示为暂无数据。
@@ -438,6 +440,7 @@ docker compose up -d --build     # 或直接 ./linux/start.sh
 先看报告第一行的 `🤖 跟单状态`：
 
 - `⏸️ 暂停跟单`：被 `MAX_ACCOUNT_EQUITY` 自动暂停了。发 `/start` 恢复，但要先确认账户权益已回落，否则下一笔又会触发暂停。
+- `💸 跟单已停止（钱包无资金）`：实盘启动时跟随钱包净值为 `$0`。入金后发 `/start`。
 - `🔴 已停止`：进程收到过 `/stop`。发 `/start` 恢复跟单，无需重启容器。
 
 状态是 `🟢 正在跟单` 时，再检查目标是否真的有新的 `Open` 或 `Add` 成交；`Close` 或 `Reduce` 成交只有在跟随账户已有相同仓位时才会发送平仓单。用以下命令查看相关日志：
