@@ -172,6 +172,11 @@ class LedgerSummary:
     deposit_count: int = 0
     withdraw_count: int = 0
     other_net: float = 0.0
+    # Transfers between this wallet's own spot and perp books. They change the
+    # perp account value (which is what the snapshot compares) without moving
+    # one cent in or out of the account, so they must never read as a deposit.
+    internal_net: float = 0.0
+    internal_count: int = 0
     other_counts: tuple[tuple[str, int], ...] = ()
     event_count: int = 0
 
@@ -184,6 +189,20 @@ class LedgerSummary:
     def matched(self) -> bool:
         """True when on-chain deposits/withdrawals were found."""
         return self.deposit_count > 0 or self.withdraw_count > 0
+
+    def explains_internal(self, net_flow: float, *, tolerance: float = 5.0) -> bool:
+        """True when own-book transfers alone account for the equity jump.
+
+        Requires that no real deposit/withdrawal happened in the window: an
+        external transfer plus an internal move could otherwise be excused by
+        their sum by coincidence.
+        """
+        if self.matched:
+            return False
+        if self.internal_count == 0:
+            return False
+        slack = max(tolerance, abs(net_flow) * 0.1)
+        return abs(net_flow - self.internal_net) <= slack
 
 
 def summarize_ledger_updates(
@@ -201,12 +220,15 @@ def summarize_ledger_updates(
     ``{"time": ms, "delta": {"type": "deposit", "usdc": "100"}}``. Withdrawals
     split the amount and the fee into separate fields, so both are counted.
     Internal transfers are direction-sensitive: count them as an inflow when
-    this wallet is the destination, an outflow when it is the source. Unknown
-    shapes are counted but never assigned a sign, so a format change cannot
-    produce a confidently wrong dollar amount.
+    this wallet is the destination, an outflow when it is the source. A
+    transfer whose source AND destination are this same wallet is a spot/perp
+    book move, not cash flow, and is reported through ``internal_net`` only.
+    Unknown shapes are counted but never assigned a sign, so a format change
+    cannot produce a confidently wrong dollar amount.
     """
     deposits = withdrawals = other_net = 0.0
-    deposit_count = withdraw_count = event_count = 0
+    internal_net = 0.0
+    deposit_count = withdraw_count = event_count = internal_count = 0
     other_counts: dict[str, int] = {}
 
     for update in updates:
@@ -243,6 +265,23 @@ def summarize_ledger_updates(
             amount = _as_float(delta.get("amount"))
         if amount is None:
             continue
+        # Same wallet on both sides: the money only moved between this
+        # account's spot and perp books (``send`` reports one row per leg).
+        # That changes the perp account value without any cash entering or
+        # leaving, so it must never be summed into ``other_net``. The signed
+        # perp move is tracked separately so a pure internal transfer can be
+        # told apart from a real deposit.
+        if _same_wallet(delta.get("user"), wallet) and _same_wallet(
+            delta.get("destination"), wallet
+        ):
+            internal_count += 1
+            source_dex = str(delta.get("sourceDex", "")).lower()
+            dest_dex = str(delta.get("destinationDex", "")).lower()
+            if source_dex == "spot" and dest_dex != "spot":
+                internal_net += abs(amount)
+            elif dest_dex == "spot" and source_dex != "spot":
+                internal_net -= abs(amount)
+            continue
         if amount < 0:
             other_net += amount
         elif _same_wallet(delta.get("destination"), wallet):
@@ -263,6 +302,8 @@ def summarize_ledger_updates(
         deposit_count=deposit_count,
         withdraw_count=withdraw_count,
         other_net=other_net,
+        internal_net=internal_net,
+        internal_count=internal_count,
         other_counts=tuple(sorted(other_counts.items())),
         event_count=event_count,
     )
@@ -279,6 +320,11 @@ def ledger_lines(summary: LedgerSummary) -> str:
         parts.append(f"充值 +${summary.deposits:,.2f} × {summary.deposit_count} 笔")
     if summary.withdraw_count:
         parts.append(f"提现 −${summary.withdrawals:,.2f} × {summary.withdraw_count} 笔")
+    if summary.internal_count:
+        parts.append(
+            f"内部划转 {summary.internal_net:+,.2f} × {summary.internal_count} 笔"
+            f"（现货↔合约，不算充提）"
+        )
     if summary.other_counts:
         shown = list(summary.other_counts)[:4]
         detail = "、".join(f"{kind} × {count}" for kind, count in shown)

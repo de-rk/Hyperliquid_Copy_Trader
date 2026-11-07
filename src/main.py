@@ -3449,6 +3449,17 @@ async def check_target_fund_flow_once() -> None:
             error=str(exc)[:200],
         )
 
+    # A target that moves money between its own spot and perp books shows up
+    # as an equity jump while no cash entered or left. Reporting that would be
+    # a false alarm: the follower's copy ratio is unaffected in the long run.
+    if ledger.explains_internal(flow.net_flow):
+        logger.info(
+            f"💰 Target equity move is an internal book transfer "
+            f"(equity {flow.net_flow:+,.2f} vs internal {ledger.internal_net:+,.2f}, "
+            f"{ledger.internal_count} legs) — no alert"
+        )
+        return
+
     portfolio_equity = await client.get_portfolio_account_value(wallet)
     logger.warning(
         f"💰 Target fund flow detected: {wallet} {flow.direction} "

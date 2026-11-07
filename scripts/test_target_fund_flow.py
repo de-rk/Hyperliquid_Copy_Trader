@@ -112,6 +112,43 @@ check("空窗口文案", "无充提" in ledger_lines(empty_led), ledger_lines(em
 failed_led = summarize_ledger_updates([], WALLET, start_ms=lo, end_ms=hi, ok=False, error="timeout")
 check("流水失败文案", "失败" in ledger_lines(failed_led), ledger_lines(failed_led))
 
+# Same wallet on both sides of a `send` = a spot/perp book move, not cash flow.
+perp_in = summarize_ledger_updates(
+    [{"time": now_ms, "delta": {
+        "type": "send", "user": WALLET, "destination": WALLET,
+        "token": "USDC", "amount": "283.86",
+        "sourceDex": "spot", "destinationDex": "",
+    }}],
+    WALLET, start_ms=lo, end_ms=hi,
+)
+check("现货→合约的内部划转不记入金", abs(perp_in.other_net) < 1e-9, str(perp_in))
+check("内部划转记入 internal_net", abs(perp_in.internal_net - 283.86) < 1e-6, str(perp_in))
+check("内部划转可解释净值跳变", perp_in.explains_internal(283.86) is True)
+check("有真实充提时不认内部划转", led.explains_internal(1_000) is False)
+check("文案标明内部划转", "内部划转" in ledger_lines(perp_in), ledger_lines(perp_in))
+
+# Real rows from 0xf8bf…391c: a 281.80 spot->bridge send that came straight
+# back, then a 280.80+1.00 withdrawal. The old code counted the outbound leg
+# as an inflow and reported +3,150 of phantom deposits over 30 days.
+real_rows = [
+    {"time": now_ms, "delta": {"type": "send", "user": WALLET, "destination": WALLET,
+                               "token": "USDC", "amount": "283.86",
+                               "sourceDex": "spot", "destinationDex": "xyz"}},
+    {"time": now_ms, "delta": {"type": "send", "user": WALLET, "destination": OTHER,
+                               "token": "USDC", "amount": "281.800537",
+                               "sourceDex": "spot", "destinationDex": "spot"}},
+    {"time": now_ms, "delta": {"type": "spotTransfer", "token": "USDC", "amount": "281.800537",
+                               "usdcValue": "281.800537", "user": OTHER,
+                               "destination": WALLET}},
+    {"time": now_ms, "delta": {"type": "withdraw", "usdc": "280.802675", "fee": "1.0"}},
+]
+real_led = summarize_ledger_updates(real_rows, WALLET, start_ms=lo, end_ms=hi)
+check("真实数据：提现净额 −281.80",
+      abs(real_led.chain_net + 281.802675) < 1e-6, str(real_led))
+check("真实数据：内在双列划转不外报",
+      abs(real_led.other_net) < 1e-6, str(real_led))
+check("真实数据：无虚假入金", abs(real_led.other_net) < 1e-6 and real_led.deposits == 0, str(real_led))
+
 
 # ------------------------------------------------------------------ poll tick
 class StubClient:
@@ -245,6 +282,17 @@ async def run_tick_checks():
         ledger=dep,
     )
     check("仓位大变时不发通知", len(calls) == 0, str(calls))
+
+    _, calls = await scenario(
+        "内部划转",
+        [state(10_000, 0), state(11_000, 0)],
+        ledger=[{"time": int(time.time() * 1000), "delta": {
+            "type": "send", "user": WALLET, "destination": WALLET,
+            "token": "USDC", "amount": "1000",
+            "sourceDex": "spot", "destinationDex": "",
+        }}],
+    )
+    check("目标把现货划进合约时不误报入金", len(calls) == 0, str(calls))
 
     _, calls = await scenario(
         "流水失败", [state(10_000, 0), state(9_000, 0)], ledger_error="timeout",
