@@ -33,6 +33,16 @@ SIZE_EPSILON = 1e-9
 # noise out of the *inferred* residual; a real deposit or withdrawal is not
 # noise, so it is only filtered for dust below this amount.
 LEDGER_ALERT_MIN_USD = 1.0
+# Hyperliquid's own spot-USDC system account: it holds the spot USDC book
+# (tens of billions), and no ordinary wallet ever pays into it. Verified against
+# the target's portfolio curve: each ``send`` here lowers total account value by
+# exactly its size (six samples over four months, exact to the cent), so it is
+# reported as a real outflow rather than excused as an own-book move. The label
+# matters because "转出至 0x2000…0000" tells a human it is an exchange-side
+# move, not a payment to another trader.
+SYSTEM_ADDRESSES = {
+    "0x2000000000000000000000000000000000000000": "系统地址",
+}
 
 
 @dataclass(frozen=True)
@@ -165,6 +175,32 @@ def _same_wallet(value: Any, wallet: str) -> bool:
     return isinstance(value, str) and value.lower() == wallet.lower()
 
 
+def _peer_of(delta: Mapping[str, Any], wallet: str) -> str:
+    """The other side of a peer transfer, normalised to lowercase."""
+    for key in ("user", "source", "destination"):
+        value = delta.get(key)
+        if isinstance(value, str) and value and not _same_wallet(value, wallet):
+            return value.lower()
+    return ""
+
+
+def _track_peer(peers: dict[str, list[float]], address: str, signed_net: float) -> None:
+    if not address:
+        return
+    slot = peers.setdefault(address, [0.0, 0])
+    slot[0] += signed_net
+    slot[1] += 1
+
+
+def short_address(address: str, *, head: int = 6, tail: int = 4) -> str:
+    """0x62f87be0…75e7ac style shortening for chat messages."""
+    if not address:
+        return "未知"
+    if len(address) <= head + tail + 1:
+        return address
+    return f"{address[:head]}…{address[-tail:]}"
+
+
 @dataclass(frozen=True)
 class LedgerSummary:
     """Exact exchange cash movements inside the detection window."""
@@ -176,6 +212,11 @@ class LedgerSummary:
     deposit_count: int = 0
     withdraw_count: int = 0
     other_net: float = 0.0
+    # Gross legs of the peer transfers, so a window that both took money in and
+    # paid money out can be shown as two numbers instead of one net figure that
+    # hides a six-figure movement on each side.
+    send_in: float = 0.0
+    send_out: float = 0.0
     # Transfers between this wallet's own spot and perp books. They change the
     # perp account value (which is what the snapshot compares) without moving
     # one cent in or out of the account, so they must never read as a deposit.
@@ -183,6 +224,10 @@ class LedgerSummary:
     internal_count: int = 0
     other_counts: tuple[tuple[str, int], ...] = ()
     event_count: int = 0
+    # Who the external transfers went to or came from, largest first:
+    # ``(address, signed_net, count)``. A bare total says money moved; the
+    # counterparty is what tells a funding wallet apart from a real exit.
+    peer_flows: tuple[tuple[str, float, int], ...] = ()
 
     @property
     def chain_net(self) -> float:
@@ -230,10 +275,11 @@ def summarize_ledger_updates(
     Unknown shapes are counted but never assigned a sign, so a format change
     cannot produce a confidently wrong dollar amount.
     """
-    deposits = withdrawals = other_net = 0.0
+    deposits = withdrawals = other_net = send_in = send_out = 0.0
     internal_net = 0.0
     deposit_count = withdraw_count = event_count = internal_count = 0
     other_counts: dict[str, int] = {}
+    peers: dict[str, list[float]] = {}  # address -> [signed net, count]
 
     for update in updates:
         if not isinstance(update, Mapping):
@@ -288,12 +334,18 @@ def summarize_ledger_updates(
             continue
         if amount < 0:
             other_net += amount
+            send_out += abs(amount)
+            _track_peer(peers, _peer_of(delta, wallet), amount)
         elif _same_wallet(delta.get("destination"), wallet):
             other_net += amount
+            send_in += amount
+            _track_peer(peers, _peer_of(delta, wallet), amount)
         elif _same_wallet(delta.get("user"), wallet) or _same_wallet(
             delta.get("source"), wallet
         ):
             other_net -= amount
+            send_out += amount
+            _track_peer(peers, _peer_of(delta, wallet), -amount)
         elif str(delta.get("type", "")).lower() in ("rewardsclaim", "spogenesis"):
             other_net += amount
         # Otherwise the direction is unknown; do not invent a sign.
@@ -306,10 +358,18 @@ def summarize_ledger_updates(
         deposit_count=deposit_count,
         withdraw_count=withdraw_count,
         other_net=other_net,
+        send_in=send_in,
+        send_out=send_out,
         internal_net=internal_net,
         internal_count=internal_count,
         other_counts=tuple(sorted(other_counts.items())),
         event_count=event_count,
+        peer_flows=tuple(
+            (addr, net, int(count))
+            for addr, (net, count) in sorted(
+                peers.items(), key=lambda kv: -abs(kv[1][0])
+            )[:3]
+        ),
     )
 
 
@@ -335,10 +395,21 @@ def ledger_lines(summary: LedgerSummary) -> str:
         if len(summary.other_counts) > len(shown):
             detail += f" 等 {len(summary.other_counts)} 类"
         if abs(summary.other_net) > 0.005:
-            # A deposit paid with ``send`` has no ``deposit`` row, so name the
-            # direction explicitly instead of leaving a bare signed number.
-            verb = "外部转入" if summary.other_net > 0 else "外部转出"
-            parts.append(f"{verb} +${abs(summary.other_net):,.2f}")
+            # A deposit paid with ``send`` has no ``deposit`` row, so both legs
+            # are named explicitly. The sign belongs in the direction word, not
+            # twice: "转出 +$278,892" reads as a contradiction.
+            for sign, total in ((1, summary.send_in), (-1, summary.send_out)):
+                if total <= 0.005:
+                    continue
+                peers = [
+                    f"{SYSTEM_ADDRESSES.get(addr) or short_address(addr)}"
+                    f"{'' if count == 1 else f' ×{count}'}"
+                    for addr, net, count in summary.peer_flows
+                    if net * sign > 0
+                ]
+                verb = "外部转入" if sign > 0 else "外部转出"
+                suffix = f"（{'、'.join(peers[:2])}）" if peers else ""
+                parts.append(f"{verb} ${total:,.2f}{suffix}")
         parts.append(f"流水类型：{detail}")
     return "；".join(parts)
 

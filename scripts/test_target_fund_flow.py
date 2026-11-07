@@ -149,6 +149,55 @@ check("真实数据：内在双列划转不外报",
       abs(real_led.other_net) < 1e-6, str(real_led))
 check("真实数据：无虚假入金", abs(real_led.other_net) < 1e-6 and real_led.deposits == 0, str(real_led))
 
+# Real rows from the live target 0x62f8…e7ac: a funding wallet (0x6b9e…) pays
+# in, the target pays out to Hyperliquid's spot-USDC system account, and two
+# withdrawals land. The system address is NOT an own-book move: the portfolio
+# curve drops by exactly the sent amount (six samples over four months), so it
+# must stay in the external total or the alert misses a 21% shrink in value.
+FUNDER = "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24"
+SYSTEM = "0x2000000000000000000000000000000000000000"
+live_rows = [
+    {"time": now_ms, "delta": {
+        "type": "send", "user": FUNDER, "destination": WALLET,
+        "token": "USDC", "amount": "110215.3",
+        "sourceDex": "spot", "destinationDex": "",
+    }},
+    {"time": now_ms, "delta": {
+        "type": "send", "user": WALLET, "destination": SYSTEM,
+        "token": "USDC", "amount": "130000",
+        "sourceDex": "spot", "destinationDex": "spot",
+    }},
+    {"time": now_ms, "delta": {"type": "withdraw", "usdc": "99999", "fee": "1"}},
+]
+live_led = summarize_ledger_updates(live_rows, WALLET, start_ms=lo, end_ms=hi)
+check("实盘：系统地址划出算外部转出",
+      abs(live_led.send_out - 130_000) < 1e-6, str(live_led))
+check("实盘：外部转入单独统计",
+      abs(live_led.send_in - 110_215.3) < 1e-6, str(live_led))
+check("实盘：净额按方向相加",
+      abs(live_led.other_net - (110_215.3 - 130_000)) < 1e-6, str(live_led))
+check("实盘：对手方按金额排序",
+      live_led.peer_flows[0][0] == SYSTEM and live_led.peer_flows[0][2] == 1,
+      str(live_led.peer_flows))
+check("实盘：资金钱包被识别为转入方",
+      any(addr == FUNDER and net > 0 for addr, net, _ in live_led.peer_flows),
+      str(live_led.peer_flows))
+live_text = ledger_lines(live_led)
+check("实盘文案：两个方向都列出",
+      "外部转入 $110,215.30" in live_text and "外部转出 $130,000.00" in live_text,
+      live_text)
+check("实盘文案：系统地址带标签", "系统地址" in live_text, live_text)
+check("实盘文案：转入方显示缩写地址", "0x6b9e…0a24" in live_text, live_text)
+check("实盘文案：转出不带正号",
+      "外部转出 +" not in live_text and "外部转出 $" in live_text, live_text)
+check("对手方为空时不产生空括号",
+      "（）" not in ledger_lines(summarize_ledger_updates(
+          [{"time": now_ms, "delta": {"type": "deposit", "usdc": "5"}}],
+          WALLET, start_ms=lo, end_ms=hi)),
+      ledger_lines(summarize_ledger_updates(
+          [{"time": now_ms, "delta": {"type": "deposit", "usdc": "5"}}],
+          WALLET, start_ms=lo, end_ms=hi)))
+
 
 # ------------------------------------------------------------------ poll tick
 class StubClient:
@@ -345,6 +394,52 @@ async def run_tick_checks():
         }}],
     )
     check("目标把现货划进合约时不误报入金", len(calls) == 0, str(calls))
+
+    # Ledger index lag: the perp snapshot jumps one poll *before* the ledger row
+    # shows up. The residual announces the deposit, then the ledger sees the
+    # same money. Without a symmetric check that is two messages for one event.
+    class LaggedClient:
+        def __init__(self):
+            self.states = [state(10_000, 0), state(11_000, 0), state(11_000, 0)]
+            self.row = {"time": now_ms(), "delta": {
+                "type": "send", "user": FUNDER, "destination": WALLET,
+                "token": "USDC", "amount": "1000",
+                "sourceDex": "spot", "destinationDex": "",
+            }}
+            self.visible = False
+
+        async def get_user_state(self, wallet):
+            return self.states.pop(0) if self.states else None
+
+        async def get_non_funding_ledger_updates(self, wallet, start_ms, end_ms):
+            return [self.row] if self.visible else []
+
+        async def get_portfolio_account_value(self, wallet):
+            return 11_000.0
+
+    lagged = LaggedClient()
+    notifier = StubNotifier()
+    reset(lagged, notifier)
+    await main.check_target_fund_flow_once()  # 建基线
+    await main.check_target_fund_flow_once()  # 净值先跳，流水还没索引到
+    check("流水滞后时先由净值推断报警", len(notifier.calls) == 1, str(notifier.calls))
+    lagged.visible = True
+    await main.check_target_fund_flow_once()
+    check("流水随后到达不再重复报警", len(notifier.calls) == 1, str(notifier.calls))
+
+    # The other order: ledger first, residual after. Must also stay at one.
+    _, calls = await scenario(
+        "流水先行",
+        [state(10_000, 0), state(11_000, 0), state(11_000, 0)],
+        ledger=[{"time": now_ms(), "delta": {
+            "type": "send", "user": FUNDER, "destination": WALLET,
+            "token": "USDC", "amount": "1000",
+            "sourceDex": "spot", "destinationDex": "",
+        }}],
+    )
+    check("流水先行时净值残差不重复", len(calls) == 1, str(calls))
+    if calls:
+        check("先到的是流水告警", calls[0]["source"] == "ledger", str(calls[0]))
 
 
 async def no_second_alert(ledger):

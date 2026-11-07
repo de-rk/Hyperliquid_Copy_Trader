@@ -3394,16 +3394,16 @@ def _target_equity_snapshot(wallet: str, state, captured_at_ms: int) -> EquitySn
 
 
 def _flow_already_reported(net_flow: float, now_ts: float) -> bool:
-    """True when a ledger-confirmed alert already covered this movement.
+    """True when an alert already covered this movement, from either source.
 
-    Without this, a deposit seen in the ledger is announced again by the next
-    equity residual: both paths describe the same event from different angles.
-    Only ledger-confirmed amounts take part, so a genuine second transfer of
-    the same size is still reported by whichever path sees it first.
+    The two paths describe the same event from different angles: the residual
+    sees the equity jump first when the ledger index lags, and the ledger sees
+    it first when the perp account does not move. Whichever runs second must
+    stay quiet, so the match is symmetric rather than one-way.
     """
-    slack = max(5.0, abs(net_flow) * 0.1)
+    slack = max(10.0, abs(net_flow) * 0.02)
     for ts, amount in target_flow_reported_flows:
-        if now_ts - ts > 600:
+        if now_ts - ts > 300:
             continue
         if abs(net_flow - amount) <= slack:
             return True
@@ -3520,7 +3520,13 @@ async def check_target_fund_flow_once() -> None:
         equity=pct_base,
     )
     if ledger_flow is not None:
-        alert = ("ledger", ledger_flow, ledger)
+        if _flow_already_reported(ledger_flow.net_flow, time.time()):
+            logger.info(
+                f"💰 Ledger flow ${ledger_flow.amount:,.2f} already reported by "
+                f"the equity residual — no duplicate alert"
+            )
+        else:
+            alert = ("ledger", ledger_flow, ledger)
 
     if (
         alert is None
@@ -3609,8 +3615,7 @@ async def check_target_fund_flow_once() -> None:
                 portfolio_equity=equity_now,
             )
     target_flow_next_alert_at = time.time() + cfg.cooldown_seconds
-    if source == "ledger":
-        target_flow_reported_flows.append((time.time(), flow.net_flow))
+    target_flow_reported_flows.append((time.time(), flow.net_flow))
 
 
 async def poll_target_fund_flow():
