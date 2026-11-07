@@ -3,6 +3,7 @@ import html
 import os
 import tempfile
 import time
+from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -16,6 +17,8 @@ from utils import copy_ledger
 from utils.equity_flow import (
     EquitySnapshot,
     analyze_equity_flow,
+    detect_ledger_flow,
+    event_key,
     ledger_lines,
     summarize_ledger_updates,
 )
@@ -115,6 +118,18 @@ last_target_equity_snapshot: Optional[EquitySnapshot] = None
 target_flow_next_alert_at: float = 0.0
 target_flow_last_check_at: Optional[datetime] = None
 target_flow_last_equity: Optional[float] = None
+# Ledger scanning state. ``cursor`` is the end of the last successful scan so a
+# failed lookup is retried over the same window instead of losing it; ``seen``
+# de-duplicates the deliberate window overlap; ``reported`` stops the equity
+# residual from re-announcing a transfer the ledger already confirmed.
+target_flow_ledger_cursor_ms: Optional[int] = None
+target_flow_seen_events: deque = deque(maxlen=800)
+target_flow_reported_flows: deque = deque(maxlen=50)
+# Internal book transfers seen in the last few minutes. The ledger row and the
+# equity jump it causes can land in different polls (the row arrives with the
+# transfer, the perp value one tick later), so the explanation has to outlive
+# the single scan that found it.
+target_flow_recent_internal: deque = deque(maxlen=20)
 
 
 def perp_dex_for_symbol(symbol: str) -> str:
@@ -2515,16 +2530,17 @@ async def get_status() -> str:
     flow_cfg = settings.target_equity_flow
     if not flow_cfg.enabled:
         flow_status = "已关闭"
-    elif target_flow_last_equity is None:
-        flow_status = f"等待首次采样（每 {flow_cfg.poll_seconds}s）"
+    elif target_flow_last_check_at is None:
+        flow_status = f"等待首次扫描（每 {flow_cfg.poll_seconds}s）"
     else:
-        checked = (
-            target_flow_last_check_at.strftime("%H:%M:%S")
-            if target_flow_last_check_at
-            else "?"
+        checked = target_flow_last_check_at.strftime("%H:%M:%S")
+        equity_part = (
+            f"合约净值 ${target_flow_last_equity:,.2f}"
+            if target_flow_last_equity is not None
+            else "合约无余额，按流水判定"
         )
         flow_status = (
-            f"目标净值 ${target_flow_last_equity:,.2f}｜采样 {checked}"
+            f"{equity_part}｜流水+净值｜扫描 {checked}"
             f"｜每 {flow_cfg.poll_seconds}s"
         )
 
@@ -3376,67 +3392,77 @@ def _target_equity_snapshot(wallet: str, state, captured_at_ms: int) -> EquitySn
     )
 
 
-async def check_target_fund_flow_once() -> None:
-    """One poll of the target wallet: build/compare a snapshot, alert if needed.
+def _flow_already_reported(net_flow: float, now_ts: float) -> bool:
+    """True when a ledger-confirmed alert already covered this movement.
 
-    Split out of the loop so the whole decision path can be exercised with a
-    stub client. A bad read always returns without touching the baseline,
-    because a partial DEX aggregate looks exactly like a large withdrawal.
+    Without this, a deposit seen in the ledger is announced again by the next
+    equity residual: both paths describe the same event from different angles.
+    Only ledger-confirmed amounts take part, so a genuine second transfer of
+    the same size is still reported by whichever path sees it first.
+    """
+    slack = max(5.0, abs(net_flow) * 0.1)
+    for ts, amount in target_flow_reported_flows:
+        if now_ts - ts > 600:
+            continue
+        if abs(net_flow - amount) <= slack:
+            return True
+    return False
+
+
+def _note_internal_transfers(ledger) -> None:
+    """Remember book transfers so a later equity jump can be excused by them."""
+    if ledger.internal_count and not ledger.matched:
+        target_flow_recent_internal.append((time.time(), ledger.internal_net))
+
+
+def _recent_internal_explains(net_flow: float) -> bool:
+    """Consume a remembered book transfer that matches this equity change."""
+    slack = max(5.0, abs(net_flow) * 0.1)
+    now_ts = time.time()
+    for entry in list(target_flow_recent_internal):
+        ts, amount = entry
+        if now_ts - ts > 600:
+            continue
+        if abs(net_flow - amount) <= slack:
+            target_flow_recent_internal.remove(entry)
+            return True
+    return False
+
+
+async def check_target_fund_flow_once() -> None:
+    """One poll: read the exchange ledger first, then the equity residual.
+
+    The ledger is authoritative and covers the spot book too. The perp account
+    value behind the residual only sees perp books, and is 0 for a wallet that
+    keeps its cash in spot, so the residual is a fallback for movements the
+    ledger has not indexed yet rather than the primary trigger.
     """
     global last_target_equity_snapshot, target_flow_next_alert_at
     global target_flow_last_check_at, target_flow_last_equity
+    global target_flow_ledger_cursor_ms
 
     cfg = settings.target_equity_flow
     if not client:
         return
     wallet = settings.target_wallet
-    state = await client.get_user_state(wallet)
-    if state is None or state.balance <= 0:
-        logger.warning("💰 Target fund-flow poll skipped: account state unavailable")
-        return
-
     now_ms = int(time.time() * 1000)
-    snapshot = _target_equity_snapshot(wallet, state, now_ms)
     target_flow_last_check_at = datetime.now(SHANGHAI_TZ)
-    target_flow_last_equity = snapshot.equity
-    previous = last_target_equity_snapshot
-    if previous is None or previous.wallet.lower() != wallet.lower():
-        last_target_equity_snapshot = snapshot
-        logger.info(
-            f"💰 Target fund-flow baseline: {snapshot.wallet[:10]}... "
-            f"equity=${snapshot.equity:,.2f} positions={len(snapshot.positions)}"
-        )
-        return
 
-    flow = analyze_equity_flow(
-        previous,
-        snapshot,
-        min_usd=cfg.min_usd,
-        min_pct=cfg.min_pct,
-        max_position_change_pct=cfg.max_position_change_pct,
+    # ---- 1) exchange ledger (spot + perp, authoritative) ----
+    # Windows overlap by 90s to absorb index lag, and already-reported rows are
+    # dropped by key so the overlap cannot announce the same transfer twice.
+    # A failed lookup keeps the cursor in place, so the next tick re-covers it.
+    window_start = (
+        target_flow_ledger_cursor_ms - 90_000
+        if target_flow_ledger_cursor_ms is not None
+        else now_ms - max(120_000, cfg.poll_seconds * 2_000)
     )
-    # Always advance the baseline, alert or not: the same transfer must never
-    # be reported twice.
-    last_target_equity_snapshot = snapshot
-    if flow is None:
-        return
-    if time.time() < target_flow_next_alert_at:
-        logger.info(
-            f"💰 Target fund-flow alert suppressed (cooldown): "
-            f"{flow.direction} ${flow.amount:,.2f}"
-        )
-        return
-
-    # A little slack on both ends: the ledger index can lag a fresh transfer,
-    # and the previous poll's wall clock is only an estimate of when it happened.
-    window_start = previous.captured_at_ms - 60_000
+    window_start = max(window_start, now_ms - 3_600_000)
     window_end = now_ms + 60_000
+    ledger = summarize_ledger_updates([], wallet, start_ms=window_start, end_ms=window_end)
     try:
         updates = await client.get_non_funding_ledger_updates(
             wallet, window_start, window_end
-        )
-        ledger = summarize_ledger_updates(
-            updates, wallet, start_ms=window_start, end_ms=window_end
         )
     except Exception as exc:
         logger.warning(f"Target ledger lookup failed: {exc}")
@@ -3448,42 +3474,148 @@ async def check_target_fund_flow_once() -> None:
             ok=False,
             error=str(exc)[:200],
         )
+    else:
+        fresh = [row for row in updates if event_key(row) not in target_flow_seen_events]
+        ledger = summarize_ledger_updates(
+            fresh, wallet, start_ms=window_start, end_ms=window_end
+        )
+        for row in fresh:
+            key = event_key(row)
+            if key:
+                target_flow_seen_events.append(key)
+        target_flow_ledger_cursor_ms = now_ms
+    _note_internal_transfers(ledger)
 
-    # A target that moves money between its own spot and perp books shows up
-    # as an equity jump while no cash entered or left. Reporting that would be
-    # a false alarm: the follower's copy ratio is unaffected in the long run.
-    if ledger.explains_internal(flow.net_flow):
+    # ---- 2) equity snapshot (residual fallback + /status) ----
+    state = await client.get_user_state(wallet)
+    snapshot = None
+    if state is None:
+        logger.warning("💰 Target fund-flow poll: account state unavailable")
+    elif state.balance > 0:
+        snapshot = _target_equity_snapshot(wallet, state, now_ms)
+        target_flow_last_equity = snapshot.equity
+    # balance == 0 means "no perp cash", not "no money": a spot-only wallet
+    # still gets ledger alerts, it just cannot use the residual this round.
+
+    previous = last_target_equity_snapshot
+    if snapshot is not None:
+        # Advance even when nothing is reported: the same transfer must never
+        # be announced twice, and a bad read never reaches this point.
+        last_target_equity_snapshot = snapshot
+    equity_now = await client.get_portfolio_account_value(wallet)
+    pct_base = (
+        equity_now
+        if equity_now is not None and equity_now > 0
+        else (snapshot.equity if snapshot is not None else None)
+    )
+
+    # ---- 3) decide ----
+    alert = None  # (source, flow, ledger_summary)
+    ledger_flow = detect_ledger_flow(
+        ledger,
+        min_usd=cfg.min_usd,
+        from_ms=window_start,
+        to_ms=window_end,
+        equity=pct_base,
+    )
+    if ledger_flow is not None:
+        flow_pct = ledger_flow.flow_pct
+        if flow_pct is not None and abs(flow_pct) < max(0.0, cfg.min_pct):
+            logger.info(
+                f"💰 Ledger flow ${ledger_flow.amount:,.2f} is under "
+                f"{cfg.min_pct:g}% of ${pct_base:,.2f} — no alert"
+            )
+        else:
+            alert = ("ledger", ledger_flow, ledger)
+
+    if (
+        alert is None
+        and snapshot is not None
+        and previous is not None
+        and previous.wallet.lower() == wallet.lower()
+    ):
+        flow = analyze_equity_flow(
+            previous,
+            snapshot,
+            min_usd=cfg.min_usd,
+            min_pct=cfg.min_pct,
+            max_position_change_pct=cfg.max_position_change_pct,
+        )
+        if flow is not None:
+            # A target that moves money between its own spot and perp books
+            # shows up as an equity jump while no cash entered or left.
+            if ledger.explains_internal(flow.net_flow) or _recent_internal_explains(
+                flow.net_flow
+            ):
+                logger.info(
+                    f"💰 Target equity move is an internal book transfer "
+                    f"(equity {flow.net_flow:+,.2f} vs internal "
+                    f"{ledger.internal_net:+,.2f}, {ledger.internal_count} legs)"
+                )
+            elif _flow_already_reported(flow.net_flow, time.time()):
+                logger.info(
+                    f"💰 Residual ${flow.amount:,.2f} already reported from the "
+                    f"ledger — no duplicate alert"
+                )
+            else:
+                alert = ("inferred", flow, ledger)
+
+    if alert is None:
+        return
+    if time.time() < target_flow_next_alert_at:
         logger.info(
-            f"💰 Target equity move is an internal book transfer "
-            f"(equity {flow.net_flow:+,.2f} vs internal {ledger.internal_net:+,.2f}, "
-            f"{ledger.internal_count} legs) — no alert"
+            f"💰 Target fund-flow alert suppressed (cooldown): "
+            f"{alert[1].direction} ${alert[1].amount:,.2f}"
         )
         return
 
-    portfolio_equity = await client.get_portfolio_account_value(wallet)
-    logger.warning(
-        f"💰 Target fund flow detected: {wallet} {flow.direction} "
-        f"${flow.amount:,.2f} equity ${flow.equity_before:,.2f} -> "
-        f"${flow.equity_after:,.2f}, positions changed "
-        f"{flow.position_change_pct:.2f}%, ledger={ledger_lines(ledger)}"
-    )
-    if notifier:
-        await notifier.send_target_fund_flow_notification(
-            wallet=wallet,
-            direction=flow.direction,
-            net_flow=flow.net_flow,
-            equity_before=flow.equity_before,
-            equity_after=flow.equity_after,
-            equity_delta=flow.equity_delta,
-            unrealized_pnl_delta=flow.unrealized_pnl_delta,
-            flow_pct=flow.flow_pct,
-            position_change_pct=flow.position_change_pct,
-            ledger_text=ledger_lines(ledger),
-            chain_net=ledger.chain_net if ledger.matched else None,
-            chain_matched=ledger.matched,
-            portfolio_equity=portfolio_equity,
+    source, flow, used_ledger = alert
+    if source == "ledger":
+        logger.warning(
+            f"💰 Target ledger flow: {wallet} {flow.direction} "
+            f"${flow.amount:,.2f}, ledger={ledger_lines(used_ledger)}"
         )
+        if notifier:
+            await notifier.send_target_fund_flow_notification(
+                wallet=wallet,
+                direction=flow.direction,
+                net_flow=flow.net_flow,
+                ledger_text=ledger_lines(used_ledger),
+                chain_net=(
+                    used_ledger.chain_net if used_ledger.matched else None
+                ),
+                chain_matched=used_ledger.matched,
+                portfolio_equity=equity_now,
+                source="ledger",
+            )
+    else:
+        logger.warning(
+            f"💰 Target fund flow detected: {wallet} {flow.direction} "
+            f"${flow.amount:,.2f} equity ${flow.equity_before:,.2f} -> "
+            f"${flow.equity_after:,.2f}, positions changed "
+            f"{flow.position_change_pct:.2f}%, ledger={ledger_lines(used_ledger)}"
+        )
+        if notifier:
+            await notifier.send_target_fund_flow_notification(
+                wallet=wallet,
+                direction=flow.direction,
+                net_flow=flow.net_flow,
+                equity_before=flow.equity_before,
+                equity_after=flow.equity_after,
+                equity_delta=flow.equity_delta,
+                unrealized_pnl_delta=flow.unrealized_pnl_delta,
+                flow_pct=flow.flow_pct,
+                position_change_pct=flow.position_change_pct,
+                ledger_text=ledger_lines(used_ledger),
+                chain_net=(
+                    used_ledger.chain_net if used_ledger.matched else None
+                ),
+                chain_matched=used_ledger.matched,
+                portfolio_equity=equity_now,
+            )
     target_flow_next_alert_at = time.time() + cfg.cooldown_seconds
+    if source == "ledger":
+        target_flow_reported_flows.append((time.time(), flow.net_flow))
 
 
 async def poll_target_fund_flow():
@@ -3498,9 +3630,9 @@ async def poll_target_fund_flow():
         logger.info("💰 Target fund-flow monitoring is disabled")
         return
     logger.info(
-        f"💰 Target fund-flow monitor started: every {cfg.poll_seconds}s, "
-        f"alert above ${cfg.min_usd:,.0f} / {cfg.min_pct:g}% with positions "
-        f"changing under {cfg.max_position_change_pct:g}%"
+        f"💰 Target fund-flow monitor started: ledger + equity residual every "
+        f"{cfg.poll_seconds}s, alert above ${cfg.min_usd:,.0f} / {cfg.min_pct:g}%"
+        f" with positions changing under {cfg.max_position_change_pct:g}%"
     )
     while True:
         await asyncio.sleep(cfg.poll_seconds)

@@ -330,7 +330,97 @@ def ledger_lines(summary: LedgerSummary) -> str:
         detail = "、".join(f"{kind} × {count}" for kind, count in shown)
         if len(summary.other_counts) > len(shown):
             detail += f" 等 {len(summary.other_counts)} 类"
-        parts.append(f"其他：{detail}")
+        parts.append(f"事件：{detail}")
         if abs(summary.other_net) > 0.005:
-            parts.append(f"可判方向净额 {summary.other_net:+,.2f}")
+            # A deposit paid with ``send`` has no ``deposit`` row, so name the
+            # direction explicitly instead of leaving a bare signed number.
+            verb = "外部转入" if summary.other_net > 0 else "外部转出"
+            parts.append(f"{verb}净额 {summary.other_net:+,.2f}")
     return "；".join(parts)
+
+
+def event_key(update: Mapping[str, Any]) -> str:
+    """Stable identity for one ledger row, used to de-duplicate overlapping scans.
+
+    The poll windows deliberately overlap by a minute or more to absorb index
+    lag, so the same row is returned several times. ``nonce`` is unique per
+    event when present; otherwise fall back to the timestamp plus size, which
+    is still specific enough to avoid swallowing two distinct transfers.
+    """
+    if not isinstance(update, Mapping):
+        return ""
+    delta = update.get("delta")
+    if not isinstance(delta, Mapping):
+        return ""
+    kind = str(delta.get("type", "unknown"))
+    nonce = delta.get("nonce")
+    if nonce not in (None, ""):
+        return f"{kind}:{nonce}"
+    size = delta.get("usdc") or delta.get("amount") or ""
+    return f"{kind}:{update.get('time', '')}:{size}"
+
+
+@dataclass(frozen=True)
+class LedgerFlow:
+    """A cash movement read straight from the exchange ledger.
+
+    This is the primary signal because the ledger covers the spot book as well
+    as perp, while the equity residual can only see the perp account. The
+    amount is the signed external cash flow of the window: deposits minus
+    withdrawals plus direction-resolved peer transfers.
+    """
+
+    net_flow: float
+    deposits: float
+    withdrawals: float
+    from_ms: int
+    to_ms: int
+    equity: float | None = None
+
+    @property
+    def amount(self) -> float:
+        return abs(self.net_flow)
+
+    @property
+    def direction(self) -> str:
+        return "in" if self.net_flow > 0 else "out"
+
+    @property
+    def is_inflow(self) -> bool:
+        return self.net_flow > 0
+
+    @property
+    def flow_pct(self) -> float | None:
+        if not self.equity or self.equity <= 0:
+            return None
+        return self.net_flow / self.equity * 100.0
+
+
+def detect_ledger_flow(
+    summary: LedgerSummary,
+    *,
+    min_usd: float,
+    from_ms: int,
+    to_ms: int,
+    equity: float | None = None,
+) -> LedgerFlow | None:
+    """Return the window's external cash flow when it clears the dollar floor.
+
+    Deposits and withdrawals are summed with the direction-resolved peer
+    transfers, because a deposit made with ``send`` never produces a
+    ``deposit`` row. Self-transfers between the spot and perp books are already
+    excluded from ``other_net`` so they cannot inflate this number.
+    """
+    if not summary.ok or summary.event_count == 0:
+        return None
+    net = summary.chain_net + summary.other_net
+    if abs(net) < max(0.0, min_usd):
+        return None
+    return LedgerFlow(
+        net_flow=net,
+        deposits=summary.deposits,
+        withdrawals=summary.withdrawals,
+        from_ms=from_ms,
+        to_ms=to_ms,
+        equity=equity,
+    )

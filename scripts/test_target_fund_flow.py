@@ -201,6 +201,10 @@ def reset(client=None, notifier=None, cooldown=0, wallet=WALLET):
     main.target_flow_next_alert_at = 0.0
     main.target_flow_last_check_at = None
     main.target_flow_last_equity = None
+    main.target_flow_ledger_cursor_ms = None
+    main.target_flow_seen_events.clear()
+    main.target_flow_reported_flows.clear()
+    main.target_flow_recent_internal.clear()
     main.settings.target_wallet = wallet
     cfg = main.settings.target_equity_flow
     cfg.enabled = True
@@ -211,8 +215,9 @@ def reset(client=None, notifier=None, cooldown=0, wallet=WALLET):
 
 
 async def scenario(name, states, *, cooldown=0, wallet=WALLET, ledger=None,
-                   ledger_error=None, extra_wallet=None):
-    client = StubClient(states, ledger=ledger, ledger_error=ledger_error)
+                   ledger_error=None, extra_wallet=None, portfolio=11_000.0):
+    client = StubClient(states, ledger=ledger, ledger_error=ledger_error,
+                        portfolio=portfolio)
     notifier = StubNotifier()
     reset(client, notifier, cooldown, wallet)
     for _ in states:
@@ -223,40 +228,78 @@ async def scenario(name, states, *, cooldown=0, wallet=WALLET, ledger=None,
 
 
 async def run_tick_checks():
-    dep = [{"time": int(time.time() * 1000), "delta": {"type": "deposit", "usdc": "1000"}}]
+    def now_ms():
+        return int(time.time() * 1000)
 
+    dep = [{"time": now_ms(), "delta": {"type": "deposit", "usdc": "1000"}}]
+    wd = [{"time": now_ms(), "delta": {"type": "withdraw", "usdc": "500", "fee": "1"}}]
+
+    # ---------------------------------------------------- ledger (primary)
     _, calls = await scenario("首次采样", [state(10_000, 0, [("BTC", 0.5)])])
     check("首次采样只建基线，不发通知", len(calls) == 0, str(calls))
     check("首次采样记录净值供 /status", main.target_flow_last_equity == 10_000)
 
-    _, calls = await scenario(
-        "转入", [state(10_000, 0, [("BTC", 0.5)]), state(11_000, 0, [("BTC", 0.5)])],
-        ledger=dep,
-    )
-    check("转入触发一条通知", len(calls) == 1, str(calls))
+    _, calls = await scenario("流水入金", [state(10_000, 0), state(11_000, 0)], ledger=dep)
+    check("流水命中即通知（不必等净值两轮）", len(calls) == 1, str(calls))
     if calls:
         c = calls[0]
-        check("通知方向为转入", c["direction"] == "in", str(c))
-        check("通知金额 $1,000", abs(c["net_flow"] - 1000) < 1e-6, str(c))
-        check("通知含链上流水", "充值 +$1,000.00" in c["ledger_text"], str(c["ledger_text"]))
-        check("通知含全账户净值", c["portfolio_equity"] == 11_000.0, str(c))
-        check("通知 chain_matched", c["chain_matched"] is True)
-    check("真实通知模板渲染成功", await render_notification(calls[0]) if calls else False)
+        check("流水通知来源为 ledger", c["source"] == "ledger", str(c))
+        check("流水通知金额 $1,000", abs(c["net_flow"] - 1000) < 1e-6, str(c))
+        check("流水通知方向为转入", c["direction"] == "in", str(c))
+        check("流水通知含充值明细", "充值 +$1,000.00" in c["ledger_text"], c["ledger_text"])
+        check("流水通知含全账户净值", c["portfolio_equity"] == 11_000.0, str(c))
+        check("流水通知 chain_matched", c["chain_matched"] is True)
+        check("流水与残差不重复通知", await no_second_alert(dep))
+    check("流水通知模板渲染成功", await render_ledger_notification(calls[0]) if calls else False)
+
+    _, calls = await scenario("现货账户", [state(0, 0), state(0, 0)], ledger=dep)
+    check("合约余额为 0 仍能靠流水告警", len(calls) == 1, str(calls))
+    check("现货账户不写净值基线", main.target_flow_last_equity is None)
 
     _, calls = await scenario(
-        "重复", [state(10_000, 0), state(11_000, 0), state(11_000, 0)], ledger=dep,
+        "重叠窗口",
+        [state(10_000, 0), state(10_000, 0), state(10_000, 0)],
+        ledger=dep,
     )
-    check("同一笔转账不会重复通知", len(calls) == 1, str(calls))
+    check("重叠窗口只看一次", len(calls) == 1, str(calls))
+
+    _, calls = await scenario("流水出金", [state(10_000, 0)], ledger=wd)
+    check("流水出金方向正确", len(calls) == 1 and calls[0]["direction"] == "out", str(calls))
+
+    _, calls = await scenario(
+        "小额流水", [state(10_000, 0)],
+        ledger=[{"time": now_ms(), "delta": {"type": "deposit", "usdc": "50"}}],
+    )
+    check("低于金额阈值不告警", len(calls) == 0, str(calls))
+
+    _, calls = await scenario(
+        "比例阈值", [state(1_000_000, 0)],
+        ledger=[{"time": now_ms(), "delta": {"type": "deposit", "usdc": "150"}}],
+        portfolio=1_000_000.0,
+    )
+    check("低于比例阈值不告警", len(calls) == 0, str(calls))
+
+    # -------------------------------------------------- residual (fallback)
+    _, calls = await scenario(
+        "残差兜底", [state(10_000, 0, [("BTC", 0.5)]), state(11_000, 0, [("BTC", 0.5)])],
+    )
+    check("流水无事件时用残差兜底", len(calls) == 1, str(calls))
+    if calls:
+        c = calls[0]
+        check("残差通知来源默认 inferred", c.get("source", "inferred") == "inferred", str(c))
+        check("残差通知金额 $1,000", abs(c["net_flow"] - 1000) < 1e-6, str(c))
+        check("残差通知含全账户净值", c["portfolio_equity"] == 11_000.0, str(c))
+    check("残差通知模板渲染成功", await render_notification(calls[0]) if calls else False)
 
     _, calls = await scenario(
         "冷静期",
         [state(10_000, 0), state(11_000, 0), state(12_000, 0)],
-        cooldown=9999, ledger=dep,
+        cooldown=9999,
     )
     check("冷静期内第二次转账被抑制", len(calls) == 1, str(calls))
 
     for label, bad in (("读取失败", None), ("零净值", state(0, 0))):
-        client = StubClient([state(10_000, 0), bad, state(11_000, 0)], ledger=dep)
+        client = StubClient([state(10_000, 0), bad, state(11_000, 0)])
         notifier = StubNotifier()
         reset(client, notifier)
         await main.check_target_fund_flow_once()
@@ -268,25 +311,28 @@ async def run_tick_checks():
 
     _, calls = await scenario(
         "切换目标", [state(10_000, 0), state(20_000, 0)],
-        extra_wallet=[WALLET, OTHER], ledger=dep,
+        extra_wallet=[WALLET, OTHER],
     )
     check("/follow 切换目标重建基线，零通知", len(calls) == 0, str(calls))
 
-    _, calls = await scenario(
-        "行情误报", [state(10_000, 0), state(11_000, 1_000)], ledger=dep,
-    )
+    _, calls = await scenario("行情误报", [state(10_000, 0), state(11_000, 1_000)])
     check("浮盈导致的净值跳变不发通知", len(calls) == 0, str(calls))
 
     _, calls = await scenario(
         "仓位变动", [state(10_000, 0, [("BTC", 0.5)]), state(11_000, 0, [("BTC", 1.0)])],
-        ledger=dep,
     )
     check("仓位大变时不发通知", len(calls) == 0, str(calls))
+
+    _, calls = await scenario("流水失败", [state(10_000, 0), state(9_000, 0)], ledger_error="timeout")
+    check("流水查询失败仍发出推断通知", len(calls) == 1, str(calls))
+    if calls:
+        check("通知注明流水失败", "流水查询失败" in calls[0]["ledger_text"], calls[0]["ledger_text"])
+        check("净流出方向正确", calls[0]["direction"] == "out", str(calls[0]))
 
     _, calls = await scenario(
         "内部划转",
         [state(10_000, 0), state(11_000, 0)],
-        ledger=[{"time": int(time.time() * 1000), "delta": {
+        ledger=[{"time": now_ms(), "delta": {
             "type": "send", "user": WALLET, "destination": WALLET,
             "token": "USDC", "amount": "1000",
             "sourceDex": "spot", "destinationDex": "",
@@ -294,13 +340,15 @@ async def run_tick_checks():
     )
     check("目标把现货划进合约时不误报入金", len(calls) == 0, str(calls))
 
-    _, calls = await scenario(
-        "流水失败", [state(10_000, 0), state(9_000, 0)], ledger_error="timeout",
-    )
-    check("流水查询失败仍发出推断通知", len(calls) == 1, str(calls))
-    if calls:
-        check("通知注明流水失败", "流水查询失败" in calls[0]["ledger_text"], calls[0]["ledger_text"])
-        check("净流出方向正确", calls[0]["direction"] == "out", str(calls[0]))
+
+async def no_second_alert(ledger):
+    """Run the same ledger twice more: the overlap must not re-announce it."""
+    client = StubClient([state(10_000, 0), state(11_000, 0), state(11_000, 0)], ledger=ledger)
+    notifier = StubNotifier()
+    reset(client, notifier)
+    for _ in range(3):
+        await main.check_target_fund_flow_once()
+    return len(notifier.calls) == 1
 
 
 async def render_notification(payload):
@@ -323,6 +371,29 @@ async def render_notification(payload):
     check("通知含仓位变化标签", "基本未变" in text, text)
     check("通知含跟单金额提示", "跟单金额" in text, text)
     return ok and all(k in text for k in ("转入", "$1,000.00", "基本未变"))
+
+
+async def render_ledger_notification(payload):
+    """The ledger-confirmed template has no equity before/after to show."""
+    sent = {}
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, parse_mode=None):
+            sent["text"] = text
+            return True
+
+    svc = notifications.NotificationService.__new__(notifications.NotificationService)
+    svc.bot = FakeBot()
+    svc.chat_id = "1"
+    svc.enabled = True
+    ok = await svc.send_target_fund_flow_notification(**payload)
+    text = sent.get("text", "")
+    check("流水通知含方向标题", "转入" in text, text)
+    check("流水通知含净额", "$1,000.00" in text, text)
+    check("流水通知标明已确认", "流水确认" in text or "交易所流水净额" in text, text)
+    check("流水通知含流水明细", "充值" in text, text)
+    check("流水通知不含推断仓位行", "基本未变" not in text, text)
+    return ok and all(k in text for k in ("转入", "$1,000.00", "充值"))
 
 
 asyncio.run(run_tick_checks())

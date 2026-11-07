@@ -168,23 +168,25 @@ class NotificationService:
         wallet: str,
         direction: str,
         net_flow: float,
-        equity_before: float,
-        equity_after: float,
-        equity_delta: float,
-        unrealized_pnl_delta: float,
-        flow_pct: float,
-        position_change_pct: float,
-        ledger_text: str,
+        equity_before: float | None = None,
+        equity_after: float | None = None,
+        equity_delta: float | None = None,
+        unrealized_pnl_delta: float | None = None,
+        flow_pct: float | None = None,
+        position_change_pct: float | None = None,
+        ledger_text: str = "",
         chain_net: float | None = None,
         chain_matched: bool = False,
         portfolio_equity: float | None = None,
+        source: str = "inferred",
     ) -> bool:
         """Alert that the followed wallet deposited or withdrew funds.
 
-        The headline amount is inferred from equity after removing the
-        unrealized-PnL change; the exchange ledger breakdown below it is the
-        exact cash movement. They are shown side by side so a data glitch can
-        never be mistaken for a confirmed deposit.
+        Two shapes: ``source="ledger"`` announces an amount the exchange ledger
+        confirmed (this is the only one that also sees cash held in spot), and
+        ``source="inferred"`` announces an equity residual when the ledger has
+        nothing to show yet. The ledger breakdown is always displayed so a data
+        glitch can never be mistaken for a confirmed deposit.
         """
         inflow = direction == "in"
         emoji = "📥" if inflow else "📤"
@@ -204,8 +206,23 @@ class NotificationService:
             if portfolio_equity is not None
             else ""
         )
-        message = f"""
+        if source == "ledger":
+            message = f"""
 {emoji} <b>目标地址资金异动 · {label}</b>
+
+👤 <b>目标：</b><code>{short_wallet}</code>
+💵 <b>交易所流水净额：</b><b>${abs(net_flow):,.2f}</b>{f"（{flow_pct:+.2f}%）" if flow_pct is not None else ""}{portfolio_line}
+
+━━━━━━━━━━━━━━━━━━
+🔗 <b>流水明细：</b>{ledger_text}
+
+⚠️ 这次变动已由交易所流水确认，跟单金额按目标净值比例计算，会自动放大或缩小。
+🕐 <b>时间：</b>{_now_shanghai().strftime('%Y-%m-%d %H:%M:%S UTC+8')}
+"""
+            return await self.send_message(message.strip())
+
+        message = f"""
+{emoji} <b>目标地址资金异动 · {label}（净值推断）</b>
 
 👤 <b>目标：</b><code>{short_wallet}</code>
 💼 <b>账户净值：</b>${equity_before:,.2f} → ${equity_after:,.2f}（{equity_delta:+,.2f}）{portfolio_line}
