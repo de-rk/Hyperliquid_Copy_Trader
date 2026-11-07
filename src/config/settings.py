@@ -168,9 +168,11 @@ class TargetEquityFlowConfig(BaseModel):
 
     enabled: bool = True
     poll_seconds: int = 60
-    # Both thresholds must be met: an absolute floor avoids noise on small
-    # accounts, a percentage floor keeps large accounts from missing a
-    # proportionally small but meaningful transfer.
+    # Noise thresholds for the *inferred* residual only: an absolute floor
+    # avoids noise on small accounts, a percentage floor keeps large accounts
+    # from missing a proportionally small but meaningful transfer. A ledger
+    # confirmed deposit/withdrawal bypasses both (see LEDGER_ALERT_MIN_USD),
+    # because a real cash movement is never noise.
     min_usd: float = 100.0
     min_pct: float = 1.0
     # Max tolerated change in position sizes (percent of gross signed size).

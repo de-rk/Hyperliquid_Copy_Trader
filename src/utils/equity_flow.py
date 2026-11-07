@@ -29,6 +29,10 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 SIZE_EPSILON = 1e-9
+# Floor for ledger-confirmed alerts. The configurable thresholds exist to keep
+# noise out of the *inferred* residual; a real deposit or withdrawal is not
+# noise, so it is only filtered for dust below this amount.
+LEDGER_ALERT_MIN_USD = 1.0
 
 
 @dataclass(frozen=True)
@@ -330,12 +334,12 @@ def ledger_lines(summary: LedgerSummary) -> str:
         detail = "、".join(f"{kind} × {count}" for kind, count in shown)
         if len(summary.other_counts) > len(shown):
             detail += f" 等 {len(summary.other_counts)} 类"
-        parts.append(f"事件：{detail}")
         if abs(summary.other_net) > 0.005:
             # A deposit paid with ``send`` has no ``deposit`` row, so name the
             # direction explicitly instead of leaving a bare signed number.
             verb = "外部转入" if summary.other_net > 0 else "外部转出"
-            parts.append(f"{verb}净额 {summary.other_net:+,.2f}")
+            parts.append(f"{verb} +${abs(summary.other_net):,.2f}")
+        parts.append(f"流水类型：{detail}")
     return "；".join(parts)
 
 

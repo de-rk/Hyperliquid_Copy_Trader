@@ -15,6 +15,7 @@ from config.settings import normalize_pnl_filter, settings
 from utils.logger import setup_logger
 from utils import copy_ledger
 from utils.equity_flow import (
+    LEDGER_ALERT_MIN_USD,
     EquitySnapshot,
     analyze_equity_flow,
     detect_ledger_flow,
@@ -3457,7 +3458,7 @@ async def check_target_fund_flow_once() -> None:
         if target_flow_ledger_cursor_ms is not None
         else now_ms - max(120_000, cfg.poll_seconds * 2_000)
     )
-    window_start = max(window_start, now_ms - 3_600_000)
+    window_start = max(window_start, now_ms - 86_400_000)
     window_end = now_ms + 60_000
     ledger = summarize_ledger_updates([], wallet, start_ms=window_start, end_ms=window_end)
     try:
@@ -3503,30 +3504,23 @@ async def check_target_fund_flow_once() -> None:
         # be announced twice, and a bad read never reaches this point.
         last_target_equity_snapshot = snapshot
     equity_now = await client.get_portfolio_account_value(wallet)
-    pct_base = (
-        equity_now
-        if equity_now is not None and equity_now > 0
-        else (snapshot.equity if snapshot is not None else None)
-    )
+    # A dust-level total is not a usable denominator for a percentage.
+    pct_base = equity_now if equity_now is not None and equity_now >= 1.0 else None
 
     # ---- 3) decide ----
     alert = None  # (source, flow, ledger_summary)
+    # A confirmed cash movement is announced regardless of the noise
+    # thresholds: those exist to keep the *inferred* residual quiet, and a real
+    # deposit or withdrawal is never noise. Only dust is dropped.
     ledger_flow = detect_ledger_flow(
         ledger,
-        min_usd=cfg.min_usd,
+        min_usd=LEDGER_ALERT_MIN_USD,
         from_ms=window_start,
         to_ms=window_end,
         equity=pct_base,
     )
     if ledger_flow is not None:
-        flow_pct = ledger_flow.flow_pct
-        if flow_pct is not None and abs(flow_pct) < max(0.0, cfg.min_pct):
-            logger.info(
-                f"💰 Ledger flow ${ledger_flow.amount:,.2f} is under "
-                f"{cfg.min_pct:g}% of ${pct_base:,.2f} — no alert"
-            )
-        else:
-            alert = ("ledger", ledger_flow, ledger)
+        alert = ("ledger", ledger_flow, ledger)
 
     if (
         alert is None
@@ -3581,6 +3575,7 @@ async def check_target_fund_flow_once() -> None:
                 direction=flow.direction,
                 net_flow=flow.net_flow,
                 ledger_text=ledger_lines(used_ledger),
+                flow_pct=flow.flow_pct,
                 chain_net=(
                     used_ledger.chain_net if used_ledger.matched else None
                 ),
@@ -3630,8 +3625,9 @@ async def poll_target_fund_flow():
         logger.info("💰 Target fund-flow monitoring is disabled")
         return
     logger.info(
-        f"💰 Target fund-flow monitor started: ledger + equity residual every "
-        f"{cfg.poll_seconds}s, alert above ${cfg.min_usd:,.0f} / {cfg.min_pct:g}%"
+        f"💰 Target fund-flow monitor started: ledger every {cfg.poll_seconds}s "
+        f"(any net deposit/withdrawal above ${LEDGER_ALERT_MIN_USD:g}), "
+        f"residual fallback above ${cfg.min_usd:,.0f} / {cfg.min_pct:g}%"
         f" with positions changing under {cfg.max_position_change_pct:g}%"
     )
     while True:

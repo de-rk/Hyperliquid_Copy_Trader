@@ -201,9 +201,11 @@ class NotificationService:
                 f"\n<b>链上充提净额：</b>{chain_net:+,.2f}"
                 f"\n<b>与推断差额：</b>${gap:+,.2f}（浮盈、资金费或内部划转）"
             )
+        # A dust-level portfolio value (a wallet emptied into spot) would read
+        # as "$0.00" and contradict the flow being announced, so it is hidden.
         portfolio_line = (
             f"\n<b>全账户净值：</b>${portfolio_equity:,.2f}（portfolio 口径，含现货）"
-            if portfolio_equity is not None
+            if portfolio_equity is not None and portfolio_equity >= 1.0
             else ""
         )
         if source == "ledger":

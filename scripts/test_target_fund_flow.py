@@ -270,14 +270,20 @@ async def run_tick_checks():
         "小额流水", [state(10_000, 0)],
         ledger=[{"time": now_ms(), "delta": {"type": "deposit", "usdc": "50"}}],
     )
-    check("低于金额阈值不告警", len(calls) == 0, str(calls))
+    check("小额净入金也提示（不受推断阈值限制）", len(calls) == 1, str(calls))
+
+    _, calls = await scenario(
+        "尘埃流水", [state(10_000, 0)],
+        ledger=[{"time": now_ms(), "delta": {"type": "deposit", "usdc": "0.5"}}],
+    )
+    check("低于 1 美元的尘埃流水不提示", len(calls) == 0, str(calls))
 
     _, calls = await scenario(
         "比例阈值", [state(1_000_000, 0)],
         ledger=[{"time": now_ms(), "delta": {"type": "deposit", "usdc": "150"}}],
         portfolio=1_000_000.0,
     )
-    check("低于比例阈值不告警", len(calls) == 0, str(calls))
+    check("大账户的小额净入金也提示", len(calls) == 1, str(calls))
 
     # -------------------------------------------------- residual (fallback)
     _, calls = await scenario(
