@@ -139,6 +139,8 @@ Fill copied: xyz:SKHX buy size=... target_size=... reduce_only=False
 SIMULATED_TRADING=false
 ```
 
+注意：实盘模式下如果 `HYPERLIQUID_WALLET_ADDRESS` 的账户净值为 0，程序**不会退出**，而是打一条 `💸 Follower wallet ... has $0.00 total equity` 并每 30 秒重试一次，入金后自动继续启动（按新余额重算跟单比例）。以前这里直接抛异常，碰上 `restart: unless-stopped` 就变成每几秒重启一次的日志风暴，而且 Telegram 还没起来，看不到任何提示。
+
 再重新创建容器：
 
 ```bash

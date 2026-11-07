@@ -3554,9 +3554,41 @@ async def main():
             simulated_balance = follower_total_equity
 
             if simulated_balance <= 0:
-                raise RuntimeError(
-                    f"Follower wallet total equity is ${simulated_balance:,.2f}; "
-                    "fund the wallet before live trading."
+                # Do not raise here. The container runs under Docker's
+                # `restart: unless-stopped`, so exiting produces a restart every
+                # few seconds: a log storm, no Telegram, and no /status. Zero
+                # equity means nothing can be copied anyway, so wait for a
+                # deposit and carry on with the normal startup once it lands;
+                # the ratio is recalculated from the fresh balance.
+                follower_address = settings.hyperliquid.wallet_address
+                logger.error(
+                    f"💸 Follower wallet {follower_address} has "
+                    f"${simulated_balance:,.2f} total equity — live copying is on "
+                    "hold until it is funded."
+                )
+                logger.error(
+                    "   入金到上面这个地址，或把 SIMULATED_TRADING 设为 true 先跑模拟盘；"
+                    "要换钱包就改 HYPERLIQUID_WALLET_ADDRESS 后重启。"
+                )
+                waited_seconds = 0
+                while simulated_balance <= 0:
+                    await asyncio.sleep(30)
+                    waited_seconds += 30
+                    equity = await client.get_portfolio_account_value(
+                        follower_address
+                    )
+                    if equity is None:
+                        continue  # read failed; keep the previous value
+                    simulated_balance = equity
+                    if simulated_balance <= 0 and waited_seconds % 1800 == 0:
+                        logger.error(
+                            f"💸 Still waiting for funds: {follower_address} "
+                            f"= ${simulated_balance:,.2f} (waited "
+                            f"{waited_seconds // 60} min)"
+                        )
+                logger.success(
+                    f"💰 Follower wallet funded: ${simulated_balance:,.2f} — "
+                    "continuing startup"
                 )
 
         if target_balance <= 0:
@@ -3889,6 +3921,11 @@ async def main():
         
         if telegram_bot:
             await telegram_bot.stop()
+
+        # Without this every fatal path leaves an aiohttp session open and the
+        # logs end with "Unclosed client session" right after the real error.
+        if client:
+            await client.close()
         
         logger.info("👋 Bot stopped gracefully")
 

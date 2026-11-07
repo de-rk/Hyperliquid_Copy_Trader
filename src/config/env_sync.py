@@ -28,6 +28,7 @@ python image before any dependency is installed.
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import re
 import shutil
@@ -194,6 +195,21 @@ def backup(path: Path) -> Path:
     return target
 
 
+def write_in_place(path: Path, content: str) -> None:
+    """Rewrite the file without changing its inode.
+
+    Required when the path is a bind mount (``/app/.env`` inside the
+    container): the mount point is not a regular directory entry, so any
+    rename onto it fails with EBUSY. Truncating the existing file keeps the
+    inode, and therefore keeps the mount, intact. A crash midway leaves a
+    truncated file, which is why apply_plan backs the file up first.
+    """
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def write_atomic(path: Path, content: str) -> None:
     tmp = path.with_name(f"{path.name}.env_sync.tmp")
     mode = None
@@ -209,7 +225,16 @@ def write_atomic(path: Path, content: str) -> None:
                 os.chmod(tmp, mode)
             except OSError:
                 pass
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            # EBUSY/EXDEV: path is a mount point (docker bind mount), so the
+            # tmp+rename swap is impossible. Fall back to an in-place rewrite
+            # instead of failing the sync on every single container start.
+            if exc.errno not in (errno.EBUSY, errno.EXDEV, errno.EPERM):
+                raise
+            write_in_place(path, content)
+            print(f"[env] {path.name} 是挂载文件，已改为原地写入（rename 被拒绝：{exc.strerror}）")
     finally:
         if tmp.exists():
             try:
