@@ -272,9 +272,9 @@ ENV_VARS: tuple[EnvVar, ...] = (
     ),
     EnvVar(
         "TARGET_EQUITY_FLOW_MIN_PCT",
-        "1.0",
+        "10000",
         "目标资金监控",
-        "净值推断兜底的最低比例（占总净值百分比）；流水确认的出入金不受此限制。",
+        "净值推断兜底的最低比例（占总净值百分比）；流水确认的出入金不受此限制。默认 10000 即关闭残差兜底（含 HYPE 现货波动易误报），只报流水确认的真实出入金。",
     ),
     EnvVar(
         "TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT",

@@ -174,7 +174,10 @@ class TargetEquityFlowConfig(BaseModel):
     # confirmed deposit/withdrawal bypasses both (see LEDGER_ALERT_MIN_USD),
     # because a real cash movement is never noise.
     min_usd: float = 100.0
-    min_pct: float = 1.0
+    # 10000% disables the residual fallback by default: the total-equity
+    # baseline includes HYPE spot, whose price swings would otherwise fire
+    # false alerts. Ledger-confirmed cash movements bypass this entirely.
+    min_pct: float = 10000.0
     # Max tolerated change in position sizes (percent of gross signed size).
     max_position_change_pct: float = 5.0
     cooldown_seconds: int = 300
