@@ -2528,23 +2528,6 @@ async def get_status() -> str:
         ]
     position_details = "\n".join(position_lines) if position_lines else "暂无持仓"
 
-    flow_cfg = settings.target_equity_flow
-    if not flow_cfg.enabled:
-        flow_status = "已关闭"
-    elif target_flow_last_check_at is None:
-        flow_status = f"等待首次扫描（每 {flow_cfg.poll_seconds}s）"
-    else:
-        checked = target_flow_last_check_at.strftime("%H:%M:%S")
-        equity_part = (
-            f"合约净值 ${target_flow_last_equity:,.2f}"
-            if target_flow_last_equity is not None
-            else "合约无余额，按流水判定"
-        )
-        flow_status = (
-            f"{equity_part}｜流水+净值｜扫描 {checked}"
-            f"｜每 {flow_cfg.poll_seconds}s"
-        )
-
     funding_note = (
         "钱包净值 $0，/orders /copyloss /close 已禁用；入金后发 /start"
         if wallet_unfunded
@@ -2569,7 +2552,6 @@ async def get_status() -> str:
 <b>仓位模式：</b>{settings.sizing.mode.title()}
 <b>杠杆：</b>目标杠杆的 {settings.leverage.adjustment_ratio} 倍
 <b>追入旧仓位：</b>{existing_position_policy_text()}
-<b>目标资金监控：</b>{flow_status}
 <b>资金限制：</b>{funding_note}
 <b>版本：</b>{build_stamp()}
     """.strip()
@@ -3367,14 +3349,20 @@ async def handle_stop():
     logger.warning("🛑 Bot stopped. Send /start to resume copying.")
 
 
-def _target_equity_snapshot(wallet: str, state, captured_at_ms: int) -> EquitySnapshot:
+def _target_equity_snapshot(
+    wallet: str, state, captured_at_ms: int, equity: Optional[float] = None
+) -> EquitySnapshot:
     """Turn one target read into a comparable snapshot.
 
-    Equity, unrealized PnL and sizes all come from the same ``get_user_state``
-    response. Mixing a cached portfolio value with a fresh position read would
-    create a phantom "deposit" whenever the two were sampled at different
-    prices.
+    Equity is the all-account total (perp + spot), matching the 账户总金额 the
+    account summary shows, because the target holds most of its cash in spot
+    and a perp-only basis reads $0 there. Unrealized PnL and position sizes
+    still come from the perp state: they only exist on perp books, so a spot
+    token's price swing lands in the residual as-is and is the caller's job to
+    threshold away. ``state`` may be None for a wallet the perp endpoint does
+    not know; the snapshot then carries no positions and zero unrealized PnL.
     """
+    positions = state.positions if state else ()
     signed_positions = tuple(
         (
             position.symbol,
@@ -3382,12 +3370,14 @@ def _target_equity_snapshot(wallet: str, state, captured_at_ms: int) -> EquitySn
             if str(position.side.value).lower() == "long"
             else -float(position.size),
         )
-        for position in state.positions
+        for position in positions
     )
+    if equity is None:
+        equity = float(state.balance) if state else 0.0
     return EquitySnapshot(
         wallet=wallet,
-        equity=float(state.balance),
-        unrealized_pnl=float(state.unrealized_pnl),
+        equity=float(equity),
+        unrealized_pnl=float(state.unrealized_pnl) if state else 0.0,
         positions=signed_positions,
         captured_at_ms=captured_at_ms,
     )
@@ -3487,23 +3477,31 @@ async def check_target_fund_flow_once() -> None:
         target_flow_ledger_cursor_ms = now_ms
     _note_internal_transfers(ledger)
 
-    # ---- 2) equity snapshot (residual fallback + /status) ----
+    # ---- 2) equity snapshot (residual fallback) ----
+    # The residual runs on the all-account total (perp + spot) — the same 账户
+    # 总金额 the account summary reports — because the target keeps most of its
+    # cash in spot and a perp-only basis reads $0 there. The portfolio's latest
+    # point is sampled live, so consecutive 60s polls stay comparable. Positions
+    # and unrealized PnL still come from the perp read; they have no spot form.
     state = await client.get_user_state(wallet)
+    equity_now = await client.get_portfolio_account_value(wallet)
     snapshot = None
-    if state is None:
-        logger.warning("💰 Target fund-flow poll: account state unavailable")
-    elif state.balance > 0:
+    if equity_now is not None and equity_now > 0:
+        snapshot = _target_equity_snapshot(wallet, state, now_ms, equity=equity_now)
+        target_flow_last_equity = snapshot.equity
+    elif state is not None and state.balance > 0:
+        # Portfolio read failed: fall back to the perp-only value so the
+        # residual keeps working instead of going blind.
         snapshot = _target_equity_snapshot(wallet, state, now_ms)
         target_flow_last_equity = snapshot.equity
-    # balance == 0 means "no perp cash", not "no money": a spot-only wallet
-    # still gets ledger alerts, it just cannot use the residual this round.
+    else:
+        logger.warning("💰 Target fund-flow poll: account state unavailable")
 
     previous = last_target_equity_snapshot
     if snapshot is not None:
         # Advance even when nothing is reported: the same transfer must never
         # be announced twice, and a bad read never reaches this point.
         last_target_equity_snapshot = snapshot
-    equity_now = await client.get_portfolio_account_value(wallet)
     # A dust-level total is not a usable denominator for a percentage.
     pct_base = equity_now if equity_now is not None and equity_now >= 1.0 else None
 

@@ -201,17 +201,22 @@ check("对手方为空时不产生空括号",
 
 # ------------------------------------------------------------------ poll tick
 class StubClient:
-    def __init__(self, states, ledger=None, ledger_error=None, portfolio=11_000.0):
+    def __init__(self, states, ledger=None, ledger_error=None, portfolio=None):
         self.states = list(states)
         self.ledger = ledger or []
         self.ledger_error = ledger_error
+        # None -> mirror the live total by tracking this poll's state balance,
+        # so the residual exercises a moving all-account basis. An explicit
+        # value pins the total constant, isolating the ledger path.
         self.portfolio = portfolio
         self.state_calls = 0
         self.ledger_calls = 0
+        self.last_state = None
 
     async def get_user_state(self, wallet):
         self.state_calls += 1
-        return self.states.pop(0) if self.states else None
+        self.last_state = self.states.pop(0) if self.states else None
+        return self.last_state
 
     async def get_non_funding_ledger_updates(self, wallet, start_ms, end_ms):
         self.ledger_calls += 1
@@ -220,7 +225,9 @@ class StubClient:
         return self.ledger
 
     async def get_portfolio_account_value(self, wallet):
-        return self.portfolio
+        if self.portfolio is not None:
+            return self.portfolio
+        return float(self.last_state.balance) if self.last_state is not None else None
 
 
 class StubNotifier:
@@ -264,7 +271,7 @@ def reset(client=None, notifier=None, cooldown=0, wallet=WALLET):
 
 
 async def scenario(name, states, *, cooldown=0, wallet=WALLET, ledger=None,
-                   ledger_error=None, extra_wallet=None, portfolio=11_000.0):
+                   ledger_error=None, extra_wallet=None, portfolio=None):
     client = StubClient(states, ledger=ledger, ledger_error=ledger_error,
                         portfolio=portfolio)
     notifier = StubNotifier()
@@ -288,7 +295,10 @@ async def run_tick_checks():
     check("首次采样只建基线，不发通知", len(calls) == 0, str(calls))
     check("首次采样记录净值供 /status", main.target_flow_last_equity == 10_000)
 
-    _, calls = await scenario("流水入金", [state(10_000, 0), state(11_000, 0)], ledger=dep)
+    # The deposit already landed before the first poll, so pin the live total
+    # at its post-deposit value; the ledger path is what announces it.
+    _, calls = await scenario("流水入金", [state(10_000, 0), state(11_000, 0)],
+                              ledger=dep, portfolio=11_000.0)
     check("流水命中即通知（不必等净值两轮）", len(calls) == 1, str(calls))
     if calls:
         c = calls[0]
@@ -345,6 +355,44 @@ async def run_tick_checks():
         check("残差通知金额 $1,000", abs(c["net_flow"] - 1000) < 1e-6, str(c))
         check("残差通知含全账户净值", c["portfolio_equity"] == 11_000.0, str(c))
     check("残差通知模板渲染成功", await render_notification(calls[0]) if calls else False)
+
+    # The target parks its cash in spot: perp balance is $0 while the total is
+    # $615k. A perp-only residual reads $0 forever and never fires; the basis
+    # must be the all-account total so a spot-side move still shows up.
+    class SpotHeavyClient:
+        def __init__(self):
+            self.states = [state(0, 0), state(0, 0), state(0, 0)]
+            self.totals = [615_000.0, 715_000.0, 715_000.0]
+            self.last_state = None
+
+        async def get_user_state(self, wallet):
+            self.last_state = self.states.pop(0) if self.states else None
+            return self.last_state
+
+        async def get_non_funding_ledger_updates(self, wallet, s, e):
+            return []
+
+        async def get_portfolio_account_value(self, wallet):
+            return self.totals.pop(0) if self.totals else None
+
+    spot_heavy = SpotHeavyClient()
+    notifier = StubNotifier()
+    reset(spot_heavy, notifier)
+    await main.check_target_fund_flow_once()  # baseline at $615k
+    check("合约余额 0 但总额有值时也建基线",
+          main.target_flow_last_equity == 615_000.0,
+          str(main.target_flow_last_equity))
+    await main.check_target_fund_flow_once()  # total jumps $100k
+    check("总净值口径的残差能检出大额变动",
+          len(notifier.calls) == 1, str(notifier.calls))
+    if notifier.calls:
+        check("残差金额按总净值计算",
+              abs(notifier.calls[0]["net_flow"] - 100_000) < 1e-6,
+              str(notifier.calls[0]))
+        check("残差通知净值前后为总口径",
+              abs(notifier.calls[0]["equity_before"] - 615_000) < 1e-6
+              and abs(notifier.calls[0]["equity_after"] - 715_000) < 1e-6,
+              str(notifier.calls[0]))
 
     _, calls = await scenario(
         "冷静期",
@@ -407,15 +455,17 @@ async def run_tick_checks():
                 "sourceDex": "spot", "destinationDex": "",
             }}
             self.visible = False
+            self.last_state = None
 
         async def get_user_state(self, wallet):
-            return self.states.pop(0) if self.states else None
+            self.last_state = self.states.pop(0) if self.states else None
+            return self.last_state
 
         async def get_non_funding_ledger_updates(self, wallet, start_ms, end_ms):
             return [self.row] if self.visible else []
 
         async def get_portfolio_account_value(self, wallet):
-            return 11_000.0
+            return float(self.last_state.balance) if self.last_state else None
 
     lagged = LaggedClient()
     notifier = StubNotifier()
