@@ -428,10 +428,15 @@ def _copy_receipt_text(
     scope_name: str,
     simulated: bool,
 ) -> str:
-    """Render the per-position receipt for a manual copy run."""
+    """Render the per-position receipt for a manual copy run.
+
+    ``notional`` is recomputed from the fill when the exchange reported one:
+    sizing converts at the *target's entry price*, so quoting that number as
+    the fill notional makes the receipt disagree with what actually settled.
+    """
     stamp = datetime.now(SHANGHAI_TZ).strftime("%m-%d %H:%M:%S")
     filled = [record for record in records if record["ok"]]
-    total_notional = sum(record["notional"] for record in filled)
+    total_notional = 0.0
     lines = [
         f"🧾 <b>一键复制回执</b>｜{scope_name}｜{'模拟' if simulated else '实盘'}｜{stamp}",
         "",
@@ -446,6 +451,8 @@ def _copy_receipt_text(
             continue
         size = record["fill_size"] or record["size"]
         price = record["fill_price"]
+        notional = abs(size * price) if price else record["notional"]
+        total_notional += notional
         if price:
             price_text = f"@ ${price:,.4f}"
         elif simulated:
@@ -455,9 +462,7 @@ def _copy_receipt_text(
         lines.append(
             f"{index}. ✅ <b>{symbol} {side}</b>｜{record['leverage']}x"
         )
-        lines.append(
-            f"   成交 {size:.6g} {price_text}｜名义 ${record['notional']:,.2f}"
-        )
+        lines.append(f"   成交 {size:.6g} {price_text}｜名义 ${notional:,.2f}")
         if record["order_id"]:
             lines.append(f"   订单 <code>{html.escape(str(record['order_id']))}</code>")
     lines.append("")
@@ -472,20 +477,134 @@ def _copy_receipt_text(
     return "\n".join(lines)
 
 
-async def _recent_fills_by_symbol(started_at_ms: int) -> dict[str, dict]:
-    """Follower fills created after ``started_at_ms``, keyed by symbol."""
+async def _recent_fills_by_symbol(
+    started_at_ms: int,
+    symbols: Optional[set[str]] = None,
+    attempts: int = 3,
+) -> dict[str, dict]:
+    """Follower fills created after ``started_at_ms``, keyed by symbol.
+
+    ``userFills`` is indexed a moment *after* the order call returns, so a
+    single immediate read often comes back empty — that is why receipts used
+    to say "未取到成交价". A couple of short retries close most of the gap.
+    """
     if settings.simulated_trading:
         return {}
     wallet = settings.hyperliquid.wallet_address
     if not wallet:
         return {}
     fills: dict[str, dict] = {}
-    for fill in await client.get_user_fills(wallet, limit=20):
-        if fill["timestamp"] < started_at_ms:
-            continue
-        fills.setdefault(fill["symbol"], fill)
-        fills.setdefault(fill["symbol"].lower(), fill)
+    for attempt in range(max(1, attempts)):
+        fills = {}
+        for fill in await client.get_user_fills(wallet, limit=20):
+            if fill["timestamp"] < started_at_ms:
+                continue
+            fills.setdefault(fill["symbol"], fill)
+            fills.setdefault(fill["symbol"].lower(), fill)
+        if not symbols or any(symbol in fills for symbol in symbols):
+            break
+        if attempt + 1 < attempts:
+            await asyncio.sleep(0.6)
     return fills
+
+
+async def estimate_copy_execution(
+    candidates: list[Any],
+    auto_ratio: float,
+) -> dict[str, dict[str, Any]]:
+    """Estimate the notional each ``/copyloss`` entry will actually place.
+
+    The proportional figure (target notional × equity ratio) is only the
+    *request*. Before the order leaves, it is capped by the free margin of the
+    symbol's own perp DEX and by ``MAX_POSITION_SIZE``. A HIP-3 symbol such as
+    ``xyz:SKHX`` settles on a separate margin account, so cash parked in spot
+    or on another DEX cannot back it: a $141 portfolio holding $33 free on
+    ``xyz`` can only open ~$134 at 10x with 40% margin usage. The preview used
+    to show the uncapped $368, which is why the receipt looked like a
+    different calculation.
+
+    Budgets are consumed in list order so a multi-position preview adds up the
+    way the sequential order placement does.
+    """
+    usage = max(0.0, settings.copy_rules.max_margin_usage_ratio)
+    position_cap = settings.sizing.max_position_size
+    address = settings.hyperliquid.wallet_address
+    unified = settings.hyperliquid.account_mode == "unified"
+
+    plans: dict[str, dict[str, Any]] = {}
+    budgets: dict[str, float] = {}
+    states: dict[str, Any] = {}
+    unified_budget: Optional[float] = None
+
+    for pos in candidates:
+        requested = abs(pos.size) * pos.entry_price * auto_ratio
+        leverage = calculate_adjusted_leverage(
+            target_leverage=pos.leverage,
+            adjustment_ratio=settings.leverage.adjustment_ratio,
+            symbol=pos.symbol,
+        )
+        dex = perp_dex_for_symbol(pos.symbol)
+        available: Optional[float] = None
+        basis = ""
+
+        if settings.simulated_trading:
+            available = max(0.0, simulated_balance)
+            basis = f"模拟余额 ${available:,.2f} × {leverage}x × {usage:.0%}"
+        elif client is None or not address:
+            available = None
+        elif unified:
+            if unified_budget is None:
+                side = (
+                    OrderSide.BUY
+                    if pos.side == PositionSide.LONG
+                    else OrderSide.SELL
+                )
+                unified_budget = await client.get_available_to_trade_notional(
+                    address,
+                    pos.symbol,
+                    side.value,
+                    target_leverage=max(1, leverage),
+                )
+            available = unified_budget
+            basis = f"可交易额度 ${(available or 0.0):,.2f} × {usage:.0%}"
+        else:
+            if dex not in states:
+                states[dex] = await client.get_user_state(address, dex=dex)
+                if states[dex] is not None:
+                    budgets[dex] = max(0.0, states[dex].available_balance)
+            available = budgets.get(dex)
+            basis = (
+                f"可用保证金 ${(available or 0.0):,.2f}"
+                f" × {leverage}x × {usage:.0%}"
+            )
+
+        executable = requested
+        if available is not None:
+            executable = min(executable, max(0.0, available) * max(1.0, leverage) * usage)
+        if position_cap is not None:
+            executable = min(executable, max(0.0, position_cap))
+        executable = max(0.0, executable)
+
+        # Spend the budget so the next row in the same preview sees less.
+        if available is not None and not settings.simulated_trading:
+            if unified:
+                unified_budget = max(0.0, (unified_budget or 0.0) - executable)
+            else:
+                budgets[dex] = max(
+                    0.0, available - executable / max(1.0, leverage)
+                )
+
+        plans[pos.symbol] = {
+            "requested": requested,
+            "executable": executable,
+            "leverage": leverage,
+            "available": available,
+            "dex": dex,
+            "basis": basis,
+            "capped": executable < requested - 0.005,
+            "unknown": available is None,
+        }
+    return plans
 
 
 async def handle_copy_existing(
@@ -595,6 +714,7 @@ async def handle_copy_existing(
             )
         chosen = [candidates[number - 1] for number in wanted]
 
+    copy_plan = {} if confirm else await estimate_copy_execution(copyable, auto_ratio)
     ratio_text = f"1:{int(1 / auto_ratio)}" if auto_ratio > 0 else "0"
     lines = [
         f"🎯 <b>目标{scope_name}仓位{'（预览）' if not confirm else ''}</b>",
@@ -604,31 +724,70 @@ async def handle_copy_existing(
         "",
     ]
     total_your_value = 0.0
+    total_executable = 0.0
     selected_numbers = {id(pos) for pos in chosen}
     for index, pos in enumerate(candidates, 1):
         target_value = abs(pos.size) * pos.entry_price
-        your_value = target_value * auto_ratio
+        plan = copy_plan.get(pos.symbol)
+        your_value = plan["requested"] if plan else target_value * auto_ratio
+        exec_value = plan["executable"] if plan else your_value
         total_your_value += your_value
+        total_executable += exec_value
         pnl = position_unrealized_pnl(pos)
         picked = " ✅" if id(pos) in selected_numbers and selection else ""
         blocked = guard.get(pos.symbol)
         guard_note = blocked["short"] if blocked else ""
+        exec_note = (
+            f"｜实下 ≈ ${exec_value:,.0f}" if plan and plan["capped"] else ""
+        )
         below_min = (
             f"｜⚠️ 低于 ${MIN_POSITION_SIZE_USD:.0f} 最低，将被跳过"
-            if your_value < MIN_POSITION_SIZE_USD and not guard_note
+            if exec_value < MIN_POSITION_SIZE_USD and not guard_note
             else ""
         )
         lines.append(
             f"{index}. {html.escape(pos.symbol)} {pos.side.value.upper()}｜"
-            f"目标 ${target_value:,.0f}｜你 ≈ ${your_value:,.0f}｜"
+            f"目标 ${target_value:,.0f}｜你 ≈ ${your_value:,.0f}{exec_note}｜"
             f"PnL ${pnl:+,.0f}｜{pos.leverage}x{picked}{below_min}{guard_note}"
         )
     lines.append("")
-    lines.append(f"全部复制合计 ≈ ${total_your_value:,.2f}。")
+    if abs(total_executable - total_your_value) >= 0.5:
+        lines.append(
+            f"全部复制合计 ≈ ${total_your_value:,.2f}；"
+            f"按可用保证金实下 ≈ ${total_executable:,.2f}。"
+        )
+    else:
+        lines.append(f"全部复制合计 ≈ ${total_your_value:,.2f}。")
+
+    # Name the constraint instead of letting the user compare two unexplained
+    # numbers: the ratio uses the whole portfolio, the order can only use the
+    # margin that the symbol's own DEX holds.
+    capped_by_dex: dict[str, dict[str, Any]] = {}
+    for pos in copyable:
+        plan = copy_plan.get(pos.symbol)
+        if not plan or not plan["capped"]:
+            continue
+        entry = capped_by_dex.setdefault(
+            plan["dex"] or "主账户",
+            {"basis": plan["basis"], "limit": 0.0},
+        )
+        entry["limit"] += plan["executable"]
+    if capped_by_dex:
+        lines.append("")
+        lines.append("⚠️ <b>为什么实下比合计小</b>：比例按全账户净值算，下单只能用该 DEX 的可用保证金。")
+        for dex_label, entry in capped_by_dex.items():
+            lines.append(f"• {html.escape(dex_label)}：{entry['basis']} → 上限 ${entry['limit']:,.2f}")
+        lines.append("想把仓位跟满，先把 USDC 从现货划到对应 DEX。")
+        lines.append("")
+    if any(plan["unknown"] for plan in copy_plan.values()):
+        lines.append("")
+        lines.append("⚠️ 读不到可用保证金：上面的金额只是比例估算，实际下单可能被缩量。")
 
     if not confirm:
         selected_total = sum(
-            abs(pos.size) * pos.entry_price * auto_ratio
+            (copy_plan.get(pos.symbol) or {}).get(
+                "executable", abs(pos.size) * pos.entry_price * auto_ratio
+            )
             for pos in chosen
             if pos.symbol not in guard
         )
@@ -696,7 +855,9 @@ async def handle_copy_existing(
                     "fill_size": None,
                 })
 
-    fills = await _recent_fills_by_symbol(started_at_ms)
+    fills = await _recent_fills_by_symbol(
+        started_at_ms, {record["symbol"] for record in records if record["ok"]}
+    )
     for record in records:
         if not record["ok"]:
             continue
