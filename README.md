@@ -4,6 +4,8 @@
 
 > 风险提示：这是交易执行程序，不保证盈利。先使用模拟模式验证，再用少量资金开启实盘。私钥只应保存在本机或服务器的 `.env`，不要提交、截图或发送给任何人。
 
+**目录**：[当前行为](#当前行为) · [快速开始](#快速开始) · [配置说明](#配置说明) · [Telegram](#telegram) · [常见问题](#常见问题) · [本地运行](#本地运行)
+
 ## 当前行为
 
 - 默认镜像机器人启动后的目标**限价挂单**：目标挂单后立即按同一价格创建跟随挂单；目标取消、过期或被拒时，撤销仍未成交的跟随挂单。
@@ -21,6 +23,8 @@
 - 资产表在进程内缓存：遇到未知币种时刷新一次，之后在 `ASSET_METADATA_TTL_SECONDS`（默认 300 秒）内不再重复请求。新上架的 HIP-3 标的无需重启即可解析。
 - 默认只使用 WebSocket 监听成交；`FILL_POLLING_ENABLED=true` 时才会按 `FILL_POLL_INTERVAL_SECONDS`（默认 15 秒）查询 REST 接口补回断线期间漏掉的成交。启动前的历史 fills 仅作为基线，不会自动补单。
 - 每小时报告的统计块首行是跟单状态（`🟢 正在跟单` / `⏸️ 暂停跟单，自 MM-DD HH:MM 起` / `🔴 已停止`）。暂停期间仍按时发报，但报告会明确标出已暂停多久。
+- **钱包零资金不等于进程挂了**：实盘启动时若跟随钱包净值为 `$0`，跟单停止但进程和 Telegram 都活着，只有 `/orders`、`/copyloss`、`/close` 被拒。入金后发 `/start` 自动恢复。
+- **目标出入金会主动提醒**：每 `TARGET_EQUITY_FLOW_POLL_SECONDS` 扫一次目标的交易所流水，出现净出入金就推送 Telegram，并附对手方地址。跟单比例的分母就是这个净值，一次出入金会直接改变你后续每一笔的尺寸，详见[目标地址出入金提醒](#目标地址出入金提醒)。
 - 容器日志和 Telegram 通知使用中国标准时间（UTC+8）。
 
 目标在机器人启动前就持有的仓位，启动时**不会**被追入。原因是这条路径曾经在后台直接下真实市价单，既没有预览也没有通知，只能事后在交易所账本里发现。现在它被 `/copyloss` 取代：
@@ -99,10 +103,17 @@ TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 同步发生在两个位置，任选其一都会生效：`linux/start.sh`、`windows/start.bat` 在构建前跑一次；容器 CMD 在 `python src/main.py` 之前再跑一次（`.env` 是挂载进去的，容器能直接改宿主机上的文件）。手动执行：
 
 ```bash
-python src/config/env_sync.py            # 只看差异，不写文件
-python src/config/env_sync.py --apply    # 修复 .env
-python src/config/env_sync.py --example  # 由 schema 重新生成 .env.example
+python src/config/env_sync.py                 # 只看差异，不写文件
+python src/config/env_sync.py --apply         # 修复 .env（写前备份到 data/env_backups/）
+python src/config/env_sync.py --check         # 有差异时返回退出码 1，可用于脚本/巡检
+python src/config/env_sync.py --example       # 由 schema 重新生成 .env.example
+python src/config/env_sync.py --check-example # 校验 .env.example 与 schema 一致（构建门禁）
+python src/config/env_sync.py --audit         # 源码读了但 schema 未声明的变量（构建门禁）
+python src/config/env_sync.py --keep-removed  # 只补新增，不删失效项
+python src/config/env_sync.py --no-backup     # 改动前不备份
 ```
+
+只读文件系统或 `.env` 是单文件 bind mount 时，同步不会阻断启动：`rename(2)` 在挂载点上会返回 `EBUSY`，程序会退化为原地 truncate + fsync，保证文件能写进去、inode 不变。
 
 加一个新配置的正确顺序：在 `env_schema.py` 里加一条 → `--example` 重新生成 `.env.example` → 一起提交。即使漏了中间那步也不会静默出错：`docker build` 里有 `--audit` 和 `--check-example` 两道门禁，代码读了没声明的变量、或样例与 schema 不一致，构建直接失败。这道门禁是必要的——否则新变量会被同步逻辑当成"失效配置"从用户的 `.env` 里删掉。
 
@@ -123,7 +134,7 @@ docker compose down
 
 代码更新后必须使用 `up -d --build` 重新构建；仅执行 `restart` 不会更新镜像内的代码。`linux/start.sh` 与 `windows/start.bat` 已带 `--build`，并把当前 commit 作为 `BUILD_ID` 注入镜像。
 
-判断线上到底跑的是哪一版：在 Telegram 发 `/start`，最后一行是 `版本：v1.1.0 +<commit>`。**没有这一行，就说明容器里还是旧镜像**——旧版本的帮助文本里也没有 `/copyloss`，这正是"命令加了但看不到"的典型症状。
+判断线上到底跑的是哪一版：在 Telegram 发 `/start`，最后一行是 `版本：v1.1.0 +<commit>`。走 start 脚本构建时是 commit 短哈希；其它方式构建（没有 `BUILD_ID` 也没 `.git`）会显示 `版本：v1.1.0 +local@20261107-1215`，用镜像构建时间代替 commit，至少两个镜像之间能区分。**没有 `版本：` 这一行，就说明容器里还是旧镜像**——旧版本的帮助文本里也没有 `/close`，这正是"命令加了但看不到"的典型症状。
 
 ### 3. 切换到实盘前的检查
 
@@ -192,100 +203,36 @@ Unified 账户下额度取 `activeAssetData` 的方向额度，而不是某个 D
 
 ## 配置说明
 
+全部 43 个运行时配置项都在 [`.env.example`](.env.example) 里，带逐项注释，且由 `src/config/env_schema.py` 自动生成——**以它为准**，不要在这里背列表（这份 README 曾经因为手抄清单漏掉过新配置）。
+
+必填的只有 4 项，其余都有合理默认值：
+
 ```properties
-# Hyperliquid API
-HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
-# 公开排行榜接口（通常无需修改）
-HYPERLIQUID_LEADERBOARD_URL=https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
-
-# 跟随钱包。实盘时两个值必须填写且地址必须匹配。
-HYPERLIQUID_WALLET_ADDRESS=
-HYPERLIQUID_PRIVATE_KEY=
-# 跟随钱包模式：standard 或 unified，必须与 Hyperliquid 账户设置一致。
-HYPERLIQUID_ACCOUNT_MODE=standard
-
-# 目标钱包或 Vault 地址
-TARGET_WALLET_ADDRESS=
-
-# true 为模拟模式；实盘必须明确改为 false
-SIMULATED_TRADING=true
-SIMULATED_ACCOUNT_BALANCE=1000.0
-
-# 启动时不复制已有仓位，此项仅为兼容保留（置 true 也不会下单）。
-COPY_OPEN_POSITIONS=false
-# /copyloss 不带参数时列出的范围：
-#   loss   目标当前浮亏的仓位：你在比目标更好的价位进场，等于“接目标的水下仓”
-#   profit 目标当前浮盈的仓位：等于追高，慎用
-#   all    全部持仓
-COPY_OPEN_PNL_FILTER=loss
-# 同币种同方向在上次手动复制后多少分钟内不再重复买；0 = 关闭该检查。
-# /copyloss ... force 可单次绕过。
-COPY_DUPLICATE_GUARD_MINUTES=30
-
-# 启动时是否复制目标已有挂单。建议保持 false。
-COPY_EXISTING_ORDERS=false
-
-# 是否在目标挂单出现时立即镜像，以及目标取消时联动撤销。
-COPY_PENDING_ORDERS=true
-CANCEL_MIRRORED_ORDERS=true
-# true 使用目标限价；false 使用跟随账户读取的当前中间价。
-MIRROR_ORDER_PRICE=true
-# 同币种、同方向的密集挂单在该静默窗口（秒）内合并为一笔镜像挂单。
-PENDING_ORDER_MERGE_WINDOW_SECONDS=5
-
-# true 时，单笔跟随数量 = 目标本次成交量 × 跟随资金 / 目标资金
-AUTO_ADJUST_SIZE=true
-
-# false 为带滑点保护的 IOC 市价单；true 为限价单。
-USE_LIMIT_ORDERS=false
-MAX_SLIPPAGE_PCT=1.0
-# 每笔开仓最多使用可交易额度的比例。Standard 按该 DEX 可用保证金和杠杆估算；Unified 按 activeAssetData 的方向额度限制。
-MAX_MARGIN_USAGE_RATIO=0.40
-# 默认关闭 REST 成交补漏；需要时改为 true
-FILL_POLLING_ENABLED=false
-FILL_POLL_INTERVAL_SECONDS=15
-# 未知币种的负缓存时长（秒，最小 30）。同时决定新上架标的最迟多久被识别；
-# 已知标的始终走内存，不会按该间隔重复拉取资产表。
-ASSET_METADATA_TTL_SECONDS=300
-
-# 目标杠杆的倍数。0.5 表示目标 6x 时使用 3x。
-LEVERAGE_ADJUSTMENT=0.5
-
-# 单个跟随仓位的名义价值上限。x 表示不限制（默认），此时只受交易所可用保证金约束；
-# 填数字则把单仓压到该美元额度。
-MAX_POSITION_SIZE=x
-
-# 全部仓位合计名义价值上限。x 表示不限制（默认）；真实风险上限由
-# MAX_MARGIN_USAGE_RATIO 对交易所可交易额度的约束决定。
-MAX_TOTAL_EXPOSURE=x
-
-# 同时跟随的仓位数上限。x 表示不限制（默认）：目标持几个仓就跟几个。
-# 填 1 会只保留第一个仓位，目标同时持 BTC 和 SKHX 时第二个会被直接跳过。
-MAX_OPEN_TRADES=x
-MAX_OPEN_ORDERS=x
-MAX_ACCOUNT_EQUITY=x
-
-# 不跟随的币种，使用英文逗号分隔
-BLOCKED_ASSETS=
-
-# 目标地址出入金监控：仓位没大变但总资金大变时 Telegram 提醒
-TARGET_EQUITY_FLOW_ENABLED=true
-TARGET_EQUITY_FLOW_POLL_SECONDS=60
-TARGET_EQUITY_FLOW_MIN_USD=100
-TARGET_EQUITY_FLOW_MIN_PCT=1.0
-TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT=5
-TARGET_EQUITY_FLOW_COOLDOWN_SECONDS=300
-
-# Telegram 为可选功能
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-INSTALL_TELEGRAM=true
-
-# 数据库与日志
-DATABASE_URL=sqlite:///./data/trading.db
-LOG_LEVEL=INFO
-LOG_FILE=./logs/trading.log
+HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址
+HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
+HYPERLIQUID_ACCOUNT_MODE=standard   # standard 或 unified，必须与账户设置一致
+TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```
+
+改配置的正确流程：改 `.env` → 重启容器（`docker compose up -d`）。容器启动时会先跑一次 `.env` 对齐，新增项按代码默认值补齐、失效项移除，已有键不动。
+
+最容易踩的几个开关：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `SIMULATED_TRADING` | `true` | 实盘必须显式改 `false`，没有其它逃生门 |
+| `MAX_MARGIN_USAGE_RATIO` | `0.40` | **默认唯一生效的尺寸约束**，单笔最多用 40% 可交易额度 |
+| `LEVERAGE_ADJUSTMENT` | `0.5` | 用目标杠杆的一半，再按交易所上限截断 |
+| `MAX_POSITION_SIZE` | `x` | 单仓名义额上限；`x` = 不限制，填数字才生效 |
+| `MAX_TOTAL_EXPOSURE` | `x` | 全部仓位合计名义额上限；`x` = 不限制 |
+| `MAX_OPEN_TRADES` | `x` | 同时跟随的仓位数；`x` = 目标几个就跟几个 |
+| `MAX_ACCOUNT_EQUITY` | `x` | 权益超过该值自动暂停；`x` = 不限制 |
+| `COPY_PENDING_ORDERS` | `true` | 目标新挂单是否立即镜像 |
+| `MIRROR_ORDER_PRICE` | `true` | 镜像用目标限价，还是跟随账户的中间价 |
+| `TARGET_EQUITY_FLOW_MIN_PCT` | `10000` | 净值残差兜底的比例阈值；10000 = 关闭兜底，只报流水确认的出入金 |
+| `BLOCKED_ASSETS` | 空 | 不跟随的币种，逗号分隔，如 `BTC,ETH,SOL` |
+
+`BUILD_ID`、`LIVE_ORDER_TEST_CONFIRM` 不是业务配置：前者由 start 脚本在构建时注入（用于 `/start` 显示 commit），后者是验证脚本的一次性确认词。
 
 ### 资金与仓位示例
 
@@ -322,18 +269,41 @@ LOG_FILE=./logs/trading.log
 
 填写 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID` 后，机器人会发送中文通知，并支持：
 
-- `/status` 查看运行状态和跟随账户信息（末尾附带当前的追入旧仓位策略）
-- `/positions` 查看当前仓位
+- `/start` 启动或恢复跟单：暂停后用它恢复；停止后也用它恢复，无需重启容器（恢复时重新连接目标监控，不会补跟停止期间的历史成交）。最后一行是运行版本
+- `/status` 查看运行状态、跟单配置和**自己的持仓**（`/positions` 是这个命令的别名）
 - `/orders` 查看挂单
 - `/pnl` 查看收益摘要，含目标钱包与跟随钱包的完整地址
 - `/leaderboard` 查看 Hyperliquid 公开排行榜，可按 24H、7D、30D 的收益额或收益率筛选；最多读取 200 名，每页 10 名
 - `/wallet 0x地址 [1-20]` 查询任意公开地址的账户状态、24H/7D/30D 净值变化和最近成交；默认显示 10 笔
+- `/follow 0x地址` 更换跟单目标，同时重建资金监控基线
 - `/copyloss [loss|all|profit] [序号...] [confirm] [force]` 手动复制目标现有仓位（启动时永不自动复制）：不带参数先列出编号清单和每笔大约要花的钱；`/copyloss 1 3` 只选第 1、3 笔；加 `confirm` 才真正下单，随后返回逐笔回执（成交价、数量、名义额、订单号，失败项带原因）。已持有、持有反方向、或 30 分钟内复制过的会在预览里标出并在下单时拦下；确需叠加同一仓位追加 `force`。
-- `/close [序号|币种|all] [confirm]` 平掉**跟随账户自己**的仓位：不带参数列出编号清单（数量、≈金额、未实现盈亏）；可用序号（`/close 1 3 confirm`）、币种片段（`/close BTC confirm`、`/close xyz:SKHX confirm`）或 `all` 选择，加 `confirm` 才发送 reduce-only 市价单，随后返回逐笔回执（平仓方向、成交价、名义额、已实现盈亏、订单号，失败项带原因）。暂停或停止状态下都能用——`/stop` 现在只停跟单不动仓位，平仓完全由这个命令负责。
-- `/start` 启动或恢复跟单：暂停后用它恢复；停止后也用它恢复，无需重启容器（恢复时重新连接目标监控，不会补跟停止期间的历史成交）
+- `/close [序号|币种|all] [confirm]` 平掉**跟随账户自己**的仓位：不带参数列出编号清单（数量、≈金额、未实现盈亏）；可用序号（`/close 1 3 confirm`）、币种片段（`/close BTC confirm`、`/close xyz:SKHX confirm`）或 `all` 选择，加 `confirm` 才发送 reduce-only 市价单，随后返回逐笔回执（平仓方向、成交价、名义额、已实现盈亏、订单号，失败项带原因）。暂停或停止状态下都能用
 - `/stop` 停止跟单：取消全部挂单、停止复制，**保留所有仓位**；不再询问是否平仓，平仓交给 `/close`
 
-实盘启动时跟随钱包净值为 `$0`，跟单会自动停止，只有 `/orders`、`/copyloss`、`/close` 三个需要资金的命令被拒绝（其余命令照常可用）。入金后发 `/start` 会重新读取净值、重算跟单比例并恢复复制。
+命令面只有这 10 项（`/positions` 为别名，不进菜单）。`/pause`、`/resume` 这类旧命令已经从代码和 Telegram 菜单里移除：菜单在默认范围和授权的 chat 范围都会重写，同时清掉 `all_private_chats`、`all_group_chats`、`all_chat_administrators` 三个历史 scope，否则旧列表会一直挂在客户端里。
+
+实盘启动时跟随钱包净值为 `$0`，跟单会自动停止，只有 `/orders`、`/copyloss`、`/close` 三个需要资金的命令被拒绝（其余命令照常可用）。入金后发 `/start` 会重新读取净值、重算跟单比例并恢复复制。此时 `/status` 长这样：
+
+```text
+📊 跟单运行状态
+💸 状态：跟单已停止（钱包无资金，入金后发 /start）
+🎮 模式：实盘
+👤 目标：0x62f87be0...75e7ac
+💼 账户余额：$0.00
+📈 未实现盈亏：$0.00
+📊 已复制成交：0
+📍 持仓数：0
+自己的持仓
+暂无持仓
+⏰ 运行时长：1.8 小时
+仓位模式：Proportional
+杠杆：目标杠杆的 1.0 倍
+追入旧仓位：手动：/copyloss 选择浮亏仓位（启动不自动追入）
+资金限制：钱包净值 $0，/orders /copyloss /close 已禁用；入金后发 /start
+版本：v1.1.0 +1fa371b
+```
+
+`资金限制` 这行只在零资金状态下出现，正常情况下整行不显示。
 
 同一个 Telegram Token 只能由一个实例轮询。出现 `terminated by other getUpdates request` 时，关闭使用同一 Token 的其他机器人实例。
 
@@ -359,37 +329,51 @@ LOG_FILE=./logs/trading.log
 
 ### 目标地址出入金提醒
 
-按账户净值比例跟单时，目标钱包一次入金或出金会直接放大／缩小你后续每一笔单，而交易所不会推送「有人充值了」这种事件。机器人每 `TARGET_EQUITY_FLOW_POLL_SECONDS`（默认 60 秒）读一次目标账户的净值、未实现盈亏和带方向的持仓数量，同时满足下面三条才发 Telegram 通知：
+按账户净值比例跟单时，目标钱包一次入金或出金会直接放大／缩小你后续每一笔单，而交易所不会推送「有人充值了」这种事件。机器人每 `TARGET_EQUITY_FLOW_POLL_SECONDS`（默认 60 秒）扫一次，分两条路径判断，命中任一就发 Telegram 通知。
 
-1. **仓位基本没变**：各币种带方向数量的变化 ≤ `TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT`（默认 5%），排除「目标交易了」；
-2. **总资金确实大变**：扣除浮动盈亏变化后的净值残差 ≥ `TARGET_EQUITY_FLOW_MIN_USD`（默认 $100）**且** ≥ `TARGET_EQUITY_FLOW_MIN_PCT`（默认 1%），排除「行情涨了导致浮盈增加」；
-3. 距上次提醒超过 `TARGET_EQUITY_FLOW_COOLDOWN_SECONDS`（默认 300 秒），避免分批转账刷屏。
+**主路径：交易所流水（权威，覆盖现货）**
 
-判断公式：
+每轮固定读 `userNonFundingLedgerUpdates`，窗口回溯到上次成功扫描的位置再往前 90 秒（吸收索引延迟），最远回溯 24 小时。净额 = 充值 − 提现 + 有方向的地址间划转：
+
+- **不受金额/比例阈值限制**，真正的现金进出不是噪声，只有低于 `$1` 的尘埃级流水会被丢弃；
+- **自己搬钱不算**。目标把 USDC 从现货划到合约（或反向）时，流水里也表现为 `send`，但收发双方都是本钱包，直接排除，不当作入金也不当作出金；
+- **只统计 USDC 现金**。`spotTransfer` 里的 `usdcValue` 是对代币的估值，不是现金流，计入会虚增；只认 `usdc` 字段和 USDC 代币的 `amount`；
+- **同一个窗口不重复报**。窗口故意重叠以吸收索引延迟，靠事件的 nonce（`event_key`）去重；流水与净值两条路径也会互相登记金额，同一笔不会因为"流水先到、净值后跳"而推两条。重复推送比漏报更烦人。
+- **两条路径共用冷却窗口**：`TARGET_EQUITY_FLOW_COOLDOWN_SECONDS`（默认 300 秒）内最多推一条，避免分批转账刷屏。
+
+**兜底路径：净值残差（默认关闭）**
+
+只有流水还没索引到、但净值已经跳了的时候才用得上：
 
 ```text
-推断净流转 = (本次净值 − 上次净值) − (本次未实现盈亏 − 上次未实现盈亏)
+推断净流转 = (本次总净值 − 上次总净值) − (本次未实现盈亏 − 上次未实现盈亏)
 ```
 
-仓位不变意味着期间没有成交，残差就是进出资金；浮盈口径差异、资金费和手续费会带来少量误差。因此通知里会**同时**列出交易所 `userNonFundingLedgerUpdates` 的真实充值／提现／内部划转流水，两者对照即可确认方向与金额：
+同时满足三条才告警：仓位变化 ≤ `TARGET_EQUITY_FLOW_MAX_POSITION_CHANGE_PCT`（默认 5%，排除"目标交易了"）、残差 ≥ `TARGET_EQUITY_FLOW_MIN_USD`（默认 $100）且 ≥ `TARGET_EQUITY_FLOW_MIN_PCT`（占总净值百分比）、不在冷却窗口内。
+
+净值基准是**全账户总金额**（`portfolio` 口径，perp + 现货），和账户盈亏摘要里那行同源——目标把资金全放现货时，只看合约账户净值会读到 `$0`，监控直接失明。代价是这个口径含现货代币的价格波动，所以 `TARGET_EQUITY_FLOW_MIN_PCT` 默认是 **10000**，等于把兜底路径关掉：只报流水确认过的事实，不猜。需要兜底时把它改成 `1.0` 之类的小值。
+
+通知里的金额和对手方都直接给出，不用去区块浏览器反查：
 
 ```text
-📥 目标地址资金异动 · 转入 / 入金
-👤 目标：0x62f8abcd...12ef34
-💼 账户净值：$10,000.00 → $11,000.00（+1,000.00）
-📈 浮动盈亏变化：+20.00
-🧮 推断净转入：$980.00（+9.80%）
-📍 仓位变化：0.00%（判定：基本未变）
+📤 目标地址资金异动 · 转出 / 出金
+
+👤 目标：0x62f87be0...75e7ac
+💵 交易所流水净额：$130,000.00（-21.57%）
+全账户净值：$602,795.90（portfolio 口径，含现货）
+
 ━━━━━━━━━━━━━━━━━━
-🔗 交易所流水：充值 +$1,000.00 × 1 笔
+🔗 流水明细：外部转出 $130,000.00（系统地址）；流水类型：send × 1
 ```
+
+同一窗口里既有进又有出时，两个方向分别列出（`$110,215.30（0x6b9e…0a24）` / `$130,000.00（系统地址）`），不会被净额吃掉。`0x2000…0000` 是 Hyperliquid 的现货 USDC 系统地址，打到它的钱**是真的从账户净值里出去了**（已用净值曲线逐区间对账验证，误差只有手续费），所以标记为「系统地址」但仍然算转出。
 
 几个边界：
 
-- 首次采样只建立基线，不告警；`/follow` 切换目标后自动重建基线。
-- 净值读取失败或读到 0 会跳过本轮且**不更新基线**——部分 DEX 聚合失败看起来就像一笔巨额出金，不能被当成资金异动。
-- 进程重启后基线丢失，停机期间的出入金不追溯。
-- 监控是只读的，`/stop` 之后仍然运行；`/status` 末尾显示最近一次采样时间和目标净值。
+- 首次扫描只建立游标/基线，不告警；`/follow` 切换目标后自动重建。
+- 流水查询失败不推进游标，下一轮重新覆盖同一窗口；净值读取失败或读到 0 时不更新基线——部分 DEX 聚合失败看起来就像一笔巨额出金。
+- 进程重启会丢掉游标和去重集合，最多回溯 24 小时；停机更久期间的流水不补报。
+- 监控是只读的，`/stop` 之后仍然运行。`/status` 不显示监控行，避免把"上次采样时间"当成跟单状态。
 
 ### 排行榜与地址查询
 
@@ -425,7 +409,7 @@ docker compose up -d --build
 
 ### 新加的命令在 Telegram 里看不到
 
-先发 `/start`，看最后一行有没有 `版本：`。**没有就是旧镜像在跑**：`/start` 的文本由进程内存里的代码生成，旧代码里既没有这一行，也没有 `/copyloss`，所以"命令没生效"和"没重启"看起来一模一样。
+先发 `/start`，看最后一行有没有 `版本：`。**没有就是旧镜像在跑**：`/start` 的文本由进程内存里的代码生成，旧代码里既没有这一行，也没有 `/close`，所以"命令没生效"和"没重启"看起来一模一样。
 
 ```bash
 git pull
@@ -434,6 +418,8 @@ docker compose up -d --build     # 或直接 ./linux/start.sh
 ```
 
 `docker compose restart` 只是重启容器，镜像里那份 `src/` 不会变，这也是最常踩的坑。重建后 `/start` 的版本行会显示新的 commit 短哈希；命令菜单还要等 Telegram 客户端刷新（重开聊天或等十几秒）。
+
+菜单里有、发出去却报「未知命令」，是另一个问题：旧版本把命令注册在 chat scope，和 BotFather 的默认 scope 是两份独立数据。现在的代码启动时会把默认范围、授权 chat 范围以及 `all_private_chats` / `all_group_chats` / `all_chat_administrators` 全部重写一遍，并在日志里回读校验；如果菜单仍不对，先看日志有没有 `Failed to publish Telegram command menu`。
 
 ### 只收到小时报告，没有跟单
 
