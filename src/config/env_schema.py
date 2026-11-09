@@ -104,7 +104,9 @@ ENV_VARS: tuple[EnvVar, ...] = (
         "HYPERLIQUID_ACCOUNT_MODE",
         "standard",
         "Hyperliquid API",
-        "跟随钱包的账户模式：standard 或 unified。目标地址无需设置模式。",
+        "跟随钱包的账户模式兜底值：standard 或 unified。实际以下单时从交易所 "
+        "userAbstraction 读到的为准（统一账户/组合保证金账户的一切现金共用一份保证金），"
+        "这里只在接口读不到时生效。目标地址无需设置模式。",
     ),
     # ------------------------------------------------------------- TARGET
     EnvVar(

@@ -80,10 +80,10 @@ HYPERLIQUID_ACCOUNT_MODE=standard
 TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```
 
-`HYPERLIQUID_WALLET_ADDRESS` 必须填写由 `HYPERLIQUID_PRIVATE_KEY` 推导出的钱包地址（当前程序要求两者匹配）。`HYPERLIQUID_ACCOUNT_MODE` 要与跟随账户在 Hyperliquid 中的模式一致：
+`HYPERLIQUID_WALLET_ADDRESS` 必须填写由 `HYPERLIQUID_PRIVATE_KEY` 推导出的钱包地址（当前程序要求两者匹配）。`HYPERLIQUID_ACCOUNT_MODE` 只是兜底值：下单前程序会向交易所查 `userAbstraction`（返回 `unifiedAccount` / `portfolioMargin` / `default`）并以后者为准，所以账户里切换成统一账户后不需要改 `.env`，重启后日志会打出 `Follower Account Mode: unified (env: standard)` 这样的对照。两种模式的区别：
 
-- `standard`：现货、默认 Perp 和各 HIP-3 Perp DEX 的保证金分开。资金须位于该市场可用的 Perp 账户/DEX。
-- `unified`：同一抵押币种的余额在现货与支持该币种的 Perp 市场间统一。程序使用 `activeAssetData` 读取当前市场、交易方向的可交易额度。不同抵押币种不会自动互换或合并。
+- `standard`（交易所返回 `default`）：现货、默认 Perp 和各 HIP-3 Perp DEX 的保证金分开。资金须位于该市场可用的 Perp 账户/DEX。缺失时按该 DEX 子账户的可用保证金算上限——一个 $151 的账户如果只往 `xyz` 划了 $33.57，就只能开 ~$134。
+- `unified` / `portfolioMargin`：同一抵押币种的余额在现货与支持该币种的 Perp 市场间统一。程序改用 `activeAssetData` 读取当前市场、交易方向的可交易额度，不再看 DEX 子账户余额。不同抵押币种不会自动互换或合并。
 
 目标地址可以是 Standard 或 Unified；跟单比例使用账户级 `portfolio` 净值。目标持仓状态和目标账户净值分开读取。
 
@@ -210,7 +210,7 @@ Unified 账户下额度取 `activeAssetData` 的方向额度，而不是某个 D
 ```properties
 HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址
 HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
-HYPERLIQUID_ACCOUNT_MODE=standard   # standard 或 unified，必须与账户设置一致
+HYPERLIQUID_ACCOUNT_MODE=standard   # 兜底值；实际以交易所 userAbstraction 为准
 TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```
 
@@ -447,7 +447,7 @@ docker compose logs --since 24h copy-trader | grep -E 'FILL DETECTED|Fill copied
 
 `standard` 模式下，请将 USDC 从 Hyperliquid 的 Spot 账户转入 Perp 账户；该模式下每个 HIP-3 DEX 的保证金也是独立的，资金需要位于目标标的所属的 DEX 或默认 Perp 账户。
 
-`unified` 模式下同一抵押币种的余额在现货与支持该币种的 Perp 市场间共用，但仍不能跨抵押币种互换。跟单时以 `activeAssetData` 返回的 `availableToTrade` 为准：`/positions` 里的余额为 0、而 `availableToTrade` 有额度属于正常情况，下单不会被拦。
+`unified` 模式下同一抵押币种的余额在现货与支持该币种的 Perp 市场间共用，但仍不能跨抵押币种互换。跟单时以 `activeAssetData` 返回的 `availableToTrade` 为准：`/positions` 里的余额为 0、而 `availableToTrade` 有额度属于正常情况，下单不会被拦。同理，交易所给某个 HIP-3 DEX 子账户算出来的 `withdrawable`／可用保证金会远小于账户真实可用资金（实测过 $4.44 对 $123.26），那只是该 DEX 已占用保证金后的残值，不是下单上限。
 
 ## 本地运行
 

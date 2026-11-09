@@ -515,13 +515,18 @@ async def estimate_copy_execution(
     """Estimate the notional each ``/copyloss`` entry will actually place.
 
     The proportional figure (target notional × equity ratio) is only the
-    *request*. Before the order leaves, it is capped by the free margin of the
-    symbol's own perp DEX and by ``MAX_POSITION_SIZE``. A HIP-3 symbol such as
-    ``xyz:SKHX`` settles on a separate margin account, so cash parked in spot
-    or on another DEX cannot back it: a $141 portfolio holding $33 free on
-    ``xyz`` can only open ~$134 at 10x with 40% margin usage. The preview used
-    to show the uncapped $368, which is why the receipt looked like a
-    different calculation.
+    *request*. Before the order leaves, it is capped by the free margin the
+    exchange reports for the symbol's own market and by ``MAX_POSITION_SIZE``.
+    Which margin that is depends on the account mode, read live from
+    ``userAbstraction``:
+
+    * standard — the Perp DEX's own sub-account. A HIP-3 symbol such as
+      ``xyz:SKHX`` settles there, so Spot cash cannot back it: a $151 wallet
+      shows $33.57 free on ``xyz`` and can only open ~$134 at 10x with 40%
+      margin usage.
+    * unified / portfolio margin — one collateral pool, so the cap comes from
+      ``activeAssetData.availableToTrade``. Reading the sub-account here was
+      the bug behind "$33.57 on a funded, fully unified account".
 
     Budgets are consumed in list order so a multi-position preview adds up the
     way the sequential order placement does.
@@ -529,7 +534,7 @@ async def estimate_copy_execution(
     usage = max(0.0, settings.copy_rules.max_margin_usage_ratio)
     position_cap = settings.sizing.max_position_size
     address = settings.hyperliquid.wallet_address
-    unified = settings.hyperliquid.account_mode == "unified"
+    unified = await resolve_account_mode() == "unified"
 
     plans: dict[str, dict[str, Any]] = {}
     budgets: dict[str, float] = {}
@@ -559,14 +564,17 @@ async def estimate_copy_execution(
                     if pos.side == PositionSide.LONG
                     else OrderSide.SELL
                 )
-                unified_budget = await client.get_available_to_trade_notional(
+                unified_budget = await client.get_available_to_trade_margin(
                     address,
                     pos.symbol,
                     side.value,
                     target_leverage=max(1, leverage),
                 )
             available = unified_budget
-            basis = f"可交易额度 ${(available or 0.0):,.2f} × {usage:.0%}"
+            basis = (
+                f"可交易额度 ${(available or 0.0):,.2f}"
+                f" × {leverage}x × {usage:.0%}"
+            )
         else:
             if dex not in states:
                 states[dex] = await client.get_user_state(address, dex=dex)
@@ -585,14 +593,16 @@ async def estimate_copy_execution(
             executable = min(executable, max(0.0, position_cap))
         executable = max(0.0, executable)
 
-        # Spend the budget so the next row in the same preview sees less.
+        # Spend the budget so the next row in the same preview sees less. The
+        # budget is collateral, the executable figure is notional, so convert
+        # with this row's leverage — otherwise a 10x row would eat 10x its
+        # real margin and starve every row after it.
         if available is not None and not settings.simulated_trading:
+            spent_margin = executable / max(1.0, leverage)
             if unified:
-                unified_budget = max(0.0, (unified_budget or 0.0) - executable)
+                unified_budget = max(0.0, (unified_budget or 0.0) - spent_margin)
             else:
-                budgets[dex] = max(
-                    0.0, available - executable / max(1.0, leverage)
-                )
+                budgets[dex] = max(0.0, available - spent_margin)
 
         plans[pos.symbol] = {
             "requested": requested,
@@ -1035,6 +1045,66 @@ async def get_follower_balance() -> float | None:
     return await client.get_portfolio_account_value(settings.hyperliquid.wallet_address)
 
 
+ACCOUNT_MODE_TTL_SECONDS = 300.0
+_account_mode_cache: dict[str, Any] = {"mode": None, "checked_at": 0.0}
+
+
+def account_mode_from_abstraction(abstraction: Optional[str]) -> Optional[str]:
+    """Map ``userAbstraction`` onto the two sizing paths, or ``None``.
+
+    ``unifiedAccount`` and ``portfolioMargin`` both pool Spot USDC with every
+    Perp DEX, so a builder-DEX balance is meaningless there and the order has
+    to be priced off ``activeAssetData.availableToTrade``. ``default`` is the
+    classic split-account mode. Anything unrecognised returns ``None`` so the
+    caller falls back to configuration instead of guessing.
+    """
+    if not abstraction:
+        return None
+    value = str(abstraction).strip().lower()
+    if value in {"unifiedaccount", "unified", "portfoliomargin", "portfolio_margin"}:
+        return "unified"
+    if value in {"default", "standard", "disabled"}:
+        return "standard"
+    return None
+
+
+async def resolve_account_mode(force: bool = False) -> str:
+    """Return the follower's real account mode, asking the exchange first.
+
+    ``HYPERLIQUID_ACCOUNT_MODE`` is only a fallback: the exchange knows when
+    the operator switched to a unified account, and a stale flag used to size
+    every HIP-3 order against that DEX's own sub-account — a $151 wallet was
+    told it had $33.57 of room. The answer is cached for a few minutes and
+    re-read after a restart or a mode switch.
+    """
+    fallback = settings.hyperliquid.account_mode
+    address = settings.hyperliquid.wallet_address
+    if settings.simulated_trading or not address or client is None:
+        return fallback
+
+    cached_mode = _account_mode_cache.get("mode")
+    checked_at = float(_account_mode_cache.get("checked_at") or 0.0)
+    if not force and cached_mode and time.monotonic() - checked_at < ACCOUNT_MODE_TTL_SECONDS:
+        return str(cached_mode)
+
+    detected = account_mode_from_abstraction(
+        await client.get_account_abstraction(address)
+    )
+    if detected is None:
+        # Keep the last good answer; a transient Info failure must not flip
+        # sizing to the wrong path mid-session.
+        return str(cached_mode or fallback)
+
+    if detected != fallback:
+        logger.warning(
+            f"⚙️  Account mode from the exchange ({detected}) overrides "
+            f"HYPERLIQUID_ACCOUNT_MODE={fallback}; sizing follows {detected}."
+        )
+    _account_mode_cache["mode"] = detected
+    _account_mode_cache["checked_at"] = time.monotonic()
+    return detected
+
+
 async def get_follower_order_notional_cap(
     symbol: str,
     side: OrderSide,
@@ -1044,10 +1114,11 @@ async def get_follower_order_notional_cap(
 ) -> float | None:
     """Return the configured per-order notional cap for the follower wallet.
 
-    Standard accounts use the selected Perp DEX's free margin. Unified
-    accounts use Hyperliquid's market- and direction-specific available
-    trading notional because individual Perp DEX balances are not authoritative
-    for unified accounts.
+    The mode is read from the exchange (see :func:`resolve_account_mode`), not
+    from the env flag. Standard accounts can only spend the selected Perp
+    DEX's own free margin; unified / portfolio-margin accounts pool Spot USDC
+    with every DEX, so there the market- and direction-specific
+    ``availableToTrade`` is the only authoritative number.
     """
     usage_ratio = settings.copy_rules.max_margin_usage_ratio
     if settings.simulated_trading:
@@ -1057,20 +1128,29 @@ async def get_follower_order_notional_cap(
     if not address:
         return None
 
-    if settings.hyperliquid.account_mode == "unified":
+    if await resolve_account_mode() == "unified":
         if prepare_leverage and not await executor.prepare_leverage(
             symbol, int(max(1, leverage))
         ):
             return None
-        available_notional = await client.get_available_to_trade_notional(
+        available_margin = await client.get_available_to_trade_margin(
             address,
             symbol,
             side.value,
             target_leverage=max(1, leverage),
         )
-        if available_notional is None:
+        if available_margin is None:
             return None
-        return max(0.0, available_notional) * usage_ratio
+        # ``availableToTrade`` is collateral, not notional — verified against
+        # ``maxTradeSzs × markPx`` on BTC/ETH/xyz:SKHX (the product is exactly
+        # ``availableToTrade × leverage``). Multiplying here keeps the live cap
+        # identical to the /copyloss preview, which would otherwise overstate
+        # capacity by the leverage factor.
+        return (
+            max(0.0, available_margin)
+            * max(1.0, leverage)
+            * usage_ratio
+        )
 
     if dex_state is None:
         dex_state = await client.get_user_state(
@@ -4104,7 +4184,8 @@ async def main():
     logger.info(f"   Leverage Adjustment: {settings.leverage.adjustment_ratio}x")
     logger.info(f"   Max Position Size: {_format_limit(settings.sizing.max_position_size)}")
     logger.info(f"   Max Total Exposure: {_format_limit(settings.sizing.max_total_exposure)}")
-    logger.info(f"   Follower Account Mode: {settings.hyperliquid.account_mode}")
+    logger.info(f"   Follower Account Mode: {await resolve_account_mode()}"
+                f" (env: {settings.hyperliquid.account_mode})")
     logger.info(
         f"   Max Margin Usage: {settings.copy_rules.max_margin_usage_ratio:.0%}"
     )

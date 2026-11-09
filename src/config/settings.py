@@ -90,7 +90,7 @@ class HyperliquidConfig(BaseModel):
     leaderboard_url: str = Field(default="https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
     wallet_address: Optional[str] = None
     private_key: Optional[str] = None
-    account_mode: str = "standard"  # follower account: "standard" or "unified"
+    account_mode: str = "standard"  # fallback only: the exchange's userAbstraction wins
 
 class TelegramConfig(BaseModel):
     bot_token: Optional[str] = None

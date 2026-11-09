@@ -114,7 +114,7 @@ async def main() -> None:
             )
 
         for label, side in (("buy", OrderSide.BUY), ("sell", OrderSide.SELL)):
-            capacity = await client.get_available_to_trade_notional(
+            capacity = await client.get_available_to_trade_margin(
                 address, symbol, side.value
             )
             if capacity is None:
@@ -123,7 +123,10 @@ async def main() -> None:
                     "the symbol (check exact casing)"
                 )
             else:
-                print(f"availableToTrade({label}) = ${capacity:,.2f}")
+                print(
+                    f"availableToTrade({label}) = ${capacity:,.2f} collateral "
+                    "(multiply by leverage for the notional it can back)"
+                )
 
     if not live:
         print("dry diagnostics complete; set LIVE_ORDER_TEST_CONFIRM=HIP3_12_USD to place a $12 order")

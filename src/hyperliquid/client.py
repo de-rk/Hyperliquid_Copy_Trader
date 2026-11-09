@@ -594,18 +594,23 @@ class HyperliquidClient:
             logger.error(f"Failed to get Spot balances for {address}: {e}")
             return []
 
-    async def get_available_to_trade_notional(
+    async def get_available_to_trade_margin(
         self,
         address: str,
         symbol: str,
         side: str,
         target_leverage: Optional[float] = None,
     ) -> Optional[float]:
-        """Return Hyperliquid's per-market available notional for one side.
+        """Return Hyperliquid's per-market free collateral for one side.
 
         ``activeAssetData.availableToTrade`` is ordered buy then sell and is
-        account-aware, including for unified accounts. The Info API receives
-        the actual user address, never the API/agent signer address.
+        account-aware, including for unified accounts, where it reflects the
+        whole pooled balance rather than one Perp DEX's sub-account. Despite
+        the name it is *collateral*, not notional: across BTC, ETH and
+        xyz:SKHX the exchange's own ``maxTradeSzs × markPx`` equals exactly
+        ``availableToTrade × leverage``, so callers multiply by leverage
+        before comparing against an order notional. The Info API receives the
+        actual user address, never the API/agent signer address.
         """
         side_index = 0 if str(side).lower() in {"buy", "long", "b"} else 1
         try:
@@ -633,24 +638,45 @@ class HyperliquidClient:
             available = self._as_float(values[side_index])
             if available is None:
                 return None
-            current_leverage = self._as_float(
-                (response.get("leverage") or {}).get("value")
-            )
-            # If the account is currently set above the copier's intended
-            # leverage, scale capacity down conservatively. A higher intended
-            # leverage is applied before live unified-account preflight.
-            if (
-                target_leverage is not None
-                and current_leverage is not None
-                and current_leverage > target_leverage > 0
-            ):
-                available *= target_leverage / current_leverage
+            # No leverage rescaling here: this is collateral, and the caller
+            # turns it into notional with ``× intended leverage``. Scaling by
+            # the current setting as well would double-count the difference
+            # between the account's leverage and the copier's (live orders set
+            # the intended leverage before reading this value anyway).
             return available
         except Exception as e:
             logger.error(
                 f"Failed to get available trading notional for {address} {symbol}: {e}"
             )
             return None
+
+    async def get_account_abstraction(self, address: str) -> Optional[str]:
+        """Return the exchange's own abstraction mode for ``address``.
+
+        ``userAbstraction`` answers ``unifiedAccount`` or ``portfolioMargin``
+        when Spot USDC and every Perp DEX share one collateral pool, and
+        ``default`` for a classic account where each DEX is funded separately.
+        Read it from the exchange instead of trusting a config flag: a wrong
+        flag silently prices orders off a near-empty builder-DEX sub-account
+        (a $151 wallet capped at $33.57) while the money sits in Spot.
+        """
+        if not address:
+            return None
+        try:
+            response = await self._post(
+                self.info_url, {"type": "userAbstraction", "user": address}
+            )
+        except Exception as exc:
+            logger.debug(f"userAbstraction unavailable for {address}: {exc}")
+            return None
+        if isinstance(response, str):
+            return response or None
+        if isinstance(response, dict):
+            for key in ("abstraction", "mode", "type"):
+                value = response.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return None
 
     async def get_wallet_total_equity(self, address: str) -> Optional[float]:
         """Return mode-independent total account equity from portfolio history."""

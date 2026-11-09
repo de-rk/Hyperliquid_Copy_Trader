@@ -32,8 +32,12 @@ def check(name: str, cond: bool, detail: str = ""):
 class StubClient:
     """Per-DEX available margin, keyed by the ``dex`` argument."""
 
-    def __init__(self, available: dict):
+    def __init__(self, available: dict, abstraction=None, available_to_trade=None):
         self.available = available
+        self.abstraction = abstraction
+        self.available_to_trade = available_to_trade or {}
+        self.abstraction_calls = 0
+        self.available_to_trade_calls = 0
 
     async def get_user_state(self, address, dex=None):
         if dex not in self.available:
@@ -49,6 +53,14 @@ class StubClient:
             orders=[],
             timestamp=datetime.now(),
         )
+
+    async def get_account_abstraction(self, address):
+        self.abstraction_calls += 1
+        return self.abstraction
+
+    async def get_available_to_trade_margin(self, address, symbol, side, target_leverage=None):
+        self.available_to_trade_calls += 1
+        return self.available_to_trade.get(symbol)
 
 
 def position(symbol="xyz:SKHX", size=1821.0, entry=862.145, leverage=10):
@@ -71,6 +83,7 @@ def configure(*, simulated=False, balance=0.0, usage=0.40, cap=None, adjustment=
     main.settings.copy_rules.max_margin_usage_ratio = usage
     main.settings.sizing.max_position_size = cap
     main.simulated_balance = balance
+    main._account_mode_cache.update({"mode": None, "checked_at": 0.0})
 
 
 # Real numbers from the 2026-11-09 10:56 copy: target 1,570,000 notional,
@@ -171,6 +184,100 @@ def test_receipt_uses_fill_numbers():
     check("并说明未取到成交价", "未取到成交价" in text)
 
 
+async def test_unified_account_ignores_dex_sub_account():
+    """The reported bug: config said standard while the wallet was unified."""
+    configure()  # env/flag still says standard
+    main.client = StubClient(
+        {"xyz": 33.5675},
+        abstraction="unifiedAccount",
+        available_to_trade={"xyz:SKHX": 123.26},
+    )
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("统一账户按全账户额度计算", abs(plan["available"] - 123.26) < 1e-6, str(plan["available"]))
+    check("不再被 $33.57 子账户余额卡住", abs(plan["executable"] - 367.97) < 0.05, str(plan["executable"]))
+    check("不再标记缩量", plan["capped"] is False)
+    check("说明改为可交易额度", plan["basis"].startswith("可交易额度"), plan["basis"])
+    check("没有去读 DEX 子账户", main.client.available_to_trade_calls == 1)
+
+
+async def test_portfolio_margin_counts_as_unified():
+    configure()
+    main.client = StubClient(
+        {"xyz": 33.5675},
+        abstraction="portfolioMargin",
+        available_to_trade={"xyz:SKHX": 20.0},
+    )
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("组合保证金账户也走全账户额度",
+          abs(plan["executable"] - 20.0 * 10 * 0.40) < 0.05, str(plan["executable"]))
+    check("额度不足时仍标记缩量", plan["capped"] is True)
+
+
+async def test_standard_and_unknown_modes_fall_back_to_config():
+    configure()
+    main.client = StubClient({"xyz": 33.5675}, abstraction="default")
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("default 账户仍按 DEX 保证金", abs(plan["executable"] - 134.27) < 0.05, str(plan["executable"]))
+
+    configure()
+    main.client = StubClient({"xyz": 33.5675}, abstraction="somethingNew")
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("未知模式退回配置值", abs(plan["executable"] - 134.27) < 0.05, str(plan["executable"]))
+
+    configure()
+    main.client = StubClient({"xyz": 33.5675}, abstraction=None)
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("接口读不到时退回配置值", abs(plan["executable"] - 134.27) < 0.05, str(plan["executable"]))
+
+
+async def test_account_mode_is_cached():
+    configure()
+    main.client = StubClient({"xyz": 33.5675}, abstraction="unifiedAccount",
+                             available_to_trade={"xyz:SKHX": 123.26})
+    await main.resolve_account_mode()
+    await main.resolve_account_mode()
+    await main.resolve_account_mode()
+    check("账户模式查询被缓存", main.client.abstraction_calls == 1, str(main.client.abstraction_calls))
+
+    await main.resolve_account_mode(force=True)
+    check("force 会重新查询", main.client.abstraction_calls == 2, str(main.client.abstraction_calls))
+
+    check("abstraction 映射 unifiedAccount", main.account_mode_from_abstraction("unifiedAccount") == "unified")
+    check("abstraction 映射 portfolioMargin", main.account_mode_from_abstraction("portfolioMargin") == "unified")
+    check("abstraction 映射 default", main.account_mode_from_abstraction("default") == "standard")
+    check("abstraction 空值返回 None", main.account_mode_from_abstraction("") is None)
+
+
+async def test_live_cap_matches_preview_in_unified_mode():
+    """The live cap has to agree with the preview, or the receipt drifts again."""
+    configure()
+    main.client = StubClient({"xyz": 33.5675}, abstraction="unifiedAccount",
+                             available_to_trade={"xyz:SKHX": 123.26})
+    cap = await main.get_follower_order_notional_cap(
+        "xyz:SKHX", main.OrderSide.SELL, 10, prepare_leverage=False
+    )
+    check("实盘上限 = 保证金 × 杠杆 × 占比",
+          abs(cap - 123.26 * 10 * 0.40) < 0.05, str(cap))
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("预览不超过实盘上限", plan["executable"] <= cap + 0.05,
+          f"{plan['executable']} vs {cap}")
+    check("额度足够时预览不缩量", plan["capped"] is False)
+
+
+async def test_unified_budget_is_spent_as_margin():
+    configure()
+    main.client = StubClient({"xyz": 33.5675}, abstraction="unifiedAccount",
+                             available_to_trade={"xyz:AAA": 30.0, "xyz:BBB": 30.0})
+    two = await main.estimate_copy_execution(
+        [position(symbol="xyz:AAA"), position(symbol="xyz:BBB")], RATIO
+    )
+    first = two["xyz:AAA"]["executable"]
+    check("第一笔吃满额度", abs(first - 30.0 * 10 * 0.40) < 0.05, str(first))
+    expected = (30.0 - first / 10) * 10 * 0.40
+    second = two["xyz:BBB"]["executable"]
+    check("第二笔按剩余保证金缩量", abs(second - expected) < 0.05, f"{second} vs {expected}")
+
+
 async def run():
     await test_hip3_capped_by_dex_margin()
     await test_same_dex_budget_is_shared()
@@ -178,6 +285,12 @@ async def run():
     await test_unreadable_state_is_flagged()
     await test_simulated_cap()
     await test_leverage_adjustment_moves_the_cap()
+    await test_unified_account_ignores_dex_sub_account()
+    await test_portfolio_margin_counts_as_unified()
+    await test_standard_and_unknown_modes_fall_back_to_config()
+    await test_account_mode_is_cached()
+    await test_live_cap_matches_preview_in_unified_mode()
+    await test_unified_budget_is_spent_as_margin()
     test_receipt_uses_fill_numbers()
 
     failed = [name for name, ok, _ in results if not ok]
