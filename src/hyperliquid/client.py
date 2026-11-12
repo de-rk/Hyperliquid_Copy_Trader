@@ -678,6 +678,27 @@ class HyperliquidClient:
                     return value
         return None
 
+    async def get_extra_agents(self, address: str) -> List[Dict[str, Any]]:
+        """Return the API (agent) wallets ``address`` has approved.
+
+        ``extraAgents`` entries look like ``{"name": ..., "address": ...,
+        "validUntil": <ms>}``. Empty list on any failure — an empty list also
+        means "no agents", so callers check membership, not truthiness of the
+        transport.
+        """
+        if not address:
+            return []
+        try:
+            response = await self._post(
+                self.info_url, {"type": "extraAgents", "user": address}
+            )
+        except Exception as exc:
+            logger.error(f"Failed to read approved API wallets for {address}: {exc}")
+            return []
+        if not isinstance(response, list):
+            return []
+        return [item for item in response if isinstance(item, dict)]
+
     async def get_wallet_total_equity(self, address: str) -> Optional[float]:
         """Return mode-independent total account equity from portfolio history."""
         return await self.get_portfolio_account_value(address)

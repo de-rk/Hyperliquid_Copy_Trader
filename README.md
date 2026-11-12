@@ -74,13 +74,13 @@ MAX_OPEN_TRADES=x
 必须填写：
 
 ```properties
-HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址
-HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
+HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址（主账户）
+HYPERLIQUID_PRIVATE_KEY=0x该账户的私钥，或它授权的 API 钱包私钥
 HYPERLIQUID_ACCOUNT_MODE=standard
 TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```
 
-`HYPERLIQUID_WALLET_ADDRESS` 必须填写由 `HYPERLIQUID_PRIVATE_KEY` 推导出的钱包地址（当前程序要求两者匹配）。`HYPERLIQUID_ACCOUNT_MODE` 只是兜底值：下单前程序会向交易所查 `userAbstraction`（返回 `unifiedAccount` / `portfolioMargin` / `default`）并以后者为准，所以账户里切换成统一账户后不需要改 `.env`，重启后日志会打出 `Follower Account Mode: unified (env: standard)` 这样的对照。两种模式的区别：
+`HYPERLIQUID_WALLET_ADDRESS` 填交易所在的跟随账户地址。`HYPERLIQUID_PRIVATE_KEY` 可以是该账户自己的私钥，也可以是它授权的 **API 钱包（Agent）私钥**——推荐后者，私钥即使泄露也无法提现。API 钱包推导出的地址天然和账户地址不同（例如私钥对应 `0xbffa…`、账户是 `0xf8bf…`），这是正常配置：启动时程序会用交易所的 `extraAgents` 接口校验该 API 钱包已被账户授权、未过期，未通过会直接报错退出。注意 API 钱包只是签名工具，**资金和仓位永远在主账户上，不需要、也不要给 API 钱包的地址充值**；API 授权有有效期（默认约半年），快到期时程序会提前告警。`HYPERLIQUID_ACCOUNT_MODE` 只是兜底值：下单前程序会向交易所查 `userAbstraction`（返回 `unifiedAccount` / `portfolioMargin` / `default`）并以后者为准，所以账户里切换成统一账户后不需要改 `.env`，重启后日志会打出 `Follower Account Mode: unified (env: standard)` 这样的对照。两种模式的区别：
 
 - `standard`（交易所返回 `default`）：现货、默认 Perp 和各 HIP-3 Perp DEX 的保证金分开。资金须位于该市场可用的 Perp 账户/DEX。缺失时按该 DEX 子账户的可用保证金算上限——一个 $151 的账户如果只往 `xyz` 划了 $33.57，就只能开 ~$134。
 - `unified` / `portfolioMargin`：同一抵押币种的余额在现货与支持该币种的 Perp 市场间统一。程序改用 `activeAssetData` 读取当前市场、交易方向的可交易额度，不再看 DEX 子账户余额。不同抵押币种不会自动互换或合并。
@@ -208,8 +208,8 @@ Unified 账户下额度取 `activeAssetData` 的方向额度，而不是某个 D
 必填的只有 4 项，其余都有合理默认值：
 
 ```properties
-HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址
-HYPERLIQUID_PRIVATE_KEY=0x该钱包的私钥
+HYPERLIQUID_WALLET_ADDRESS=0x你的跟随钱包地址（主账户）
+HYPERLIQUID_PRIVATE_KEY=0x该账户的私钥，或它授权的 API 钱包私钥
 HYPERLIQUID_ACCOUNT_MODE=standard   # 兜底值；实际以交易所 userAbstraction 为准
 TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 ```

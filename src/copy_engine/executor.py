@@ -88,16 +88,22 @@ class TradeExecutor:
         self._configured_leverages: Dict[str, int] = {}
         self._leverage_lock = asyncio.Lock()
 
-        # Initialize signing account if we have credentials
+        # Initialize signing account if we have credentials. A Hyperliquid API
+        # (agent) wallet deliberately derives to a *different* address than the
+        # account it trades for: the agent signs, the exchange attributes the
+        # action to the approving account. Forcing the two addresses to match
+        # here blocked exactly that setup, which is the recommended one.
         self.account = None
+        self.agent_address: Optional[str] = None
         if self.private_key and not self.dry_run:
             try:
                 self.account = Account.from_key(self.private_key)
-                # Validate address matches
-                if self.account.address.lower() != self.wallet_address:
-                    raise ValueError(
-                        f"Private key address {self.account.address} doesn't match "
-                        f"configured address {self.wallet_address}"
+                self.agent_address = self.account.address.lower()
+                if self.agent_address != self.wallet_address:
+                    logger.info(
+                        f"🔑 API wallet {self.account.address} signs for "
+                        f"account {self.wallet_address}; authorization is "
+                        "verified against the exchange at startup"
                     )
                 logger.info(f"✅ Executor initialized for wallet {self.wallet_address}")
             except Exception as e:

@@ -91,13 +91,16 @@ ENV_VARS: tuple[EnvVar, ...] = (
         "HYPERLIQUID_WALLET_ADDRESS",
         "",
         "Hyperliquid API",
-        "跟单账户（你自己的）钱包地址，用于查持仓与余额。",
+        "跟单账户（你自己的）主钱包地址，用于查持仓与余额。使用 API 钱包签名时，"
+        "这里仍填主钱包地址，不要填 API 钱包推导出的地址。",
     ),
     EnvVar(
         "HYPERLIQUID_PRIVATE_KEY",
         "",
         "Hyperliquid API",
-        "跟单账户私钥，仅本机/本容器可见，切勿提交到仓库或发给他人。",
+        "跟单账户私钥，或它在 Hyperliquid 授权的 API 钱包私钥（推荐后者，泄露也无法提现）；"
+        "API 钱包地址无需配置，程序会推导并向交易所核对授权。仅本机/本容器可见，"
+        "切勿提交到仓库或发给他人。",
         secret=True,
     ),
     EnvVar(

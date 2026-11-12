@@ -247,7 +247,10 @@ def unfunded_block_text() -> Optional[str]:
         f"钱包：<code>{address}</code>\n"
         "净值：<b>$0.00</b>\n\n"
         "该状态下 /orders、/copyloss、/close 均不可用（没有资金既开不了仓也平不了仓）。\n"
-        "入金后发 /start 重新检查，资金到账即恢复跟单。"
+        "入金后发 /start 重新检查，资金到账即恢复跟单。\n\n"
+        "提示：若上面的地址是你 API 钱包推导出的地址，说明配置反了——API 钱包只是签名工具，"
+        "永远没有余额。把 HYPERLIQUID_WALLET_ADDRESS 改成主钱包地址即可，"
+        "HYPERLIQUID_PRIVATE_KEY 保持 API 私钥不用动。"
     )
 
 
@@ -1103,6 +1106,56 @@ async def resolve_account_mode(force: bool = False) -> str:
     _account_mode_cache["mode"] = detected
     _account_mode_cache["checked_at"] = time.monotonic()
     return detected
+
+
+async def verify_signer_authorization() -> None:
+    """Fail fast when an API (agent) key is not approved for the account.
+
+    A Hyperliquid API wallet signs for the approving account, so the private
+    key's address legitimately differs from the trading address. Orders from
+    an unapproved or expired agent are rejected by the exchange at fill time,
+    which used to surface as an opaque "User or API Wallet..." error per
+    order. Verifying the grant at startup turns that into one clear message.
+    """
+    if settings.simulated_trading or client is None or executor is None:
+        return
+    wallet = (settings.hyperliquid.wallet_address or "").lower()
+    agent = getattr(executor, "agent_address", None)
+    if not wallet or not agent or agent == wallet:
+        return  # signing with the account's own key — nothing to approve
+    agents = await client.get_extra_agents(wallet)
+    now_ms = int(time.time() * 1000)
+    for entry in agents:
+        if str(entry.get("address") or "").lower() != agent:
+            continue
+        name = entry.get("name") or "(未命名)"
+        valid_until = int(entry.get("validUntil") or 0)
+        if valid_until and valid_until <= now_ms:
+            raise RuntimeError(
+                f"API wallet {agent} (agent '{name}') expired at "
+                f"{datetime.fromtimestamp(valid_until / 1000, tz=timezone.utc):%Y-%m-%d %H:%M} UTC — "
+                "approve a fresh API wallet on Hyperliquid and update "
+                "HYPERLIQUID_PRIVATE_KEY."
+            )
+        if valid_until:
+            days_left = (valid_until - now_ms) / 86_400_000
+            logger.info(
+                f"🔑 API wallet {agent[:10]}… approved as '{name}', "
+                f"valid for {days_left:.0f} more days"
+            )
+            if days_left < 7:
+                logger.warning(
+                    f"⚠️ API wallet grant '{name}' expires in {days_left:.1f} days; "
+                    "rotate it before orders start failing"
+                )
+        else:
+            logger.info(f"🔑 API wallet {agent[:10]}… approved as '{name}'")
+        return
+    raise RuntimeError(
+        f"API wallet {agent} is not approved by {wallet}. On Hyperliquid, log "
+        "in with the main account → More → API → approve this agent address, "
+        "or use the account's own private key in HYPERLIQUID_PRIVATE_KEY."
+    )
 
 
 async def get_follower_order_notional_cap(
@@ -3997,6 +4050,10 @@ async def main():
         dry_run=settings.simulated_trading,
         max_slippage_pct=settings.copy_rules.max_slippage_pct,
     )
+
+    # An API (agent) wallet must be approved by the trading account — check
+    # now, before any order can fail at the exchange.
+    await verify_signer_authorization()
     
     # Fetch target wallet state to auto-calculate ratio
     logger.info("")
