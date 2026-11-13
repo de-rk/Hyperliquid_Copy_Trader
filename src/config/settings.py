@@ -138,7 +138,6 @@ class CopyRulesConfig(BaseModel):
     max_open_trades: Optional[int] = None  # None = unlimited
     max_open_orders: Optional[int] = None  # None = unlimited
     max_account_equity: Optional[float] = None  # None = unlimited
-    min_entry_quality_pct: float = 5.0
     max_slippage_pct: float = 1.0
     # Reserve headroom for asset-specific initial-margin requirements and fees.
     max_margin_usage_ratio: float = 0.40

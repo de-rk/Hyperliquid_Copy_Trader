@@ -25,7 +25,7 @@ from utils.equity_flow import (
 )
 from hyperliquid.client import HyperliquidClient
 from hyperliquid.models import PositionSide, OrderSide
-from copy_engine import WalletMonitor, TradeExecutor, PositionSizer
+from copy_engine import WalletMonitor, TradeExecutor
 from version import build_stamp
 
 # Setup logging
@@ -61,7 +61,6 @@ def _format_limit(value: Optional[float]) -> str:
 # Initialize components
 monitor: WalletMonitor = None
 executor: TradeExecutor = None
-position_sizer: PositionSizer = None
 client: HyperliquidClient = None
 telegram_bot: Any = None
 notifier: Any = None
@@ -1291,190 +1290,6 @@ def calculate_adjusted_leverage(
     final_leverage = min(rounded_leverage, asset_max_leverage)
     
     return final_leverage
-
-
-async def on_new_position(position_data: dict):
-    """
-    Called when target wallet opens a new position
-    This is where we copy the trade!
-    """
-    global trades_copied_count, is_paused, paused_since, simulated_balance, simulated_positions, simulated_pnl
-    
-    # Check if paused
-    if is_paused:
-        logger.warning("⏸️ Bot is paused - skipping trade")
-        return
-    
-    # Check max open trades limit against the follower's own positions.
-    # This used to count the target's positions, so a target holding one
-    # position blocked every new copy — the opposite of a follower-side cap.
-    if settings.copy_rules.max_open_trades is not None:
-        if settings.simulated_trading:
-            current_trades = len(simulated_positions)
-        else:
-            follower_state = await client.get_user_state(
-                settings.hyperliquid.wallet_address
-            )
-            current_trades = len(follower_state.positions) if follower_state else 0
-        if current_trades >= settings.copy_rules.max_open_trades:
-            logger.warning(f"⚠️ Max open trades limit reached ({current_trades}/{settings.copy_rules.max_open_trades}) - skipping trade")
-            return
-    
-    # Check account equity limit
-    if settings.copy_rules.max_account_equity is not None:
-        current_equity = await client.get_portfolio_account_value(settings.target_wallet)
-        if current_equity is None:
-            logger.error("Unable to read target account equity for MAX_ACCOUNT_EQUITY check")
-            return
-        if current_equity >= settings.copy_rules.max_account_equity:
-            logger.warning(f"⚠️ Max account equity reached (${current_equity:,.2f}/${settings.copy_rules.max_account_equity:,.2f}) - stopping copy trading")
-            is_paused = True
-            paused_since = datetime.now(timezone.utc)
-            if notifier:
-                await notifier.send_error_notification(f"Max account equity reached: ${current_equity:,.2f}. Bot paused automatically.")
-            return
-    
-    try:
-        logger.success("=" * 60)
-        logger.success("🎯 NEW POSITION DETECTED - COPYING TRADE!")
-        logger.success("=" * 60)
-        
-        # Parse position data
-        symbol = position_data.get("coin", "")
-        size = float(position_data.get("szi", 0))
-        side = PositionSide.LONG if size > 0 else PositionSide.SHORT
-        
-        # REST snapshots wrap this under ``position`` while websocket
-        # position updates can provide the fields at the top level.
-        position_info = position_data.get("position", position_data)
-        entry_price = float(position_info.get("entryPx", 0))
-        target_leverage = float(position_info.get("leverage", {}).get("value", 1))
-        
-        logger.info(f"📊 Target Position:")
-        logger.info(f"   Symbol: {symbol}")
-        logger.info(f"   Side: {side.value.upper()}")
-        logger.info(f"   Size: {abs(size)}")
-        logger.info(f"   Entry: ${entry_price:,.2f}")
-        logger.info(f"   Leverage: {target_leverage}x")
-        
-        # Get current market price
-        async with client:
-            current_price = await client.get_market_price(symbol)
-            if not current_price:
-                current_price = entry_price
-        
-        logger.info(f"   Current Price: ${current_price:,.2f}")
-        
-        # Check if we should copy this position (entry quality)
-        should_copy = position_sizer.should_copy_position(
-            entry_price,
-            current_price,
-            settings.copy_rules.min_entry_quality_pct
-        )
-        
-        if not should_copy:
-            logger.warning("⚠️ Skipping - Entry quality check failed")
-            return
-        
-        # Get target wallet balance
-        target_state = monitor.current_state
-        target_balance = (
-            await client.get_portfolio_account_value(settings.target_wallet)
-            if target_state else 100000
-        )
-        if target_balance is None or target_balance <= 0:
-            logger.error("Unable to read target wallet total equity; skipping position copy")
-            return
-        your_balance = await get_follower_balance()
-        if your_balance is None or your_balance <= 0:
-            logger.error("Unable to read follower wallet total equity; skipping position copy")
-            return
-
-        # Calculate your position size from the follower's actual balance.
-        your_exposure = 0  # TODO: Calculate current exposure
-        
-        # Simplified calculation for now
-        if settings.sizing.mode == "proportional":
-            ratio = your_balance / target_balance if target_balance > 0 else settings.sizing.portfolio_ratio
-            your_size = abs(size) * ratio
-        else:
-            your_size = settings.sizing.fixed_size / entry_price if entry_price > 0 else 0
-        
-        # Calculate adjusted leverage
-        your_leverage = position_sizer.calculate_leverage(
-            target_leverage,
-            settings.leverage.adjustment_ratio,
-            settings.leverage.max_leverage,
-            settings.leverage.min_leverage
-        )
-        
-        # Check minimum position size (Hyperliquid requirement)
-        your_position_value = your_size * entry_price
-        if your_position_value < MIN_POSITION_SIZE_USD:
-            logger.warning("")
-            logger.warning(f"⚠️  Skipping Position: {symbol}")
-            logger.warning(f"   Position value ${your_position_value:.2f} below Hyperliquid minimum ${MIN_POSITION_SIZE_USD:.2f}")
-            logger.success("=" * 60)
-            return
-        
-        logger.info("")
-        logger.info(f"Your Position:")
-        logger.info(f"   Size: {your_size:.4f} {symbol}")
-        logger.info(f"   Notional: ${your_size * entry_price:,.2f}")
-        logger.info(f"   Leverage: {your_leverage}x")
-        logger.info(f"   Entry: ${entry_price:,.2f}")
-        
-        # Execute the trade
-        logger.info("")
-        logger.info(f"Executing trade...")
-        result = await executor.execute_market_order(
-            symbol=symbol,
-            side=OrderSide.BUY if side == PositionSide.LONG else OrderSide.SELL,
-            size=your_size,
-            leverage=your_leverage
-        )
-        
-        if result:
-            logger.success(f"✅ Trade executed successfully!")
-            logger.success(f"   Result: {result}")
-            trades_copied_count += 1
-            
-            # Send Telegram notification
-            if notifier:
-                await notifier.send_trade_notification(
-                    symbol=symbol,
-                    side=side.value,
-                    size=your_size,
-                    entry_price=entry_price,
-                    leverage=your_leverage,
-                    target_size=abs(size),
-                    is_simulated=executor.dry_run
-                )
-        else:
-            logger.error("❌ Trade execution failed")
-            if notifier:
-                await _notify_copy_failure(
-                    symbol=symbol,
-                    direction=side.value,
-                    target_size=abs(size),
-                    follower_size=your_size,
-                    price=entry_price,
-                    category="交易所拒绝或执行器失败",
-                    reason=getattr(executor, "last_error", None) or "Executor returned no order id",
-                )
-        
-        logger.success("=" * 60)
-        
-    except Exception as e:
-        logger.error(f"Error copying position: {e}")
-        if notifier:
-            await _notify_copy_failure(
-                symbol=str(position_data.get("coin", "unknown")),
-                direction="position",
-                target_size=abs(float(position_data.get("szi", 0) or 0)),
-                category="程序异常",
-                reason=str(e),
-            )
 
 
 async def on_position_close(position_data: dict):
@@ -3687,7 +3502,7 @@ async def main():
     """
     Main entry point for the copy trading bot
     """
-    global monitor, executor, position_sizer, client, telegram_bot, notifier, bot_start_time
+    global monitor, executor, client, telegram_bot, notifier, bot_start_time
     global simulated_balance, trades_copied_count, counted_mirror_order_ids, is_stopped
     global is_paused, paused_since, wallet_unfunded
     
@@ -3952,14 +3767,6 @@ async def main():
     logger.info("   Copy Existing Positions: manual — /copyloss only (startup never orders)")
     logger.info(
         f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
-    )
-    
-    position_sizer = PositionSizer(
-        mode=settings.sizing.mode,
-        fixed_size=settings.sizing.fixed_size,
-        portfolio_ratio=settings.sizing.portfolio_ratio,
-        max_position_size=settings.sizing.max_position_size,
-        max_total_exposure=settings.sizing.max_total_exposure
     )
     
     configure_monitor_callbacks(monitor)
