@@ -1,7 +1,5 @@
-import asyncio
 import re
 from typing import Optional, Callable
-from datetime import datetime
 from telegram import (
     Update,
     InlineKeyboardButton,

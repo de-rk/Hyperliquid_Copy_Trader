@@ -145,58 +145,6 @@ class HyperliquidWebSocket:
         
         logger.info(f"Subscribed to 'orderUpdates' for {address}")
     
-    async def subscribe_trades(self, symbol: str, callback: Optional[Callable] = None):
-        """
-        Subscribe to trade updates for a specific symbol
-        
-        Args:
-            symbol: Trading pair symbol (e.g., "BTC")
-            callback: Function to call when trades are received
-        """
-        channel = f"trades:{symbol}"
-        
-        subscription = {
-            "method": "subscribe",
-            "subscription": {
-                "type": "trades",
-                "coin": symbol
-            }
-        }
-        
-        self.subscriptions[channel] = subscription
-        if callback:
-            self.callbacks[channel] = callback
-        
-        if self.ws:
-            await self._send_subscription(subscription)
-        
-        logger.info(f"Subscribed to trades for {symbol}")
-    
-    async def subscribe_all_mids(self, callback: Optional[Callable] = None):
-        """
-        Subscribe to all mid prices
-        
-        Args:
-            callback: Function to call when price updates are received
-        """
-        channel = "allMids"
-        
-        subscription = {
-            "method": "subscribe",
-            "subscription": {
-                "type": "allMids"
-            }
-        }
-        
-        self.subscriptions[channel] = subscription
-        if callback:
-            self.callbacks[channel] = callback
-        
-        if self.ws:
-            await self._send_subscription(subscription)
-        
-        logger.info("Subscribed to all mid prices")
-    
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
         try:

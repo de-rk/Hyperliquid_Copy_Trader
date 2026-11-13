@@ -1,6 +1,5 @@
 import asyncio
 import aiohttp
-import json
 import re
 from time import monotonic
 from typing import Optional, List, Dict, Any
@@ -364,23 +363,6 @@ class HyperliquidClient:
             logger.error(f"Failed to get portfolio account value for {address}: {e}")
             return None
 
-    async def get_portfolio_unrealized_pnl(self, address: str) -> Optional[float]:
-        """Return the latest all-account PnL value from portfolio history."""
-        try:
-            response = await self._get_portfolio(address)
-            windows = self._portfolio_windows(response)
-            for window in ("day", "week", "month"):
-                payload = windows.get(window)
-                points = self._history_points(
-                    payload.get("pnlHistory") if isinstance(payload, dict) else None
-                )
-                if points:
-                    return points[-1][1]
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get portfolio PnL for {address}: {e}")
-            return None
-
     async def get_non_funding_ledger_updates(
         self, address: str, start_ms: int, end_ms: int
     ) -> List[Dict[str, Any]]:
@@ -582,18 +564,6 @@ class HyperliquidClient:
             logger.error(f"Failed to get assets: {e}")
             return []
 
-    async def get_spot_balances(self, address: str) -> List[Dict[str, Any]]:
-        """Return Spot balances for diagnostics, sizing, and funding guidance."""
-        try:
-            response = await self._post(
-                self.info_url,
-                {"type": "spotClearinghouseState", "user": address},
-            )
-            return response.get("balances", []) if isinstance(response, dict) else []
-        except Exception as e:
-            logger.error(f"Failed to get Spot balances for {address}: {e}")
-            return []
-
     async def get_available_to_trade_margin(
         self,
         address: str,
@@ -699,10 +669,6 @@ class HyperliquidClient:
             return []
         return [item for item in response if isinstance(item, dict)]
 
-    async def get_wallet_total_equity(self, address: str) -> Optional[float]:
-        """Return mode-independent total account equity from portfolio history."""
-        return await self.get_portfolio_account_value(address)
-    
     @staticmethod
     def _symbol_candidates(symbol: str) -> List[str]:
         """Yield the spellings worth trying against a case-sensitive endpoint.

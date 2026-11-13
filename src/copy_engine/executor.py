@@ -230,13 +230,6 @@ class TradeExecutor:
         asset = await self.get_asset(symbol)
         return asset.max_leverage if asset else None
 
-    async def get_dex(self, symbol: str) -> str:
-        """Collateral DEX that owns the symbol, e.g. ``xyz`` or ``""``."""
-        asset = await self.get_asset(symbol)
-        if asset is not None:
-            return asset.dex
-        return symbol.split(":", 1)[0] if ":" in symbol else ""
-
     async def _get_mid_price(self, symbol: str) -> float:
         asset = await self.get_asset(symbol)
         dex = asset.dex if asset else (symbol.split(":", 1)[0] if ":" in symbol else "")

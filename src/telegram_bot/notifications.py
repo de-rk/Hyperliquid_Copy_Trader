@@ -1,5 +1,3 @@
-import asyncio
-from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Bot
@@ -240,30 +238,6 @@ class NotificationService:
 """
         return await self.send_message(message.strip())
 
-    async def send_position_close_notification(
-        self,
-        symbol: str,
-        pnl: Optional[float] = None,
-        is_simulated: bool = True
-    ):
-        """Send notification about a closed position"""
-        
-        mode_emoji = "🧪" if is_simulated else "🔴"
-        mode_text = "[模拟]" if is_simulated else "[实盘]"
-        
-        pnl_text = ""
-        if pnl is not None:
-            pnl_emoji = "📈" if pnl > 0 else "📉"
-            pnl_text = f"\n<b>盈亏：</b>{pnl_emoji} ${pnl:,.2f}"
-        
-        message = f"""
-{mode_emoji} <b>仓位已平</b> {mode_text}
-
-<b>币种：</b>{symbol}{pnl_text}
-<b>时间：</b>{_now_shanghai().strftime('%H:%M:%S UTC+8')}
-"""
-        await self.send_message(message.strip())
-    
     async def send_hourly_report(
         self,
         trades_copied: int,
