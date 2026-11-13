@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import main  # noqa: E402
 from telegram_bot.bot import TelegramBot  # noqa: E402
+from hyperliquid.models import Position, PositionSide  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
 PASS = "✅"
 FAIL = "❌"
@@ -47,6 +49,20 @@ class StubClient:
 class StubExecutor:
     async def cancel_all_orders(self, symbol=None):
         return 0
+
+
+class StubStateClient:
+    """Serves one fixed follower state for /status formatting checks."""
+
+    def __init__(self, positions, pnl=-0.29, equity=85.60):
+        self.state = SimpleNamespace(positions=positions, unrealized_pnl=pnl)
+        self.equity = equity
+
+    async def get_user_state(self, address):
+        return self.state
+
+    async def get_portfolio_account_value(self, address):
+        return self.equity
 
 
 class FakeMessage:
@@ -176,6 +192,41 @@ async def test_funded_passthrough():
     check("正常状态 start 无需动作", "本来就在运行中" in text, text)
 
 
+async def test_status_shows_entry_and_cost():
+    main.is_stopped = False
+    main.is_paused = False
+    main.wallet_unfunded = False
+    main.trades_copied_count = 2
+
+    position = Position(
+        symbol="xyz:SKHX",
+        side=PositionSide.SHORT,
+        size=0.026,
+        entry_price=828.36,
+        current_price=829.24,
+        leverage=10,
+        unrealized_pnl=-0.29,
+    )
+    main.settings.simulated_trading = False
+    main.client = StubStateClient([position])
+    text = await main.get_status()
+    check("status 显示开仓价", "开仓价 $828.36" in text, text)
+    check("status 显示持仓成本", "持仓成本 $21.54" in text, text)  # 0.026 × 828.36
+    check("status 仍显示数量与浮盈", "数量 0.026000" in text and "$-0.29" in text, text)
+
+    main.settings.simulated_trading = True
+    main.simulated_balance = 100.0
+    main.simulated_pnl = 0.0
+    main.simulated_positions = {
+        "BTC": {"side": "long", "size": 0.01, "entry_price": 73000.0, "unrealized_pnl": 5.0}
+    }
+    text = await main.get_status()
+    check("模拟持仓显示开仓价", "开仓价 $73,000.00" in text, text)
+    check("模拟持仓显示持仓成本", "持仓成本 $730.00" in text, text)
+    main.settings.simulated_trading = False
+    main.simulated_positions = {}
+
+
 async def main_():
     main.settings.target_wallet = StubClient.TARGET
     main.settings.hyperliquid.wallet_address = StubClient.FOLLOWER
@@ -187,6 +238,7 @@ async def main_():
     await test_start_blocks_when_still_empty()
     await test_start_resumes_when_funded()
     await test_funded_passthrough()
+    await test_status_shows_entry_and_cost()
 
     failed = [name for name, ok, _ in results if not ok]
     print(f"\n共 {len(results)} 项，通过 {len(results) - len(failed)}，失败 {len(failed)}")

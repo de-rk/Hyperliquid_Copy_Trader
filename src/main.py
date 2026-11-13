@@ -2809,15 +2809,22 @@ async def get_status() -> str:
         status_text = "跟单已停止（钱包无资金，入金后发 /start）"
     mode = "模拟" if settings.simulated_trading else "实盘"
     if settings.simulated_trading:
-        position_lines = [
-            f"• {html.escape(symbol)} {str(position.get('side', 'unknown')).upper()}："
-            f"数量 {abs(position.get('size', 0)):.6f}｜未实现盈亏 ${position.get('unrealized_pnl', 0):+,.2f}"
-            for symbol, position in simulated_positions.items()
-        ]
+        position_lines = []
+        for symbol, position in simulated_positions.items():
+            size = abs(float(position.get("size", 0) or 0))
+            entry = float(position.get("entry_price", 0) or 0)
+            position_lines.append(
+                f"• {html.escape(symbol)} {str(position.get('side', 'unknown')).upper()}："
+                f"数量 {size:.6f}｜开仓价 ${entry:,.2f}｜"
+                f"持仓成本 ${size * entry:,.2f}｜"
+                f"未实现盈亏 ${float(position.get('unrealized_pnl', 0)):+,.2f}"
+            )
     else:
         position_lines = [
             f"• {html.escape(position.symbol)} {position.side.value.upper()}："
-            f"数量 {position.size:,.6f}｜未实现盈亏 ${position.unrealized_pnl:+,.2f}"
+            f"数量 {abs(position.size):,.6f}｜开仓价 ${position.entry_price:,.2f}｜"
+            f"持仓成本 ${abs(position.size) * position.entry_price:,.2f}｜"
+            f"未实现盈亏 ${position.unrealized_pnl:+,.2f}"
             for position in (follower_state.positions if follower_state else [])
         ]
     position_details = "\n".join(position_lines) if position_lines else "暂无持仓"
