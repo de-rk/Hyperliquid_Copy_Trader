@@ -56,7 +56,14 @@ class StubMonitor:
 
 
 class StubExecutor:
-    pass
+    """Only the tick size, which is all the minimum-order check reads."""
+
+    def __init__(self, decimals=None):
+        self.decimals = decimals or {}
+
+    async def get_asset(self, symbol):
+        value = self.decimals.get(symbol)
+        return None if value is None else SimpleNamespace(sz_decimals=value)
 
 
 def position(symbol, side, size, entry, leverage=10, pnl=0.0):
@@ -76,7 +83,7 @@ def numbered_rows(text: str) -> list[str]:
     return [line for line in text.splitlines() if line[:2].rstrip(".").isdigit()]
 
 
-def configure(target_positions, held, *, balance=1_000.0):
+def configure(target_positions, held, *, balance=1_000.0, decimals=None):
     main.settings.simulated_trading = True
     main.settings.hyperliquid.wallet_address = "0xfollower00000000000000000000000000000000"
     main.settings.target_wallet = "0xtarget0000000000000000000000000000000000"
@@ -94,7 +101,7 @@ def configure(target_positions, held, *, balance=1_000.0):
     }
     main.client = StubClient()
     main.monitor = StubMonitor(target_positions)
-    main.executor = StubExecutor()
+    main.executor = StubExecutor(decimals)
 
 
 BOARD = [
@@ -225,6 +232,24 @@ async def test_guard_still_blocks_recent_copies():
     os.environ.pop("COPY_LEDGER_PATH", None)
 
 
+async def test_small_copy_is_not_blocked_by_a_ten_dollar_floor():
+    """A $5 proportional copy is legal on HIP-3 and must still be offered."""
+    configure(BOARD, {}, balance=71.5, decimals={"BTC": 5})
+    text = await main.handle_copy_existing()
+    rows = numbered_rows(text)
+    check("$10 以下仍进编号", any("BTC LONG" in row for row in rows), text)
+    check("不再出现 $10 最低提示", "最低" not in text, text)
+
+    # 0.35 < one lot (0.00001 BTC = $0.70): nothing the exchange could accept.
+    configure(BOARD, {}, balance=5.0, decimals={"BTC": 5})
+    text = await main.handle_copy_existing()
+    check(
+        "不足一个 tick 才标记跳过",
+        "不足一个最小下单单位" in text,
+        text,
+    )
+
+
 async def main_():
     await test_held_same_side_falls_out_of_the_list()
     await test_no_held_position_lists_everything()
@@ -238,6 +263,7 @@ async def main_():
     await test_selection_numbers_follow_the_filtered_list()
     await test_policy_line_matches_new_scope()
     await test_guard_still_blocks_recent_copies()
+    await test_small_copy_is_not_blocked_by_a_ten_dollar_floor()
 
     failed = [name for name, ok, _ in results if not ok]
     print(f"\n共 {len(results)} 项，通过 {len(results) - len(failed)}，失败 {len(failed)}")

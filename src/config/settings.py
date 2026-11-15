@@ -141,7 +141,6 @@ class CopyRulesConfig(BaseModel):
     fill_poll_interval_seconds: int = 15
     # Coalesce bursts of same-intent target orders into one follower order.
     pending_order_merge_window_seconds: float = 5.0
-    min_position_size_usd: float = 10.0
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 
 class RiskManagementConfig(BaseModel):

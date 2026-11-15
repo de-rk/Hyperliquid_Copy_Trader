@@ -15,7 +15,7 @@
 - **每次下单前跑三重重复检查**：跟随钱包已持有同方向、持有反方向、以及同一币种在 `COPY_DUPLICATE_GUARD_MINUTES`（默认 30）分钟内刚复制过。三者在预览里就标出来，`confirm` 时再按下单那一刻的实盘持仓复核一次；读不到跟随钱包持仓时直接拒单，不会“当作空仓”继续买。确需加仓用 `force` 显式绕过（反方向持仓不受 `force` 影响）。
 - 一笔目标订单分多次成交时，程序按每个 `fill.sz` 分别计算跟随数量，不会重复复制整个目标仓位。
 - 平仓按目标本次减仓占其平仓前仓位的比例执行；仅在跟随钱包存在同方向仓位时使用 `reduce-only`，不会反手开仓。
-- 单笔名义价值低于 `$10` 会跳过，这是 Hyperliquid 的最低订单要求。
+- 单笔数量只受交易所最小下单单位（`10^-szDecimals` 个币）约束：低于一个单位才跳过，其余交给交易所判定。HIP-3 市场没有 `$10` 最低名义额限制（本账户在 `xyz:SKHX` 上成交过 `$1.33` 的单子），所以程序不再自行设置金额门槛。
 - 新开仓会按跟随钱包的账户模式读取市场可交易额度，再限制在 `MAX_MARGIN_USAGE_RATIO`（默认 40%）以内。
 - `MAX_POSITION_SIZE`、`MAX_TOTAL_EXPOSURE`、`MAX_OPEN_TRADES` 默认都是 `x`（不限制），目标持几个仓位就跟几个。此时仓位大小只由可交易额度与 `MAX_MARGIN_USAGE_RATIO` 决定，详见[资金与仓位示例](#资金与仓位示例)。
 - 杠杆按交易所 `meta` 中该标的的 `maxLeverage` 截断，`onlyIsolated` 标的自动使用逐仓。不会向低杠杆标的（如 `flx:BTC` 1x、`GMX` 3x）发送必被拒绝的杠杆值。
@@ -239,7 +239,7 @@ TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 
 - 资金比例为 `1%`
 - 跟随数量为 `0.1` 个币
-- 程序检查该数量的名义价值是否至少 `$10`
+- 程序把数量对齐到该标的的最小下单单位（`10^-szDecimals`），对齐后为 `0` 才跳过
 - 程序再检查该订单是否不超过对应账户模式下可交易额度的 `MAX_MARGIN_USAGE_RATIO`（默认 40%）
 
 ### 仓位上限一览
@@ -252,7 +252,7 @@ TARGET_WALLET_ADDRESS=0x要跟随的目标地址
 | `MAX_TOTAL_EXPOSURE` | `x` | 全部仓位合计名义价值上限；填数字才生效 |
 | `MAX_OPEN_TRADES` | `x` | 同时跟随的仓位数；填 `1` 只跟第一个仓位 |
 | `MAX_ACCOUNT_EQUITY` | `x` | 跟随账户权益达到该值时自动暂停 |
-| `MIN_POSITION_SIZE_USD` | `$10` | 代码内常量（交易所最低订单额），低于则跳过并推送 Telegram 通知 |
+| 最小下单单位 | 交易所 tick | 一个 `10^-szDecimals`（如 `xyz:SKHX` 是 `0.001`）；低于它才跳过，没有 `$10` 金额门槛 |
 
 三个美元额度上限（`MAX_POSITION_SIZE`、`MAX_TOTAL_EXPOSURE`、`MAX_OPEN_TRADES`）默认都是不限制，实际生效的规模约束只有 `MAX_MARGIN_USAGE_RATIO`。这意味着：目标在 `xyz:SKHX` 上持有 `$900,000` 名义、跟随资金是目标的 `1%` 时，会真的按 `$9,000` 下这一笔，而不是被压到某个固定美元额度。这类尺寸完全依赖 `MAX_MARGIN_USAGE_RATIO` 兜底，所以不要为了“多跟一点”把它调到 0.9 以上——目标账户净值读取异常时，它是最后一道闸门。
 
@@ -432,7 +432,7 @@ docker compose up -d --build     # 或直接 ./linux/start.sh
 docker compose logs --since 24h copy-trader | grep -E 'FILL DETECTED|Fill copied|Failed to copy fill|Hyperliquid rejected'
 ```
 
-如果日志里成交笔数正常但没有下单，注意 `$10` 最低名义额：目标的小额碎片化成交（例如 SKHX 常见的中位单笔 `$1,250`，按 `1%` 比例只有 `$12.5`）刚好在门槛附近，更小的会被跳过并单独推送 Telegram 通知。
+如果日志里成交笔数正常但没有下单，先看跳过原因：`低于最小下单单位` 表示按比例算出的数量连一个 `10^-szDecimals` 都不到（例如 `xyz:SKHX` 是 `0.001` 个币，约 `$0.83`），这种数量交易所无法受理。除此之外程序不再有金额门槛——交易所拒绝时按 `交易所拒绝或执行器失败` 推送，`reason` 里带原始报错。
 
 ### 日志出现 `Unknown asset symbol`
 

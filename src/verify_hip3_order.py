@@ -27,7 +27,6 @@ from hyperliquid.models import OrderSide, PositionSide
 DEFAULT_SYMBOL = "xyz:SKHX"
 MAX_NOTIONAL_USD = Decimal("12.00")
 TARGET_NOTIONAL_USD = Decimal("11.50")
-MIN_NOTIONAL_USD = Decimal("10.00")
 CONFIRMATION = "HIP3_12_USD"
 
 
@@ -35,19 +34,18 @@ def bounded_size(
     mid_price: float,
     size_decimals: int,
     target: Decimal,
-    enforce_min: bool = True,
 ) -> Decimal:
-    """Round down so the requested notional stays below the hard cap."""
+    """Round down so the requested notional stays below the hard cap.
+
+    There is no $10 floor to enforce here: HIP-3 markets accept much smaller
+    orders (this account has filled ``xyz:SKHX`` at $1.33), so the only real
+    constraint is the ``10^-szDecimals`` tick.
+    """
     quantum = Decimal(1).scaleb(-size_decimals)
     size = (target / Decimal(str(mid_price))).quantize(quantum, rounding=ROUND_DOWN)
     notional = size * Decimal(str(mid_price))
     if size <= 0:
         raise RuntimeError("Requested notional rounds to zero at this tick size")
-    if enforce_min and notional < MIN_NOTIONAL_USD:
-        raise RuntimeError(
-            f"Order is ${notional:.4f}, below Hyperliquid's $10.00 minimum; "
-            f"the {size_decimals}-decimal tick size forces a larger notional"
-        )
     if notional > MAX_NOTIONAL_USD:
         raise RuntimeError("Internal safety cap failed: requested order exceeds $12.00")
     return size
@@ -78,7 +76,7 @@ async def main() -> None:
     )
 
     mid_price = await executor._get_mid_price(symbol)
-    size = bounded_size(mid_price, asset.sz_decimals, TARGET_NOTIONAL_USD, enforce_min=False)
+    size = bounded_size(mid_price, asset.sz_decimals, TARGET_NOTIONAL_USD)
     print(f"mid=${mid_price:.4f}  preview size={size} (~${size * Decimal(str(mid_price)):.2f})")
 
     preview = await executor.preview_order(

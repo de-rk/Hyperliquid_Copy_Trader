@@ -63,6 +63,17 @@ class StubClient:
         return self.available_to_trade.get(symbol)
 
 
+class StubExecutor:
+    """Only the tick size, which is all the minimum-order check reads."""
+
+    def __init__(self, decimals: dict):
+        self.decimals = decimals
+
+    async def get_asset(self, symbol):
+        value = self.decimals.get(symbol)
+        return None if value is None else SimpleNamespace(sz_decimals=value)
+
+
 def position(symbol="xyz:SKHX", size=1821.0, entry=862.145, leverage=10):
     return Position(
         symbol=symbol,
@@ -278,6 +289,32 @@ async def test_unified_budget_is_spent_as_margin():
     check("第二笔按剩余保证金缩量", abs(second - expected) < 0.05, f"{second} vs {expected}")
 
 
+async def test_minimum_is_one_tick_not_ten_dollars():
+    """HIP-3 fills under $10 exist, so a small copy must not be pre-judged.
+
+    The program used to skip every order below a hardcoded $10 "exchange
+    minimum". This wallet's own xyz:SKHX fills go down to $1.33, so the only
+    floor left is one size tick; the exchange decides the rest.
+    """
+    configure(simulated=True, balance=10_000.0, cap=5.0)
+    main.client = StubClient({})
+    main.executor = StubExecutor({"xyz:SKHX": 3})
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("最小下单单位 = 一个 tick 的价值",
+          abs(plan["min_notional"] - 828.36 * 0.001) < 1e-6, str(plan["min_notional"]))
+    check("$5 的一笔高于最小单位", plan["executable"] > plan["min_notional"],
+          f"{plan['executable']} vs {plan['min_notional']}")
+
+    plan = (await main.estimate_copy_execution([position(symbol="xyz:NEW")], RATIO))["xyz:NEW"]
+    check("取不到 tick 时不设门槛", plan["min_notional"] is None)
+
+    main.executor = None
+    plan = (await main.estimate_copy_execution([position()], RATIO))["xyz:SKHX"]
+    check("没有执行器时不设门槛", plan["min_notional"] is None)
+
+    check("代码里不再有 $10 硬门槛", not hasattr(main, "MIN_POSITION_SIZE_USD"))
+
+
 async def run():
     await test_hip3_capped_by_dex_margin()
     await test_same_dex_budget_is_shared()
@@ -291,6 +328,7 @@ async def run():
     await test_account_mode_is_cached()
     await test_live_cap_matches_preview_in_unified_mode()
     await test_unified_budget_is_spent_as_margin()
+    await test_minimum_is_one_tick_not_ten_dollars()
     test_receipt_uses_fill_numbers()
 
     failed = [name for name, ok, _ in results if not ok]

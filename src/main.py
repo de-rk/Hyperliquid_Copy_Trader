@@ -31,8 +31,30 @@ from version import build_stamp
 # Setup logging
 setup_logger(settings.log_file, settings.log_level)
 
-# Hyperliquid minimum order size requirement
-MIN_POSITION_SIZE_USD = 10.0
+async def min_order_notional(symbol: str, price: float) -> Optional[float]:
+    """The exchange's real floor for one order: a single size tick.
+
+    Hyperliquid only requires the size to be a multiple of ``10^-szDecimals``
+    and rejects anything finer; it does not enforce a $10 minimum notional on
+    HIP-3 markets. This account has filled ``xyz:SKHX`` orders worth $1.33,
+    so a program-side $10 gate was silently skipping trades the exchange would
+    have accepted. Sizing now stops at one lot and leaves the accept/reject
+    decision to the exchange.
+
+    ``None`` means the lot size could not be read; callers then send the order
+    unchanged rather than inventing a limit.
+    """
+    getter = getattr(executor, "get_asset", None) if executor is not None else None
+    if getter is None or price <= 0:
+        return None
+    try:
+        asset = await getter(symbol)
+    except Exception as exc:  # network blip / unknown symbol: never block on it
+        logger.debug(f"Cannot read lot size for {symbol}: {exc}")
+        return None
+    if asset is None:
+        return None
+    return price * (10.0 ** -int(asset.sz_decimals))
 
 
 def cap_position_value(requested_value: float, *hard_limits: Optional[float]) -> float:
@@ -353,14 +375,18 @@ async def copy_existing_position_snapshot(
         settings.sizing.max_position_size,
     )
     record["notional"] = capped_position_value
-    if capped_position_value < MIN_POSITION_SIZE_USD:
+    lot_value = await min_order_notional(
+        pos.symbol, pos.current_price or pos.entry_price
+    )
+    if lot_value is not None and capped_position_value < lot_value:
         logger.warning(
             f"⚠️  Skipping Position {index}/{total}: {pos.symbol}; "
-            f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
+            f"allowed value ${capped_position_value:.2f} is below one lot "
+            f"(${lot_value:.2f})"
         )
         record["reason"] = (
-            f"可下单金额 ${capped_position_value:.2f} 低于交易所最低 "
-            f"${MIN_POSITION_SIZE_USD:.2f}"
+            f"可下单金额 ${capped_position_value:.2f} 不足最小下单单位 "
+            f"${lot_value:.2f}"
         )
         return record
     if capped_position_value < requested_position_value:
@@ -614,6 +640,12 @@ async def estimate_copy_execution(
             "basis": basis,
             "capped": executable < requested - 0.005,
             "unknown": available is None,
+            # One size tick at the current price: the only floor the program
+            # applies, because the exchange's own $10 minimum does not exist
+            # on HIP-3 markets.
+            "min_notional": await min_order_notional(
+                pos.symbol, pos.current_price or pos.entry_price
+            ),
         }
     return plans
 
@@ -817,9 +849,10 @@ async def handle_copy_existing(
         exec_note = (
             f"｜实下 ≈ ${exec_value:,.0f}" if plan and plan["capped"] else ""
         )
+        lot_value = (plan or {}).get("min_notional")
         below_min = (
-            f"｜⚠️ 低于 ${MIN_POSITION_SIZE_USD:.0f} 最低，将被跳过"
-            if exec_value < MIN_POSITION_SIZE_USD and not guard_note
+            f"｜⚠️ 不足一个最小下单单位（${lot_value:,.2f}），将被跳过"
+            if lot_value and exec_value < lot_value and not guard_note
             else ""
         )
         lines.append(
@@ -1803,11 +1836,12 @@ async def _mirror_new_order(order_data: dict):
                 return
             max_size = min(max_size, max_order_notional / price)
         our_size = min(our_size, max_size)
-        if our_size * price < MIN_POSITION_SIZE_USD:
+        lot_value = await min_order_notional(symbol, price)
+        if lot_value is not None and our_size * price < lot_value:
             await _notify_copy_failure(
                 symbol=symbol, direction=notification_side, target_size=target_size,
-                follower_size=our_size, price=price, category="低于最小订单金额",
-                reason=f"Mirrored order notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}",
+                follower_size=our_size, price=price, category="低于最小下单单位",
+                reason=f"Mirrored order ${our_size * price:.2f} is below one lot (${lot_value:.2f})",
                 fill_id=target_oid,
                 stage="镜像交易",
             )
@@ -2234,15 +2268,20 @@ async def on_order_fill(fill_data: dict):
                 f"Proportional close for {symbol}: target closed {close_ratio:.2%}; "
                 f"follower closes {our_size:.8f} of {follower_size:.8f}"
             )
-            # A partial close below the exchange minimum must wait for more
-            # fills from the same target order. Once the target is fully flat,
-            # force the final reduce-only order so the follower cannot retain
-            # a residual position indefinitely.
-            if our_size * price < MIN_POSITION_SIZE_USD and not target_fully_closed:
-                logger.info(f"Reduce-only residual for {symbol} is below ${MIN_POSITION_SIZE_USD:.2f}; leaving it open")
+            # A partial close below one size tick must wait for more fills from
+            # the same target order. Once the target is fully flat, force the
+            # final reduce-only order so the follower cannot retain a residual
+            # position indefinitely.
+            lot_value = await min_order_notional(symbol, price)
+            if (
+                lot_value is not None
+                and our_size * price < lot_value
+                and not target_fully_closed
+            ):
+                logger.info(f"Reduce-only residual for {symbol} is below one lot (${lot_value:.2f}); leaving it open")
                 await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
-                                           follower_size=our_size, price=price, category="低于最小订单金额",
-                                           reason=f"Reduce-only notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}; waiting for more fills",
+                                           follower_size=our_size, price=price, category="低于最小下单单位",
+                                           reason=f"Reduce-only ${our_size * price:.2f} is below one lot (${lot_value:.2f}); waiting for more fills",
                                            fill_id=fill_id)
                 return
 
@@ -2343,14 +2382,15 @@ async def on_order_fill(fill_data: dict):
                 if remaining_position_value is not None else float("inf")
             )
             our_size = min(our_size, max_size_from_margin, max_size_from_position_limit)
-            if our_size * price < MIN_POSITION_SIZE_USD:
+            lot_value = await min_order_notional(symbol, price)
+            if lot_value is not None and our_size * price < lot_value:
                 logger.warning(
                     f"Skipping {symbol}: copied fill value ${our_size * price:.2f} is below "
-                    f"${MIN_POSITION_SIZE_USD:.2f} after margin/position-cap limits"
+                    f"one lot (${lot_value:.2f}) after margin/position-cap limits"
                 )
                 await _notify_copy_failure(symbol=symbol, direction=direction, target_size=target_size,
-                                           follower_size=our_size, price=price, category="低于最小订单金额",
-                                           reason=f"Follower notional ${our_size * price:.2f} is below ${MIN_POSITION_SIZE_USD:.2f} after risk limits",
+                                           follower_size=our_size, price=price, category="低于最小下单单位",
+                                           reason=f"Follower ${our_size * price:.2f} is below one lot (${lot_value:.2f}) after risk limits",
                                            fill_id=fill_id)
                 return
 
@@ -3718,28 +3758,10 @@ async def main():
         if auto_ratio > 0:
             logger.success(f"   This means: For every ${int(1/auto_ratio)} target trades, you copy ${1}")
         
-        # Calculate minimum balance needed for $10 minimum order size
-        if startup_positions:
-            # Find smallest target position value
-            smallest_target_value = min(abs(pos.size) * pos.entry_price for pos in startup_positions)
-            # Calculate minimum balance needed to copy at $10
-            min_balance_needed = MIN_POSITION_SIZE_USD * (target_balance / smallest_target_value)
-            
-            logger.info("")
-            logger.info(f"⚠️  MINIMUM BALANCE CHECK:")
-            logger.info(f"   Hyperliquid Min Order Size: ${MIN_POSITION_SIZE_USD:.2f}")
-            logger.info(f"   Smallest Target Position: ${smallest_target_value:,.2f}")
-            logger.info(f"   Min Balance Needed (for this ratio): ${min_balance_needed:,.2f}")
-            
-            if simulated_balance < min_balance_needed:
-                positions_below_min = sum(1 for pos in startup_positions 
-                                         if (abs(pos.size) * pos.entry_price * auto_ratio) < MIN_POSITION_SIZE_USD)
-                logger.warning(f"   ⚠️  WARNING: Your balance ${simulated_balance:,.2f} is below recommended minimum!")
-                logger.warning(f"   {positions_below_min} out of {len(startup_positions)} positions will be SKIPPED (below $10)")
-                logger.warning(f"   Consider increasing balance to ${min_balance_needed:,.2f} to copy all positions")
-            else:
-                logger.success(f"   ✅ Your balance is sufficient to copy all positions!")
-        
+        # No "$10 minimum balance" check any more: the floor is one size tick
+        # per symbol, which is reported per position below with the rest of
+        # the startup estimate.
+
         if startup_positions:
             logger.info("")
             logger.info(f"📊 Current Positions:")
@@ -3786,10 +3808,14 @@ async def main():
                     margin_limited_value,
                     settings.sizing.max_position_size,
                 )
-                if capped_position_value < MIN_POSITION_SIZE_USD:
+                lot_value = await min_order_notional(
+                    pos.symbol, pos.current_price or pos.entry_price
+                )
+                if lot_value is not None and capped_position_value < lot_value:
                     logger.warning(
                         f"⚠️  Skipping Position {i}/{len(startup_positions)}: {pos.symbol}; "
-                        f"allowed value ${capped_position_value:.2f} is below ${MIN_POSITION_SIZE_USD:.2f}"
+                        f"allowed value ${capped_position_value:.2f} is below one lot "
+                        f"(${lot_value:.2f})"
                     )
                     continue
                 if capped_position_value < target_position_value * auto_ratio:
