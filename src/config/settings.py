@@ -29,7 +29,7 @@ def normalize_pnl_filter(value: Optional[str], default: str = 'all') -> str:
     if token in _PNL_FILTER_ALIASES:
         return _PNL_FILTER_ALIASES[token]
     raise ValueError(
-        "COPY_OPEN_PNL_FILTER must be one of all/loss/profit, "
+        "/copyloss scope must be one of all/loss/profit, "
         f"got {value!r}"
     )
 
@@ -121,10 +121,6 @@ class CopyRulesConfig(BaseModel):
     # them, and the manual equivalent (/copyloss) lets the user pick which
     # positions to take and returns a fill receipt.
     copy_open_positions: bool = False
-    # Scope /copyloss lists by default: "all" | "loss" | "profit".
-    # "loss" shows only the positions the target is currently losing on, so
-    # the follower enters at a better price than the target's own entry.
-    copy_open_pnl_filter: str = "loss"
     # Refuse to copy the same symbol/side again within this many minutes.
     # 0 disables the guard. /copyloss ... force bypasses it once.
     copy_duplicate_guard_minutes: int = 30
@@ -238,13 +234,6 @@ class Settings(BaseModel):
         # Copy trading settings
         copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'false').lower()
         settings.copy_rules.copy_open_positions = copy_open_pos in ('true', '1', 'yes')
-        settings.copy_rules.copy_open_pnl_filter = normalize_pnl_filter(
-            os.getenv('COPY_OPEN_PNL_FILTER'),
-            # Honour the model default (loss) when the variable is absent;
-            # normalize_pnl_filter's own default is "all" and used to override
-            # it, so an empty .env silently listed every position.
-            default=settings.copy_rules.copy_open_pnl_filter,
-        )
         settings.copy_rules.copy_duplicate_guard_minutes = _non_negative_int(
             'COPY_DUPLICATE_GUARD_MINUTES', default=30
         )

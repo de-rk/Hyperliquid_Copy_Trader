@@ -139,16 +139,7 @@ ENV_VARS: tuple[EnvVar, ...] = (
         "false",
         "已有仓位",
         "历史兼容开关，置 true 也不会下单，仅启动日志提示。\n"
-        "# 目标已有仓位一律手动处理：Telegram /copyloss 选择仓位后按市价买入。",
-    ),
-    EnvVar(
-        "COPY_OPEN_PNL_FILTER",
-        "loss",
-        "已有仓位",
-        "/copyloss 不带参数时列出的范围：\n"
-        "#   loss   只列目标当前浮亏的仓位（你会在比目标更好的价位进场）\n"
-        "#   profit 只列目标当前浮盈的仓位（等于追高，慎用）\n"
-        "#   all    全部持仓",
+        "# 目标已有仓位一律手动处理：Telegram /copyloss 只列出你还没持有的仓位，确认后按市价买入。",
     ),
     EnvVar(
         "COPY_DUPLICATE_GUARD_MINUTES",

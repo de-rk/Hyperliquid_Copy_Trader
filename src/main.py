@@ -160,13 +160,14 @@ def position_unrealized_pnl(position) -> float:
 
 
 def select_existing_positions(positions, pnl_filter: str = "all") -> list:
-    """Return the existing target positions that may be copied at startup.
+    """Narrow the target's book by PnL scope. Never decides on its own.
 
-    ``all`` keeps the previous behaviour (every open position). ``loss`` only
-    keeps positions the target is currently underwater on: entering the same
-    side now gives the follower a better average price than the target has.
-    ``profit`` keeps the winners, which means paying a worse price than the
-    target — useful only for mirroring a momentum book.
+    ``/copyloss`` calls this first and then drops every symbol the follower
+    already holds — "does the follower have it" is the scope that matters.
+    This helper only answers "which PnL slice did the user ask for":
+    ``all`` keeps everything, ``loss`` keeps what the target is underwater on
+    (entering now beats the target's own average), ``profit`` keeps the winners
+    (you pay a worse price than the target did — momentum mirroring only).
     """
     selected = []
     skipped_in_profit = 0
@@ -221,12 +222,11 @@ def existing_position_policy_text() -> str:
     """Describe how the target's already-open positions are handled.
 
     Nothing is mirrored at startup any more — that path placed real orders
-    without asking. The text therefore always reports "manual"; the PnL filter
-    only decides which scope /copyloss lists by default.
+    without asking. /copyloss therefore only offers the positions the follower
+    is missing; anything already on the follower's book is skipped, because the
+    copy would either duplicate it or fight it.
     """
-    rule = settings.copy_rules.copy_open_pnl_filter
-    scope = {"loss": "浮亏", "profit": "浮盈"}.get(rule, "全部")
-    return f"手动：/copyloss 选择{scope}仓位（启动不自动追入）"
+    return "手动：/copyloss 只列你没持有的仓位（启动不自动追入）"
 
 
 def unfunded_block_text() -> Optional[str]:
@@ -618,6 +618,37 @@ async def estimate_copy_execution(
     return plans
 
 
+def _nothing_to_copy_text(
+    in_scope: list,
+    skipped_held: list,
+    skipped_opposite: list,
+    force: bool,
+) -> str:
+    """Explain why a run that found target positions has nothing to buy.
+
+    A bare "nothing to copy" reads like a failed fetch. Naming each symbol and
+    the reason keeps the operator from wondering whether the bot saw the book.
+    """
+    lines = [f"ℹ️ 目标 {len(in_scope)} 个仓位里没有可以新开的，本次不会下任何单："]
+    for pos in skipped_held:
+        lines.append(
+            f"• {html.escape(pos.symbol)} {pos.side.value.upper()}：你已持有，跳过"
+        )
+    for pos in skipped_opposite:
+        held_side = "SHORT" if pos.side == PositionSide.LONG else "LONG"
+        lines.append(
+            f"• {html.escape(pos.symbol)} {pos.side.value.upper()}："
+            f"你持有反向 {held_side}，需先平仓才能跟"
+        )
+    if skipped_held and not force:
+        lines.append("")
+        lines.append(
+            "要在已持有的仓位上继续加仓，加 <code>force</code>；"
+            "反向持仓必须先平掉才跟得了。"
+        )
+    return "\n".join(lines)
+
+
 async def handle_copy_existing(
     mode: Optional[str] = None,
     confirm: bool = False,
@@ -626,16 +657,17 @@ async def handle_copy_existing(
 ) -> str:
     """Copy the target's currently open positions on demand, via Telegram.
 
-    Manual by design: nothing is mirrored at startup any more. The preview
-    numbers every candidate, ``selection`` (1-based) takes a subset, and every
-    run ends with a per-position receipt, because the previous auto-copy path
-    placed real orders that the user only noticed on the exchange.
+    Manual by design: nothing is mirrored at startup any more. The list holds
+    only the target positions the follower is *missing*, ``selection`` (1-based)
+    takes a subset, and every run ends with a per-position receipt, because the
+    previous auto-copy path placed real orders that the user only noticed on
+    the exchange.
 
-    Every candidate passes :func:`copy_guard_block` twice: once for the preview
-    (so the list shows what will be skipped before anything is confirmed) and
-    again inside the snapshot immediately before the order, on a freshly read
-    follower book. ``force`` relaxes the "already copied" rules for deliberate
-    adds; an opposite-side position still blocks.
+    Every listed candidate passes :func:`copy_guard_block` twice: once for the
+    preview (so the list shows what will be skipped before anything is
+    confirmed) and again inside the snapshot immediately before the order, on a
+    freshly read follower book. ``force`` re-admits already-held same-side
+    positions for a deliberate add; an opposite-side position still blocks.
     """
     if is_stopped:
         return "🔴 机器人已停止，无法执行。请重启容器后再使用。"
@@ -646,14 +678,13 @@ async def handle_copy_existing(
         return "❌ 机器人尚未就绪，请稍后再试。"
 
     try:
-        rule = normalize_pnl_filter(
-            mode or settings.copy_rules.copy_open_pnl_filter
-        )
+        rule = normalize_pnl_filter(mode or "all")
     except ValueError:
         return (
             "❌ 无效的范围参数。\n\n"
-            "用法：<code>/copyloss [loss|all|profit] [序号...] [confirm]</code>\n"
-            "默认 <code>loss</code>：只列出目标当前浮亏的仓位。"
+            "用法：<code>/copyloss [序号...] [confirm] [force]</code>\n"
+            "默认列出「目标有、你没有」的仓位；可选 <code>loss</code> / "
+            "<code>profit</code> 再按盈亏收窄。"
         )
 
     state = await monitor.get_current_state()
@@ -672,13 +703,6 @@ async def handle_copy_existing(
         return "❌ 无法读取跟随钱包净值，无法计算跟单比例。"
 
     auto_ratio = follower_equity / target_equity
-    candidates = select_existing_positions(state.positions, rule)
-    scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "全部"}[rule]
-    if not candidates:
-        return (
-            f"ℹ️ 目标当前没有{scope_name}仓位"
-            f"（共 {len(state.positions)} 个持仓），无需操作。"
-        )
 
     held = await _follower_positions_by_symbol()
     if held is None:
@@ -688,6 +712,37 @@ async def handle_copy_existing(
             "❌ 无法读取跟随钱包当前持仓，为避免重复下单已取消。\n"
             "请稍后重试；若持续失败，检查 API 连接或钱包地址配置。"
         )
+
+    # The list is about what the follower is *missing*, not about the target's
+    # PnL: a symbol already on the follower's book is out of scope, because the
+    # copy would either duplicate it or fight it. ``force`` re-admits the
+    # same-side case only - an opposite-side order would close or flip.
+    in_scope = select_existing_positions(state.positions, rule)
+    candidates: list = []
+    skipped_held: list = []
+    skipped_opposite: list = []
+    for pos in in_scope:
+        current = held.get(pos.symbol)
+        wanted = pos.side.value.upper()
+        if current is None or (force and current == wanted):
+            candidates.append(pos)
+        elif current == wanted:
+            skipped_held.append(pos)
+        else:
+            skipped_opposite.append(pos)
+
+    scope_name = {"loss": "浮亏", "profit": "浮盈", "all": "全部"}[rule]
+    scope_label = "未持有" if rule == "all" else f"未持有·{scope_name}"
+    # Echoed back in the "run this next" hint; the default scope needs no token.
+    rule_arg = "" if rule == "all" else f" {rule}"
+    if not in_scope:
+        narrowed = "" if rule == "all" else scope_name
+        return (
+            f"ℹ️ 目标当前没有{narrowed}仓位"
+            f"（共 {len(state.positions)} 个持仓），无需操作。"
+        )
+    if not candidates:
+        return _nothing_to_copy_text(in_scope, skipped_held, skipped_opposite, force)
 
     # Number the whole candidate list, including symbols the guard will skip:
     # numbering only the copyable subset shifted every index after the first
@@ -700,7 +755,7 @@ async def handle_copy_existing(
     copyable = [pos for pos in candidates if pos.symbol not in guard]
     if not copyable:
         head = (
-            f"ℹ️ 目标当前的{scope_name}仓位（{len(candidates)} 个）全部命中下单检查，"
+            f"ℹ️ 目标{scope_label}仓位（{len(candidates)} 个）全部命中下单检查，"
             "本次不会下任何单："
         )
         rows = [
@@ -721,14 +776,25 @@ async def handle_copy_existing(
             listed = "、".join(str(number) for number in invalid)
             return (
                 f"❌ 序号超出范围：{listed}\n"
-                f"当前可选 1-{len(candidates)}。发送 <code>/copyloss {rule}</code> 查看列表。"
+                f"当前可选 1-{len(candidates)}。发送 <code>/copyloss{rule_arg}</code> 查看列表。"
             )
         chosen = [candidates[number - 1] for number in wanted]
 
     copy_plan = {} if confirm else await estimate_copy_execution(copyable, auto_ratio)
     ratio_text = f"1:{int(1 / auto_ratio)}" if auto_ratio > 0 else "0"
+    # The header states what the list is: un-held only, unless force pulled the
+    # already-held same-side positions back in. Without this the force list
+    # looks identical to a normal one.
+    conditions = []
+    if force:
+        conditions.append("含已持有")
+    else:
+        conditions.append("未持有")
+    if rule != "all":
+        conditions.append(f"只看{scope_name}")
+    scope_suffix = f"（{'·'.join(conditions)}）" if conditions else ""
     lines = [
-        f"🎯 <b>目标{scope_name}仓位{'（预览）' if not confirm else ''}</b>",
+        f"🎯 <b>目标仓位{scope_suffix}{'（预览）' if not confirm else ''}</b>",
         "",
         f"目标净值 ${target_equity:,.2f}｜跟随净值 ${follower_equity:,.2f}"
         f"（比例 {ratio_text}）",
@@ -769,6 +835,30 @@ async def handle_copy_existing(
         )
     else:
         lines.append(f"全部复制合计 ≈ ${total_your_value:,.2f}。")
+
+    # Say why a target position is missing from the list. Without this the
+    # numbering looks arbitrary: the operator knows the target has four
+    # positions but only two are offered.
+    if skipped_held or skipped_opposite:
+        lines.append("")
+        if skipped_held:
+            lines.append(
+                "已在持仓中（跳过）："
+                + "、".join(
+                    f"{html.escape(pos.symbol)} {pos.side.value.upper()}"
+                    for pos in skipped_held
+                )
+            )
+        if skipped_opposite:
+            lines.append(
+                "方向相反（需先平仓）："
+                + "、".join(
+                    f"{html.escape(pos.symbol)} {pos.side.value.upper()}"
+                    for pos in skipped_opposite
+                )
+            )
+        if skipped_held and not force:
+            lines.append("要在已持有的仓位上继续加仓，加 <code>force</code>。")
 
     # Name the constraint instead of letting the user compare two unexplained
     # numbers: the ratio uses the whole portfolio, the order can only use the
@@ -820,15 +910,15 @@ async def handle_copy_existing(
                     + "、".join(html.escape(symbol) for symbol in blocked_chosen)
                 )
             lines.append(
-                f"发送 <code>/copyloss {rule} {numbers} confirm</code> 执行。"
+                f"发送 <code>/copyloss{rule_arg} {numbers} confirm</code> 执行。"
             )
         else:
             sample = " ".join(
                 str(i) for i in range(1, min(len(candidates), 2) + 1)
             )
             lines.append(
-                f"按序号复制：<code>/copyloss {rule} {sample} confirm</code>"
-                f"（只买这几笔）；全部执行：<code>/copyloss {rule} confirm</code>。"
+                f"按序号复制：<code>/copyloss{rule_arg} {sample} confirm</code>"
+                f"（只买这几笔）；全部执行：<code>/copyloss{rule_arg} confirm</code>。"
             )
         lines.append("下单前不会发送任何订单。")
         return "\n".join(lines)
@@ -877,7 +967,7 @@ async def handle_copy_existing(
             record["fill_price"] = fill["price"]
             record["fill_size"] = fill["size"]
 
-    receipt = _copy_receipt_text(records, scope_name, settings.simulated_trading)
+    receipt = _copy_receipt_text(records, scope_label, settings.simulated_trading)
     notes: list[str] = []
     if is_paused:
         notes.append("⚠️ 机器人处于暂停状态：本次是手动下单，自动跟单仍未恢复。")
@@ -3579,18 +3669,10 @@ async def main():
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
         logger.info(f"   Open Positions: {len(state.positions)}")
 
-        # Existing-position copy scope. ``all`` keeps the historical behaviour;
-        # ``loss`` only mirrors positions the target is currently underwater on,
-        # so the follower enters at a better price than the target did.
-        startup_pnl_filter = settings.copy_rules.copy_open_pnl_filter
-        startup_positions = select_existing_positions(
-            state.positions, startup_pnl_filter
-        )
-        if startup_pnl_filter != "all":
-            logger.info(
-                f"   PnL Filter: {startup_pnl_filter} -> copying "
-                f"{len(startup_positions)}/{len(state.positions)} position(s)"
-            )
+        # Startup never places orders. /copyloss offers only the target
+        # positions the follower is missing, so this list is just a count for
+        # the simulation summary below.
+        startup_positions = list(state.positions)
         
         # In live mode, size against the follower wallet's actual balance.
         if not settings.simulated_trading:
@@ -3732,12 +3814,7 @@ async def main():
             
             logger.info("")
             logger.info("=" * 60)
-            scope_note = (
-                "" if startup_pnl_filter == "all"
-                else f" (PnL filter: {startup_pnl_filter},"
-                     f" {len(startup_positions)}/{len(state.positions)} selected)"
-            )
-            logger.warning(f"📊 If you copied all {len(startup_positions)} positions{scope_note}:")
+            logger.warning(f"📊 If you copied all {len(startup_positions)} positions:")
             logger.warning(f"   Total Margin Needed: ${total_simulated_margin:,.2f}")
             logger.warning(f"   Your Balance: ${simulated_balance:,.2f}")
             logger.warning(f"   Remaining: ${simulated_balance - total_simulated_margin:,.2f}")
@@ -3764,10 +3841,7 @@ async def main():
         f"{settings.copy_rules.pending_order_merge_window_seconds:g}s"
     )
     logger.info(f"   Cancel Mirrored Orders: {settings.copy_rules.cancel_mirrored_orders}")
-    logger.info("   Copy Existing Positions: manual — /copyloss only (startup never orders)")
-    logger.info(
-        f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
-    )
+    logger.info("   Copy Existing Positions: manual — /copyloss lists only un-held (startup never orders)")
     
     configure_monitor_callbacks(monitor)
     
@@ -3854,11 +3928,6 @@ async def main():
             )
             logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
             logger.info(f"   Open Positions: {len(state.positions)}")
-            if settings.copy_rules.copy_open_pnl_filter != "all":
-                logger.info(
-                    f"   Existing Position PnL Filter: "
-                    f"{settings.copy_rules.copy_open_pnl_filter}"
-                )
             
             if state.positions:
                 logger.info("")
@@ -3893,10 +3962,7 @@ async def main():
         logger.info("")
         logger.info(f"🔌 Starting monitoring...")
         logger.info("✅ Bot is now LIVE and monitoring for trades!")
-        logger.info("   Copy Existing Positions: manual — /copyloss only (startup never orders)")
-        logger.info(
-            f"   Existing Position PnL Filter: {settings.copy_rules.copy_open_pnl_filter}"
-        )
+        logger.info("   Copy Existing Positions: manual — /copyloss lists only un-held (startup never orders)")
         logger.info(f"   Copy Existing Orders: {settings.copy_rules.copy_existing_orders}")
         logger.info(f"   Mirror Pending Orders: {settings.copy_rules.mirror_pending_orders}")
         logger.info(

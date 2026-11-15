@@ -109,7 +109,7 @@ class TelegramBot:
 /leaderboard - 查看公开收益排行榜
 /wallet 地址 [数量] - 查询公开账户收益和最近成交
 /follow 地址 - 更换跟单目标钱包
-/copyloss [loss|all|profit] [序号...] [confirm] [force] - 手动复制目标现有仓位：先列清单，可只买指定序号，执行后回执；已持有或刚复制过的会自动拦下，确需叠加再加 force
+/copyloss [序号...] [confirm] [force] - 复制目标有、你没有的仓位：先列清单，可只买指定序号，执行后回执；已持有/方向相反/刚复制过的自动跳过（确需在已持有的仓位上叠加加 force；可选 loss|profit 只看盈亏）
 /close [序号|币种|all] [confirm] - 平掉自己的仓位：先列清单，可选币种或序号，执行后回执
 /stop - 停止跟单：撤掉挂单，保留仓位（发 /start 恢复）
 
@@ -160,11 +160,13 @@ class TelegramBot:
         """Handle /copyloss - copy the target's open positions, on demand.
 
         Two steps on purpose: without ``confirm`` it only lists what would be
-        bought, because in live mode this places real market orders. Numbers in
-        the arguments pick a subset of that list, e.g. ``/copyloss 1 3 confirm``.
+        bought, because in live mode this places real market orders. The list
+        contains only the target positions the follower does not already hold;
+        numbers in the arguments pick a subset of it, e.g. ``/copyloss 1 3
+        confirm``.
 
-        ``force`` bypasses the "already copied this symbol" guard once; the
-        duplicate check itself lives in main so every caller gets it.
+        ``force`` re-admits already-held same-side positions for a deliberate
+        add; the duplicate check itself lives in main so every caller gets it.
         """
         if not self._check_authorized(update):
             await update.message.reply_text("⛔ 未授权的聊天")
@@ -484,7 +486,7 @@ class TelegramBot:
             BotCommand("pnl", "查看收益摘要"),
             BotCommand("wallet", "查询公开账户"),
             BotCommand("follow", "更换跟单目标钱包"),
-            BotCommand("copyloss", "手动复制目标现有仓位（可选序号，带回执）"),
+            BotCommand("copyloss", "复制目标有、你没有的仓位（带回执）"),
             BotCommand("close", "平掉自己的仓位（可选币种/序号，带回执）"),
             BotCommand("leaderboard", "查看收益排行榜"),
             BotCommand("stop", "停止跟单，保留仓位"),
